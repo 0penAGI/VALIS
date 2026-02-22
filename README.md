@@ -2,6 +2,8 @@
 
 VALIS is an offline, on-device AI chat application for iOS, built with Swift and `llama.cpp`. It features a unique "plastic" brain architecture with dynamic memory and agentic capabilities.
 
+![chat](https://github.com/0penAGI/VALIS/blob/main/oss.jpg)
+
 ## Features
 
 - **Fully Offline**: Runs entirely on-device using GGUF models via `llama.cpp`.
