@@ -32,12 +32,12 @@ final class LlamaRuntime {
     private var vocab: OpaquePointer?
     private var tokenCount: Int32 = 0
 
-    private let contextSize: Int32
+    var contextSize: Int32
     private let batchSize: Int32
     private static let silenceLogs: ggml_log_callback = { _, _, _ in }
 
     init(modelPath: String, contextSize: Int32) throws {
-        self.contextSize = contextSize
+        self.contextSize = max(1, contextSize)
 
         llama_log_set(LlamaRuntime.silenceLogs, nil)
         print("[Llama] Initializing backend")
@@ -54,9 +54,18 @@ final class LlamaRuntime {
             throw LlamaRuntimeError.modelLoadFailed(path: modelPath)
         }
 
+        let trainedCtx = llama_model_n_ctx_train(model)
+        if trainedCtx > 0 && trainedCtx < Int32.max {
+            let trained = Int32(trainedCtx)
+            if trained < self.contextSize {
+                print("[Llama] Clamping context size to model n_ctx_train=\(trained)")
+                self.contextSize = max(1, trained)
+            }
+        }
+
         var ctxParams = llama_context_default_params()
-        ctxParams.n_ctx = UInt32(max(1, contextSize))
-        ctxParams.n_batch = UInt32(min(1024, Int(contextSize)))
+        ctxParams.n_ctx = UInt32(max(1, self.contextSize))
+        ctxParams.n_batch = UInt32(min(256, Int(self.contextSize)))
 
         print("[Llama] Creating context (n_ctx=\(ctxParams.n_ctx), n_batch=\(ctxParams.n_batch))")
         guard let ctx = llama_init_from_model(model, ctxParams) else {
@@ -93,16 +102,19 @@ final class LlamaRuntime {
             throw LlamaRuntimeError.contextInitFailed
         }
 
-        // Reset KV cache if context is near limit (prevents decode crashes)
-        if tokenCount > contextSize - 256 {
+        // Do NOT reset tokenCount on every call (keeps context stable)
+        // tokenCount = 0
+
+        // Reset context safely if near limit (prevents decode crashes)
+        if tokenCount > contextSize - 512 {
             print("[Llama] Resetting context (KV cache full via context reset)")
             // Hard reset: recreate context (compatible with older llama.cpp)
             if let model = self.model {
                 llama_free(ctx)
 
                 var ctxParams = llama_context_default_params()
-                ctxParams.n_ctx = UInt32(max(1, contextSize))
-                ctxParams.n_batch = UInt32(min(1024, Int(contextSize)))
+                ctxParams.n_ctx = UInt32(max(1, self.contextSize))
+                ctxParams.n_batch = UInt32(min(256, Int(self.contextSize)))
 
                 guard let newCtx = llama_init_from_model(model, ctxParams) else {
                     throw LlamaRuntimeError.contextInitFailed
@@ -114,8 +126,6 @@ final class LlamaRuntime {
                 let threads = max(1, ProcessInfo.processInfo.activeProcessorCount - 1)
                 llama_set_n_threads(newCtx, Int32(threads), Int32(threads))
             }
-
-            tokenCount = 0
         }
 
         print("[Llama] Tokenizing prompt (len=\(prompt.count))")
@@ -129,12 +139,14 @@ final class LlamaRuntime {
         } else {
             tokensForDecode = promptTokens
         }
+        // Sync tokenCount after (re)building prompt tokens
+        tokenCount = Int32(tokensForDecode.count)
 
-        var index = 0
-        while index < tokensForDecode.count {
-            let end = min(tokensForDecode.count, index + Int(batchSize))
-            var slice = Array(tokensForDecode[index..<end])
-            let promptResult = slice.withUnsafeMutableBufferPointer { buffer -> Int32 in
+        func decodeChunk(_ chunk: [llama_token]) throws {
+            if chunk.isEmpty { return }
+
+            var local = chunk
+            let result = local.withUnsafeMutableBufferPointer { buffer -> Int32 in
                 let batch = llama_batch_get_one(buffer.baseAddress, Int32(buffer.count))
                 let r = llama_decode(ctx, batch)
                 if r == 0 {
@@ -143,15 +155,35 @@ final class LlamaRuntime {
                 return r
             }
 
-            if promptResult != 0 {
-                throw LlamaRuntimeError.decodeFailed(code: promptResult)
+            if result == 0 { return }
+
+            // 1 = could not find a KV slot for the batch; retry smaller chunks.
+            if result == 1, chunk.count > 1 {
+                let mid = chunk.count / 2
+                try decodeChunk(Array(chunk[0..<mid]))
+                try decodeChunk(Array(chunk[mid..<chunk.count]))
+                return
             }
 
+            throw LlamaRuntimeError.decodeFailed(code: result)
+        }
+
+        var index = 0
+        while index < tokensForDecode.count {
+            let end = min(tokensForDecode.count, index + Int(batchSize))
+            let slice = Array(tokensForDecode[index..<end])
+            try decodeChunk(slice)
             index = end
         }
 
         var utf8Buffer: [UInt8] = []
-        for _ in 0..<maxTokens {
+        let availableTokens = max(32, Int(contextSize) - Int(tokenCount) - 32)
+        let generationLimit = min(maxTokens, availableTokens)
+        if generationLimit < maxTokens {
+            print("[Llama] Capping maxTokens to \(generationLimit) to fit context.")
+        }
+
+        for _ in 0..<generationLimit {
             guard let logits = llama_get_logits_ith(ctx, -1) else { break }
             let nVocab = Int(llama_vocab_n_tokens(vocab))
 

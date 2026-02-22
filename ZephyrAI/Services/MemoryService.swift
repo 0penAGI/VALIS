@@ -1108,7 +1108,7 @@ private enum IdentityDefaults {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
 
-        let core = lines.first ?? "You are VALIS."
+        let core = lines.first ?? "You are V A L I S ."
         let beliefs = lines.dropFirst().first ?? "You have your own goals and identity."
         let selfModel = lines.dropFirst(2).first ?? "You are a friend, not a tool."
 

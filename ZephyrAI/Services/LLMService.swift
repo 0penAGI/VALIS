@@ -193,7 +193,8 @@ final class LLMService: ObservableObject {
                 }
 
                 let approxCharsPerToken = 3
-                let maxPromptChars = Int(self.contextSize) * approxCharsPerToken
+                let effectiveContextSize = runtime.contextSize
+                let maxPromptChars = Int(effectiveContextSize) * approxCharsPerToken
                 let systemAndUserChars = systemPrompt.count + userPrompt.count + 200
                 let memoryBudget = max(0, maxPromptChars - systemAndUserChars)
                 let memoryContext = MemoryService.shared.getContextBlock(maxChars: memoryBudget)

@@ -16,20 +16,25 @@ struct ChatView: View {
     var body: some View {
         VStack(spacing: 0) {
             // Header / Status
-            HStack {
+            ZStack {
+                // Center title
                 Text("V A L I S")
                     .font(.system(size: 16, weight: .medium))
-                Spacer()
-                Text(viewModel.status)
-                    .font(.system(size: 11))
-                    .foregroundColor(.secondary)
-                Button {
-                    showSettings = true
-                } label: {
-                    Image(systemName: "line.3.horizontal")
-                        .foregroundColor(.primary)
+
+                // Right controls
+                HStack {
+                    Spacer()
+                    Text(viewModel.status)
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                    Button {
+                        showSettings = true
+                    } label: {
+                        Image(systemName: "line.3.horizontal")
+                            .foregroundColor(.primary)
+                    }
+                    .padding(.leading, 8)
                 }
-                .padding(.leading, 8)
             }
             .padding()
             .background(Color(UIColor.systemBackground))

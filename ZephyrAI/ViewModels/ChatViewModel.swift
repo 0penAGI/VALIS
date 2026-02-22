@@ -9,7 +9,7 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
     @Published var messages: [Message] = []
     @Published var inputText: String = ""
     @Published var isInteracting: Bool = false
-    @Published var status: String = "Initializing model by Liquid AI"
+    @Published var status: String = "Starting LFM 2.5"
     @Published var currentThink: String = ""
     @Published var currentThinkingMessageId: UUID?
     
@@ -35,7 +35,7 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
             self.status = llmService.status
             
             if messages.isEmpty {
-                messages.append(Message(role: .assistant, content: "Hello! I am VALIS. I have access to my memories. How can I help you?"))
+                messages.append(Message(role: .assistant, content: "Hello! I am  V A L I S . I have access to my memories. How can I help you?"))
             }
         }
     }
