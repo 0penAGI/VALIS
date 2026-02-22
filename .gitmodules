@@ -1,0 +1,9 @@
+[submodule "AnyLanguageModel"]
+	path = AnyLanguageModel
+	url = https://github.com/mattt/AnyLanguageModel
+[submodule "mlx-swift"]
+	path = mlx-swift
+	url = https://github.com/ml-explore/mlx-swift
+[submodule "swift-llama-cpp"]
+	path = swift-llama-cpp
+	url = https://github.com/ShenghaiWang/SwiftLlama
