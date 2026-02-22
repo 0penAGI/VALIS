@@ -97,10 +97,12 @@ final class LlamaRuntime {
         llama_backend_free()
     }
 
-    func generateStream(prompt: String, maxTokens: Int, onToken: (String) -> Void) throws {
+    func generateStream(prompt: String, maxTokens: Int, shouldCancel: () -> Bool, onToken: (String) -> Void) throws {
         guard var ctx = context, let vocab = vocab else {
             throw LlamaRuntimeError.contextInitFailed
         }
+
+        if shouldCancel() { return }
 
         // Do NOT reset tokenCount on every call (keeps context stable)
         // tokenCount = 0
@@ -144,6 +146,7 @@ final class LlamaRuntime {
 
         func decodeChunk(_ chunk: [llama_token]) throws {
             if chunk.isEmpty { return }
+            if shouldCancel() { return }
 
             var local = chunk
             let result = local.withUnsafeMutableBufferPointer { buffer -> Int32 in
@@ -170,6 +173,7 @@ final class LlamaRuntime {
 
         var index = 0
         while index < tokensForDecode.count {
+            if shouldCancel() { return }
             let end = min(tokensForDecode.count, index + Int(batchSize))
             let slice = Array(tokensForDecode[index..<end])
             try decodeChunk(slice)
@@ -184,6 +188,7 @@ final class LlamaRuntime {
         }
 
         for _ in 0..<generationLimit {
+            if shouldCancel() { return }
             guard let logits = llama_get_logits_ith(ctx, -1) else { break }
             let nVocab = Int(llama_vocab_n_tokens(vocab))
 
@@ -226,7 +231,9 @@ final class LlamaRuntime {
                 }
             }
         }
-        
+
+        if shouldCancel() { return }
+
         if !utf8Buffer.isEmpty {
             if let tail = String(bytes: utf8Buffer, encoding: .utf8) {
                 onToken(tail)

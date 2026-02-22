@@ -12,6 +12,7 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
     @Published var status: String = "Starting LFM 2.5"
     @Published var currentThink: String = ""
     @Published var currentThinkingMessageId: UUID?
+    private var hasUserInteracted: Bool = false
     
     private var generationTask: Task<Void, Never>?
     private var cancellables = Set<AnyCancellable>()
@@ -21,6 +22,8 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
     private let llmService = LLMService()
     private let memoryService = MemoryService.shared
     private let identityService = IdentityService.shared
+    private let experienceService = ExperienceService.shared
+    private let motivationService = MotivationService.shared
 
     
     override init() {
@@ -49,6 +52,7 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
                 guard let self = self else { return }
                 guard self.messages.count <= 1 else { return }
                 guard !self.isInteracting else { return }
+                guard self.hasUserInteracted else { return }
 
                 let now = Date()
                 if let last = self.lastSpontaneousAt, now.timeIntervalSince(last) < self.spontaneousCooldown {
@@ -63,6 +67,7 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
     func stopGeneration() {
         generationTask?.cancel()
         generationTask = nil
+        llmService.cancelGeneration()
         isInteracting = false
         currentThink = ""
         currentThinkingMessageId = nil
@@ -290,12 +295,19 @@ ISO‑время: \(iso)
 
     func sendMessage() {
         guard !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+
+        if let valence = experienceService.applyUserReaction(from: inputText) {
+            motivationService.updateForReaction(valence: valence)
+        }
+        hasUserInteracted = true
         
         generationTask?.cancel()
         generationTask = nil
+        llmService.cancelGeneration()
         
         let userMessage = Message(role: .user, content: inputText)
         messages.append(userMessage)
+        let userMessageId = userMessage.id
         let prompt = inputText
         inputText = ""
         
@@ -308,8 +320,11 @@ ISO‑время: \(iso)
             memoryService.applyPredictionFeedback(fromUserText: prompt)
             memoryService.applyReinforcement(fromUserText: prompt)
             let toolContext = await aggregateToolContext(for: prompt)
+            motivationService.updateForPrompt(prompt)
+            let motivationContext = motivationService.contextBlock()
+            let experienceContext = experienceService.contextBlock(for: prompt)
             let detailBlock = "\nResponse Detail: \(detail.rawValue)\n"
-            let systemPrompt = identityService.systemPrompt + toolContext + detailBlock
+            let systemPrompt = identityService.systemPrompt + toolContext + experienceContext + motivationContext + detailBlock
             // 2. Generate response
             let assistantMessageId = UUID()
             messages.append(Message(id: assistantMessageId, role: .assistant, content: "", thinkContent: ""))
@@ -356,6 +371,14 @@ ISO‑время: \(iso)
                     messages[index].thinkContent = split.think
                     messages[index].content = split.final
                 }
+
+                let finalAnswer = messages[index].content
+                experienceService.recordExperience(
+                    userMessageId: userMessageId,
+                    assistantMessageId: assistantMessageId,
+                    userText: prompt,
+                    assistantText: finalAnswer
+                )
             }
 
             currentThink = ""

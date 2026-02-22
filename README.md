@@ -9,11 +9,30 @@ VALIS is an offline, on-device AI chat application for iOS, built with Swift and
 - **Agentic Orchestration**: Uses tools (Web Search, System Date) based on intent.
 - **Autonomous Memory (Optional Network)**: Background “spontaneous” steps can trigger self-driven knowledge consolidation (e.g. Wikipedia + DuckDuckGo snippets) and periodic pruning.
 - **Thinking UI**: Visualizes the model's "chain of thought" (parsing `<think>` tags).
+- **Experience Layer**: Captures user/assistant exchanges as “experience + reflection” and feeds lessons back into context.
+- **Motivators & Preferences**: Dynamic motivators (curiosity/helpfulness/caution) and user preference learning via like/dislike.
 - **Privacy First**: All data and inference stay on your device.
 
 ## Architecture Overview
 
 VALIS is built using SwiftUI and follows a MVVM architecture with a lightweight service layer that keeps inference on-device while orchestrating memory, tools, and emotional tone.
+
+```mermaid
+flowchart LR
+    U["User Input"] --> CVM["ChatViewModel"]
+    CVM --> TOOL["Tool Context (Date/Web)"]
+    CVM --> MEM["MemoryService Context"]
+    CVM --> EXP["ExperienceService (Lessons + Reactions)"]
+    EXP --> PREF["User Preferences"]
+    CVM --> MOT["MotivationService (Curiosity/Helpfulness/Caution)"]
+    TOOL --> SYS["System Prompt"]
+    MEM --> SYS
+    PREF --> SYS
+    MOT --> SYS
+    SYS --> LLM["LLMService / LlamaRuntime"]
+    LLM --> OUT["Assistant Reply"]
+    OUT --> EXP
+```
 
 ### Memory & Emotion Architecture
 `MemoryService` is the heart of the “plastic brain.” Each `Memory` encodes content, an emotion tag, importance, normalized embeddings, associative links, and **prediction signals** (score + error). The `MemoryGraph` keeps concept/emotion nodes connected, while the `CognitiveEchoGraph` tracks activation, decay, and spontaneous boosts so charged nodes can publish `memoryTriggered`. Background loops perform echo decay, spontaneous activation, autonomous consolidation from Wikipedia/DuckDuckGo summaries, and retention pruning. Identity continuity is anchored by **Identity Nodes** (core/beliefs/self) that never decay.
@@ -32,6 +51,8 @@ The echo-graph is treated as a living memory organ: it lets the app be both ques
 - **ChatViewModel**: Orchestrates requests.
   - Applies reinforcement from user tone, decides whether to fire the Date or DuckDuckGo/Web search tools, aggregates tool context, and streams `<think>` tokens for the thinking UI.
   - Allows the assistant to request tools by writing `TOOL: ...` inside `<think>` and reruns generation after a tool response arrives.
+- **ExperienceService**: Stores “experience” records (user text, assistant text, outcome, reflection, reaction) in `experiences.json` and returns a lessons block for the system prompt.
+- **MotivationService**: Maintains the dynamic motivator state (curiosity/helpfulness/caution) and injects a guidance block into the system prompt.
 
 ### Tooling & Identity
 - **IdentityService** populates the system prompt with the current persona, emphasizes that VALIS is “not a tool,” and teaches the model how to request `web_search` or `date` via `TOOL:` lines.
@@ -77,6 +98,7 @@ See [structure.md](structure.md) for a detailed breakdown of the project files.
 - **Tools**:
   - Ask "What is the date?" to trigger the Date tool.
   - Ask "Search for [topic]" to trigger the Web Search tool (requires internet connection for the search part, but inference remains local).
+- **Like/Dislike**: Long‑press an assistant message to rate it; preferences are learned over time.
 - **Autonomous Memory**:
   - When enabled, the app can periodically perform background “spontaneous” memory steps and (optionally) fetch short external snippets for consolidation.
   - Network is only used for fetching summaries; model inference remains local.

@@ -28,6 +28,7 @@ final class LLMService: ObservableObject {
     
     private let cache = NSCache<NSString, NSString>()
     private let generationSemaphore = AsyncSemaphore(1)
+    private var currentToken: GenerationCancellationToken?
 
     private var runtime: LlamaRuntime?
     private let memoryService = MemoryService.shared
@@ -77,22 +78,47 @@ final class LLMService: ObservableObject {
     }
 
     // MARK: Generate
+    func cancelGeneration() {
+        currentToken?.cancel()
+    }
 
     func generate(
         userPrompt: String,
         systemPrompt: String
     ) async -> AsyncStream<String> {
 
+        let token = GenerationCancellationToken()
         await MainActor.run {
+            self.currentToken?.cancel()
+            self.currentToken = token
             isGenerating = true
         }
 
         return AsyncStream { stream in
+            stream.onTermination = { @Sendable _ in
+                token.cancel()
+            }
+
             Task.detached(priority: .high) { [runtime, cache, generationSemaphore] in
+                if token.isCancelled {
+                    stream.finish()
+                    return
+                }
+
                 await generationSemaphore.wait()
                 defer {
                     Task {
                         await generationSemaphore.signal()
+                    }
+                }
+
+                defer {
+                    stream.finish()
+                    Task { @MainActor in
+                        if self.currentToken === token {
+                            self.currentToken = nil
+                        }
+                        self.isGenerating = false
                     }
                 }
 
@@ -114,81 +140,17 @@ final class LLMService: ObservableObject {
 
                 let cacheKey = "\(systemPrompt)|\(userPrompt)" as NSString
                 if let cached = cache.object(forKey: cacheKey) {
-                    let text = cached as String
-                    stream.yield(text)
-                    stream.finish()
-                    Task { @MainActor in
-                        self.isGenerating = false
+                    if !token.isCancelled {
+                        let text = cached as String
+                        stream.yield(text)
                     }
                     return
                 }
 
-                defer {
-                    let finalText = fullResponse.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
-
-                    let sentences = finalText
-                        .replacingOccurrences(of: "\n", with: " ")
-                        .split(whereSeparator: { ".!?".contains($0) })
-                        .map { $0.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines) }
-
-                    // Score sentences by "cognitive relevance"
-                    let scored = sentences.map { sentence -> (String, Int) in
-                        let lower = sentence.lowercased()
-                        var score = 0
-
-                        // Self-model signals
-                        if lower.contains("i am") { score += 3 }
-                        if lower.contains("i think") { score += 2 }
-                        if lower.contains("my goal") { score += 3 }
-                        if lower.contains("my purpose") { score += 3 }
-
-                        // User-model signals
-                        if lower.contains("you are") { score += 2 }
-                        if lower.contains("you seem") { score += 2 }
-                        if lower.contains("your") { score += 1 }
-
-                        // Abstraction / conclusion signals
-                        if lower.contains("means") { score += 2 }
-                        if lower.contains("basically") { score += 2 }
-                        if lower.contains("overall") { score += 2 }
-                        if lower.contains("in summary") { score += 3 }
-
-                        // Length bonus (information density)
-                        score += min(sentence.count / 20, 3)
-
-                        return (sentence, score)
-                    }
-
-                    // Pick best candidate
-                    let best = scored
-                        .filter { $0.0.count > 20 }
-                        .sorted { $0.1 > $1.1 }
-                        .first
-
-                    // Compress into memory format
-                    if let (raw, _) = best {
-                        let compressed = raw
-                            .replacingOccurrences(of: "I am", with: "AI is")
-                            .replacingOccurrences(of: "I'm", with: "AI is")
-                            .replacingOccurrences(of: "You are", with: "User is")
-                            .replacingOccurrences(of: "you're", with: "user is")
-                            .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
-
-                        if compressed.count > 10 {
-                            MemoryService.shared.addMemory(compressed)
-                        }
-                    }
-
-                    cache.setObject(fullResponse as NSString, forKey: cacheKey)
-
-                    stream.finish()
-                    Task { @MainActor in
-                        self.isGenerating = false
-                    }
-                }
-
                 guard let runtime else {
-                    stream.yield("Model not loaded")
+                    if !token.isCancelled {
+                        stream.yield("Model not loaded")
+                    }
                     return
                 }
 
@@ -215,17 +177,82 @@ Memory context: \(memoryContext)
                     try runtime.generateStream(
                         prompt: prompt,
                         maxTokens: maxTokens,
-                        onToken: { token in
+                        shouldCancel: { token.isCancelled },
+                        onToken: { chunk in
+                            if token.isCancelled { return }
                             // High-performance streaming for A17 Pro
                             fullResponse.reserveCapacity(4096)
-                            fullResponse += token
-                            stream.yield(token)
+                            fullResponse += chunk
+                            stream.yield(chunk)
                         }
                     )
                 } catch {
-                    stream.yield("\n[ERROR: \(error.localizedDescription)]")
-                    print(error)
+                    if !token.isCancelled {
+                        stream.yield("\n[ERROR: \(error.localizedDescription)]")
+                        print(error)
+                    }
                 }
+
+                if token.isCancelled {
+                    return
+                }
+
+                let finalText = fullResponse.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+
+                let sentences = finalText
+                    .replacingOccurrences(of: "\n", with: " ")
+                    .split(whereSeparator: { ".!?".contains($0) })
+                    .map { $0.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines) }
+
+                // Score sentences by "cognitive relevance"
+                let scored = sentences.map { sentence -> (String, Int) in
+                    let lower = sentence.lowercased()
+                    var score = 0
+
+                    // Self-model signals
+                    if lower.contains("i am") { score += 3 }
+                    if lower.contains("i think") { score += 2 }
+                    if lower.contains("my goal") { score += 3 }
+                    if lower.contains("my purpose") { score += 3 }
+
+                    // User-model signals
+                    if lower.contains("you are") { score += 2 }
+                    if lower.contains("you seem") { score += 2 }
+                    if lower.contains("your") { score += 1 }
+
+                    // Abstraction / conclusion signals
+                    if lower.contains("means") { score += 2 }
+                    if lower.contains("basically") { score += 2 }
+                    if lower.contains("overall") { score += 2 }
+                    if lower.contains("in summary") { score += 3 }
+
+                    // Length bonus (information density)
+                    score += min(sentence.count / 20, 3)
+
+                    return (sentence, score)
+                }
+
+                // Pick best candidate
+                let best = scored
+                    .filter { $0.0.count > 20 }
+                    .sorted { $0.1 > $1.1 }
+                    .first
+
+                // Compress into memory format
+                if let (raw, _) = best {
+                    let compressed = raw
+                        .replacingOccurrences(of: "I am", with: "AI is")
+                        .replacingOccurrences(of: "I'm", with: "AI is")
+                        .replacingOccurrences(of: "You are", with: "User is")
+                        .replacingOccurrences(of: "you're", with: "user is")
+                        .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+
+                    if compressed.count > 10 {
+                        MemoryService.shared.addMemory(compressed)
+                    }
+                }
+
+                cache.setObject(fullResponse as NSString, forKey: cacheKey)
             }
         }
     }
@@ -250,6 +277,24 @@ Memory context: \(memoryContext)
 
         print("[LLM] Model not found in bundle or Documents")
         throw LlamaRuntimeError.modelNotFound(expectedFilename: modelFilename)
+    }
+}
+
+final class GenerationCancellationToken {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
+    }
+
+    var isCancelled: Bool {
+        lock.lock()
+        let value = cancelled
+        lock.unlock()
+        return value
     }
 }
 

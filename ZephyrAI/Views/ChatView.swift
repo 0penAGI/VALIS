@@ -185,6 +185,13 @@ struct ChatView: View {
         .onTapGesture {
             UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
         }
+        .onChange(of: viewModel.isInteracting) { _, newValue in
+            if newValue {
+                isInputFocused = false
+            } else {
+                isInputFocused = false
+            }
+        }
         .navigationBarHidden(true)
         .sheet(isPresented: $showSettings) {
             SettingsView()
@@ -350,6 +357,7 @@ struct MessageView: View {
     let currentThink: String
     
     private let speech = SpeechService.shared
+    private let experienceService = ExperienceService.shared
     
     private enum Segment {
         case text(String)
@@ -361,11 +369,19 @@ struct MessageView: View {
         parseSegments(message.content)
     }
     
-    private func md(_ s: String) -> Text {
+    private func md(_ s: String) -> some View {
+        let base: Text
         if let a = try? AttributedString(markdown: s) {
-            return Text(a)
+            base = Text(a)
+        } else {
+            base = Text(s)
         }
-        return Text(s)
+
+        return base
+            .fixedSize(horizontal: false, vertical: true)
+            .lineLimit(nil)
+            .multilineTextAlignment(.leading)
+            .textSelection(.enabled)
     }
     
     private func parseSegments(_ s: String) -> [Segment] {
@@ -534,6 +550,20 @@ struct MessageView: View {
                             Text("Speak (Male)")
                             Image(systemName: "waveform.circle")
                         }
+                        if message.role == .assistant {
+                            Button(action: {
+                                experienceService.applyReaction(forAssistantMessageId: message.id, isLike: true)
+                            }) {
+                                Text("Like")
+                                Image(systemName: "hand.thumbsup")
+                            }
+                            Button(action: {
+                                experienceService.applyReaction(forAssistantMessageId: message.id, isLike: false)
+                            }) {
+                                Text("Dislike")
+                                Image(systemName: "hand.thumbsdown")
+                            }
+                        }
                     }
             } else {
                 VStack(alignment: .leading) {
@@ -561,6 +591,8 @@ struct MessageView: View {
                             }
                                 .padding()
                                 .foregroundColor(.primary)
+                                .opacity(message.content.isEmpty ? 0.01 : 1.0)
+                                .animation(.easeOut(duration: 0.2), value: message.content)
                                 .contextMenu {
                                     Button(action: {
                                         UIPasteboard.general.string = message.content
@@ -579,6 +611,20 @@ struct MessageView: View {
                                     }) {
                                         Text("Speak (Male)")
                                         Image(systemName: "waveform.circle")
+                                    }
+                                    if message.role == .assistant {
+                                        Button(action: {
+                                            experienceService.applyReaction(forAssistantMessageId: message.id, isLike: true)
+                                        }) {
+                                            Text("Like")
+                                            Image(systemName: "hand.thumbsup")
+                                        }
+                                        Button(action: {
+                                            experienceService.applyReaction(forAssistantMessageId: message.id, isLike: false)
+                                        }) {
+                                            Text("Dislike")
+                                            Image(systemName: "hand.thumbsdown")
+                                        }
                                     }
                                 }
                         }

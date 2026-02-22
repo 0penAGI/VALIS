@@ -51,6 +51,12 @@ This directory contains the core business logic and backend services.
 - **SpeechService.swift**: Handles speech-to-text and text-to-speech functionality (if enabled).
 - **Notifications.swift**: NotificationCenter event names used for cross-layer signaling.
   - `memoryTriggered`: published when the echo graph crosses a trigger threshold.
+- **ExperienceService.swift**: Captures exchanges as structured “experience” records.
+  - Persists `experiences.json` with outcome + reflection + user reaction.
+  - Learns user preference signals and stores `user_preferences.json`.
+  - Provides a lessons block for the system prompt.
+- **MotivationService.swift**: Maintains dynamic motivators (curiosity/helpfulness/caution) based on prompt/reactions.
+  - Injects a guidance block into the system prompt.
 
 ### ViewModels (`ZephyrAI/ViewModels/`)
 - **ChatViewModel.swift**: The main view model for the chat interface.
@@ -58,11 +64,14 @@ This directory contains the core business logic and backend services.
   - Implements a Rule Engine to decide when to use tools (Web Search, Date).
   - Applies reinforcement from user tone, streams `<think>` via `ThinkStreamParser`, and re-invokes `LLMService` when `TOOL:` lines request a search or the date.
   - Aggregates context from tools and memory before sending to `LLMService`.
+  - Adds experience lessons + motivators into the system prompt.
+  - Records experiences after each assistant response and learns preferences from reactions.
   - Parses `<think>` tags from the model output for the "Thinking UI".
   - Listens for `memoryTriggered` and can initiate a spontaneous “learning” response when the chat is idle.
 
 ### Views (`ZephyrAI/Views/`)
 - **ChatView.swift**: The main chat interface. Displays the message list, input field, and "Thinking" panel.
+  - Long‑press context menu includes copy, speak, and like/dislike for assistant messages.
 - **MemoryListView.swift**: A debug/management view for inspecting and modifying stored memories.
 - **SettingsView.swift**: Application settings.
 

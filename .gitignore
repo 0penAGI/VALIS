@@ -12,6 +12,12 @@ DerivedData/
 # Xcode
 *.xcscmblueprint
 
+# Exclude embedded repos / large deps
+AnyLanguageModel/
+Frameworks/
+mlx-swift/
+swift-llama-cpp/
+
 # Large model files
 *.gguf
 # Vendored binaries
