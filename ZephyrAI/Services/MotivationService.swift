@@ -58,6 +58,16 @@ final class MotivationService: ObservableObject {
         }
     }
 
+    func updateForOutcome(_ outcome: String) {
+        let lower = outcome.lowercased()
+        if lower.contains("uncertain") || lower.contains("clarifying") || lower.contains("waiting") {
+            state.caution = clamp(state.caution + 0.08)
+        }
+        if lower.contains("too short") || lower.contains("missing detail") {
+            state.helpfulness = clamp(state.helpfulness + 0.08)
+        }
+    }
+
     func contextBlock(maxChars: Int = 280) -> String {
         let block = String(format: "Motivators:\nCuriosity: %.2f\nHelpfulness: %.2f\nCaution: %.2f\nGuidance: Balance curiosity with usefulness; increase caution when stakes are high.", state.curiosity, state.helpfulness, state.caution)
         if block.count <= maxChars { return "\n\n" + block }

@@ -119,6 +119,13 @@ final class ExperienceService: ObservableObject {
         experiences.append(exp)
         pendingReactionId = exp.id
         saveExperiences()
+
+        MotivationService.shared.updateForOutcome(outcome)
+        let importance = estimateExperienceImportance(outcome: outcome, reflection: reflection, motivators: MotivationService.shared.state)
+        let combined = "[experience] outcome: \(outcome) | reflection: \(reflection)"
+        Task { @MainActor in
+            MemoryService.shared.addExperienceMemory(combined, importanceOverride: importance)
+        }
     }
 
     @discardableResult
@@ -176,6 +183,15 @@ final class ExperienceService: ObservableObject {
         return "\n\n" + trimmed + preferences.contextBlock()
     }
 
+    func preferenceScore(for text: String) -> Double {
+        let topics = extractConcepts(from: text)
+        guard !topics.isEmpty else { return 0.0 }
+        let scores = topics.compactMap { preferences.topicScores[$0] }
+        if scores.isEmpty { return 0.0 }
+        let avg = scores.reduce(0.0, +) / Double(scores.count)
+        return max(-1.0, min(1.0, avg))
+    }
+
     // MARK: - Heuristics
 
     private func estimateOutcome(userText: String, assistantText: String) -> String {
@@ -186,24 +202,21 @@ final class ExperienceService: ObservableObject {
         if assistantText.count < 60 {
             return "Answer too short; likely missing detail"
         }
-        if assistantText.contains("?") {
-            return "Asked clarifying question; waiting on user"
-        }
-        return "Delivered a full response; validate usefulness"
+        return "Delivered a full response; focus on usefulness"
     }
 
     private func generateReflection(userText: String, assistantText: String, outcome: String) -> String {
         let lower = userText.lowercased()
         if lower.contains("почему") || lower.contains("explain") || lower.contains("why") {
-            return "When user asks why, respond with cause + steps + example"
+            return "Explain with cause + steps + example, without asking follow-up"
         }
         if assistantText.count < 60 {
-            return "Increase detail level if user seems confused"
+            return "Increase detail level proactively"
         }
         if outcome.contains("uncertain") {
-            return "If unsure, ask for context or cite limits"
+            return "Make best assumption and answer directly"
         }
-        return "Keep response structured and actionable"
+        return "Keep response structured, direct, and actionable"
     }
 
     private func estimateValence(for text: String) -> Double {
@@ -237,9 +250,28 @@ final class ExperienceService: ObservableObject {
         let delta = max(-0.6, min(0.6, valence * 0.4))
         preferences.update(topics: topics, delta: delta)
         MotivationService.shared.updateForReaction(valence: valence)
+        IdentityProfileService.shared.recordSignal(
+            experience: updated,
+            reactionValence: valence,
+            preferences: preferences,
+            motivators: MotivationService.shared.state
+        )
 
         saveExperiences()
         savePreferences()
+    }
+
+    private func estimateExperienceImportance(outcome: String, reflection: String, motivators: MotivatorState) -> Double {
+        var score = 0.7
+        if outcome.lowercased().contains("uncertain") {
+            score -= 0.1
+        }
+        if reflection.lowercased().contains("structured") || reflection.lowercased().contains("steps") {
+            score += 0.1
+        }
+        score += (motivators.helpfulness - 0.5) * 0.4
+        score += (motivators.caution - 0.5) * 0.2
+        return max(0.4, min(1.2, score))
     }
 
     private func extractConcepts(from text: String) -> [String] {

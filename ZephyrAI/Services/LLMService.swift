@@ -159,7 +159,7 @@ final class LLMService: ObservableObject {
                 let maxPromptChars = Int(effectiveContextSize) * approxCharsPerToken
                 let systemAndUserChars = systemPrompt.count + userPrompt.count + 200
                 let memoryBudget = max(0, maxPromptChars - systemAndUserChars)
-                let memoryContext = MemoryService.shared.getContextBlock(maxChars: memoryBudget)
+                let memoryContext = await MemoryService.shared.getContextBlock(maxChars: memoryBudget)
 
                 let prompt = """
 <|im_start|>system
@@ -177,7 +177,7 @@ Memory context: \(memoryContext)
                     try runtime.generateStream(
                         prompt: prompt,
                         maxTokens: maxTokens,
-                        shouldCancel: { token.isCancelled },
+                        shouldStop: { token.isCancelled },
                         onToken: { chunk in
                             if token.isCancelled { return }
                             // High-performance streaming for A17 Pro
@@ -248,13 +248,28 @@ Memory context: \(memoryContext)
                         .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
 
                     if compressed.count > 10 {
-                        MemoryService.shared.addMemory(compressed)
+                        await MainActor.run {
+                            MemoryService.shared.addMemory(compressed)
+                        }
                     }
                 }
 
                 cache.setObject(fullResponse as NSString, forKey: cacheKey)
             }
         }
+    }
+
+    func generateText(
+        userPrompt: String,
+        systemPrompt: String
+    ) async -> String {
+        var output = ""
+        let stream = await generate(userPrompt: userPrompt, systemPrompt: systemPrompt)
+        for await chunk in stream {
+            if Task.isCancelled { break }
+            output += chunk
+        }
+        return output
     }
 
     private func resolveModelURL() throws -> URL {

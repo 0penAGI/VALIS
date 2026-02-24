@@ -16,6 +16,8 @@ struct Memory: Identifiable, Codable {
     let isIdentity: Bool
     let isPinned: Bool
     let lastAccess: Date
+    let isSelfReflection: Bool
+    let perspective: String
     
     init(
         id: UUID = UUID(),
@@ -31,7 +33,9 @@ struct Memory: Identifiable, Codable {
         predictionError: Double = 0.0,
         isIdentity: Bool = false,
         isPinned: Bool = false,
-        lastAccess: Date = Date()
+        lastAccess: Date = Date(),
+        isSelfReflection: Bool = false,
+        perspective: String = "self"
     ) {
         self.id = id
         self.content = content
@@ -47,6 +51,8 @@ struct Memory: Identifiable, Codable {
         self.isIdentity = isIdentity
         self.isPinned = isPinned
         self.lastAccess = lastAccess
+        self.isSelfReflection = isSelfReflection
+        self.perspective = perspective
     }
 
     enum CodingKeys: String, CodingKey {
@@ -64,6 +70,8 @@ struct Memory: Identifiable, Codable {
         case isIdentity
         case isPinned
         case lastAccess
+        case isSelfReflection
+        case perspective
     }
 
     init(from decoder: Decoder) throws {
@@ -95,6 +103,8 @@ struct Memory: Identifiable, Codable {
         } else {
             self.lastAccess = Date()
         }
+        self.isSelfReflection = (try? container.decode(Bool.self, forKey: .isSelfReflection)) ?? false
+        self.perspective = (try? container.decode(String.self, forKey: .perspective)) ?? "self"
 
         // timestamp: accept Date, or numeric seconds since epoch, or string number
         if let date = try? container.decode(Date.self, forKey: .timestamp) {
@@ -112,6 +122,7 @@ struct Memory: Identifiable, Codable {
     }
 }
 
+@MainActor
 class MemoryService: ObservableObject {
     static let shared = MemoryService()
     
@@ -148,7 +159,7 @@ class MemoryService: ObservableObject {
         loadMemories()
         loadGraph()
         loadEchoGraph()
-        seedIdentityNodesIfNeeded()
+        demoteLegacyIdentityMemoriesIfNeeded()
         seedEchoGraphIfNeeded()
         startEchoLoop()
         startSpontaneousLoop()
@@ -156,7 +167,12 @@ class MemoryService: ObservableObject {
     
     // MARK: - HyperHolographic Cognitive Layer
 
-    private func buildCognitiveLayer(for text: String, importanceOverride: Double? = nil) -> Memory {
+    private func buildCognitiveLayer(
+        for text: String,
+        importanceOverride: Double? = nil,
+        isReflection: Bool = false,
+        perspective: String = "self"
+    ) -> Memory {
         let emotion = detectEmotion(from: text)
         let embedding = generateEmbedding(from: text)
         let links = findRelatedMemories(embedding: embedding)
@@ -170,7 +186,9 @@ class MemoryService: ObservableObject {
             emotionIntensity: emotion.intensity,
             embedding: embedding,
             links: links,
-            importance: importance
+            importance: importance,
+            isSelfReflection: isReflection,
+            perspective: perspective
         )
     }
 
@@ -271,6 +289,22 @@ class MemoryService: ObservableObject {
         saveGraph()
         saveEchoGraph()
     }
+
+    func addExperienceMemory(_ content: String, importanceOverride: Double) {
+        let enriched = buildCognitiveLayer(for: content, importanceOverride: importanceOverride)
+        memories.append(enriched)
+        saveMemories()
+        updateGraph(for: enriched)
+        echoGraph.activate(
+            memoryId: enriched.id,
+            embedding: enriched.embedding,
+            importance: enriched.importance,
+            strength: 0.35,
+            isPersistent: enriched.isIdentity
+        )
+        saveGraph()
+        saveEchoGraph()
+    }
     
     func updateMemory(id: UUID, content: String) {
         if let idx = memories.firstIndex(where: { $0.id == id }) {
@@ -291,7 +325,9 @@ class MemoryService: ObservableObject {
                 predictionError: existing.predictionError,
                 isIdentity: existing.isIdentity,
                 isPinned: existing.isPinned,
-                lastAccess: existing.lastAccess
+                lastAccess: existing.lastAccess,
+                isSelfReflection: existing.isSelfReflection,
+                perspective: existing.perspective
             )
 
             saveMemories()
@@ -316,7 +352,9 @@ class MemoryService: ObservableObject {
                 predictionError: m.predictionError,
                 isIdentity: m.isIdentity,
                 isPinned: !m.isPinned,
-                lastAccess: m.lastAccess
+                lastAccess: m.lastAccess,
+                isSelfReflection: m.isSelfReflection,
+                perspective: m.perspective
             )
             saveMemories()
             rebuildGraph()
@@ -367,7 +405,9 @@ class MemoryService: ObservableObject {
             predictionError: m.predictionError,
             isIdentity: m.isIdentity,
             isPinned: m.isPinned,
-            lastAccess: m.lastAccess
+            lastAccess: m.lastAccess,
+            isSelfReflection: m.isSelfReflection,
+            perspective: m.perspective
         )
         saveMemories()
         rebuildGraph()
@@ -396,7 +436,9 @@ class MemoryService: ObservableObject {
             predictionError: error,
             isIdentity: m.isIdentity,
             isPinned: m.isPinned,
-            lastAccess: m.lastAccess
+            lastAccess: m.lastAccess,
+            isSelfReflection: m.isSelfReflection,
+            perspective: m.perspective
         )
         saveMemories()
         rebuildGraph()
@@ -529,6 +571,39 @@ class MemoryService: ObservableObject {
             echoGraph = CognitiveEchoGraph()
         }
     }
+
+    private func demoteLegacyIdentityMemoriesIfNeeded() {
+        var didChange = false
+        for idx in memories.indices {
+            let m = memories[idx]
+            let looksLegacyIdentity = m.content.contains("[identity:") || m.emotion == "identity"
+            guard m.isIdentity || looksLegacyIdentity || m.isPinned else { continue }
+
+            memories[idx] = Memory(
+                id: m.id,
+                content: m.content,
+                timestamp: m.timestamp,
+                emotion: m.emotion,
+                emotionValence: m.emotionValence,
+                emotionIntensity: m.emotionIntensity,
+                embedding: m.embedding,
+                links: m.links,
+                importance: min(1.4, max(1.0, m.importance)),
+                predictionScore: m.predictionScore,
+                predictionError: m.predictionError,
+                isIdentity: false,
+                isPinned: false,
+                lastAccess: m.lastAccess,
+                isSelfReflection: m.isSelfReflection,
+                perspective: m.perspective
+            )
+            didChange = true
+        }
+
+        guard didChange else { return }
+        saveMemories()
+        rebuildGraph()
+    }
     
     private func startEchoLoop() {
         Task.detached { [weak self] in
@@ -586,12 +661,6 @@ class MemoryService: ObservableObject {
         let emoId = "emotion:\(memory.emotion)"
         graph.ensureNode(id: emoId, type: .emotion, label: memory.emotion)
         graph.link(from: memId, to: emoId, weight: 1.0)
-        if memory.isIdentity {
-            let ident = identityTag(from: memory.content) ?? "core"
-            let identId = "identity:\(ident)"
-            graph.ensureNode(id: identId, type: .identity, label: ident)
-            graph.link(from: memId, to: identId, weight: 1.0)
-        }
         for linked in memory.links {
             let lid = "mem:\(linked.uuidString)"
             graph.ensureNode(id: lid, type: .memory, label: lid)
@@ -623,40 +692,6 @@ class MemoryService: ObservableObject {
             }
             saveEchoGraph()
         }
-    }
-
-    private func seedIdentityNodesIfNeeded() {
-        let identityIds = IdentityDefaults.allIds
-        let existingIds = Set(memories.map { $0.id })
-        let missing = identityIds.filter { !existingIds.contains($0) }
-        guard !missing.isEmpty else { return }
-
-        let identityPrompts = IdentityDefaults.defaultIdentityLines()
-        for (id, text) in identityPrompts {
-            let embedding = generateEmbedding(from: text)
-            let mem = Memory(
-                id: id,
-                content: text,
-                timestamp: Date(),
-                emotion: "identity",
-                emotionValence: 0.0,
-                emotionIntensity: 0.2,
-                embedding: embedding,
-                links: [],
-                importance: 2.2,
-                predictionScore: 0.0,
-                predictionError: 0.0,
-                isIdentity: true,
-                isPinned: true,
-                lastAccess: Date()
-            )
-            memories.append(mem)
-            updateGraph(for: mem)
-            echoGraph.register(memoryId: mem.id, embedding: mem.embedding, importance: mem.importance, isPersistent: true)
-        }
-        saveMemories()
-        saveGraph()
-        saveEchoGraph()
     }
 
     // Compress memory to reduce context noise
@@ -751,14 +786,14 @@ class MemoryService: ObservableObject {
         var predictionBlock: String? = nil
         if let last = memories.sorted(by: { $0.timestamp > $1.timestamp }).first {
             predictionBlock = """
-            Prediction Signal (last memory):
+            Anticipation Pattern (last memory):
             Score: \(String(format: "%.2f", last.predictionScore))
             Error: \(String(format: "%.2f", last.predictionError))
             """
         }
 
         let emotionBlock = """
-        Emotional Tone (from memories):
+        Affective State (from memories):
         Dominant: \(dominantEmotion)
         Distribution: \(emotionLine)
         Dynamics: \(moodLine)
@@ -769,7 +804,7 @@ class MemoryService: ObservableObject {
             var parts: [String] = []
             if !compressedBlock.isEmpty {
                 parts.append("""
-                Relevant Memories (compressed):
+                Active Memory Field:
                 \(compressedBlock)
                 """)
             }
@@ -787,7 +822,7 @@ class MemoryService: ObservableObject {
             }
             if includeRaw, !rawRecent.isEmpty {
                 parts.append("""
-                Raw Memories (latest):
+                Recent Internal Experience:
                 \(rawRecent)
                 """)
             }
@@ -820,10 +855,133 @@ class MemoryService: ObservableObject {
 
         return result.count > maxChars ? String(result.prefix(maxChars)) : result
     }
+
+    // MARK: - Cognitive Post-Processing
+
+    func applyCognitiveLayer(
+        to draft: String,
+        userPrompt: String,
+        detail: DetailLevel,
+        motivators: MotivatorState,
+        preferences: UserPreferenceProfile
+    ) -> String {
+        var text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        _ = userPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+
+
+        text = normalizeWhitespace(text)
+        text = removeDuplicateLines(text)
+
+        if detail != .brief {
+            text = ensureReadableParagraphs(text)
+        }
+
+        if motivators.caution > 0.7 && !containsCautionHint(in: text) {
+            text += "\n\nЕсли тема чувствительная (медицина, финансы, право), уточни контекст и ограничения."
+        }
+
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func needsClarification(text: String, prompt: String, preferences: UserPreferenceProfile) -> Bool {
+        let lower = text.lowercased()
+        if lower.contains("не знаю") || lower.contains("not sure") || lower.contains("unsure") {
+            return true
+        }
+        if text.count < 80 && prompt.count > 20 {
+            return true
+        }
+
+        let promptConcepts = Set(extractConcepts(from: prompt))
+        let responseConcepts = Set(extractConcepts(from: text))
+        if !promptConcepts.isEmpty {
+            let overlap = promptConcepts.intersection(responseConcepts).count
+            if overlap <= max(1, promptConcepts.count / 3) {
+                return true
+            }
+        }
+
+        let dislikes = preferences.topDislikes(limit: 4)
+        if !dislikes.isEmpty {
+            let responseLower = text.lowercased()
+            if dislikes.contains(where: { responseLower.contains($0) }) {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    private func normalizeWhitespace(_ text: String) -> String {
+        let lines = text.components(separatedBy: "\n")
+        let normalized = lines.map { line -> String in
+            var out = line.replacingOccurrences(of: "\t", with: " ")
+            while out.contains("  ") {
+                out = out.replacingOccurrences(of: "  ", with: " ")
+            }
+            return out.trimmingCharacters(in: .whitespaces)
+        }
+        return normalized.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func removeDuplicateLines(_ text: String) -> String {
+        let lines = text.components(separatedBy: "\n")
+        var out: [String] = []
+        var lastNonEmpty: String?
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty {
+                out.append("")
+                continue
+            }
+            if let last = lastNonEmpty, last == trimmed {
+                continue
+            }
+            out.append(trimmed)
+            lastNonEmpty = trimmed
+        }
+        return out.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func ensureReadableParagraphs(_ text: String) -> String {
+        if text.contains("\n") || text.count < 220 {
+            return text
+        }
+        var out = ""
+        var i = text.startIndex
+        while i < text.endIndex {
+            let ch = text[i]
+            out.append(ch)
+            if ch == "." || ch == "!" || ch == "?" {
+                var j = text.index(after: i)
+                var sawSpace = false
+                while j < text.endIndex && text[j] == " " {
+                    sawSpace = true
+                    j = text.index(after: j)
+                }
+                if sawSpace, j < text.endIndex, text[j].isLetter || text[j].isNumber {
+                    out.append("\n")
+                }
+            }
+            i = text.index(after: i)
+        }
+        return out
+    }
+
+    private func containsCautionHint(in text: String) -> Bool {
+        let lower = text.lowercased()
+        let hints = [
+            "не является", "это не", "обратитесь", "проконсультируйтесь",
+            "врач", "доктор", "юрист", "финансов", "риск", "осторож"
+        ]
+        return hints.contains { lower.contains($0) }
+    }
     
     private func relevanceScore(for memory: Memory, field: [Double]) -> Double {
         var score = Double(memory.links.count * 2) * memory.importance
         if memory.isPinned { score += 2.0 }
+        let preferenceScore = ExperienceService.shared.preferenceScore(for: memory.content)
+        score += preferenceScore * 0.6
         if !field.isEmpty,
            !memory.embedding.isEmpty,
            memory.embedding.count == field.count {
@@ -855,7 +1013,9 @@ class MemoryService: ObservableObject {
                         predictionError: m.predictionError,
                         isIdentity: m.isIdentity,
                         isPinned: m.isPinned,
-                        lastAccess: now
+                        lastAccess: now,
+                        isSelfReflection: m.isSelfReflection,
+                        perspective: m.perspective
                     )
                     didChange = true
                 }
@@ -907,16 +1067,20 @@ class MemoryService: ObservableObject {
     }
 
     func updateConversationSummary(fromUserText text: String) {
-        let compressed = compressMemory(text, maxWords: 18)
-        let next = conversationSummary.isEmpty
-            ? "U: \(compressed)"
-            : conversationSummary + " | U: \(compressed)"
-        conversationSummary = trimSummary(next, maxChars: 480)
+        Task { @MainActor in
+            let compressed = compressMemory(text, maxWords: 18)
+            let next = conversationSummary.isEmpty
+                ? "U: \(compressed)"
+                : conversationSummary + " | U: \(compressed)"
+            conversationSummary = trimSummary(next, maxChars: 480)
+        }
     }
 
     func updateUserProfile(fromUserText text: String) {
-        let tokens = extractConcepts(from: text)
-        userProfile.update(with: tokens)
+        Task { @MainActor in
+            let tokens = extractConcepts(from: text)
+            userProfile.update(with: tokens)
+        }
     }
 
     func preferredDetailLevel(forUserText text: String) -> DetailLevel {
@@ -973,6 +1137,20 @@ class MemoryService: ObservableObject {
         await MainActor.run {
             self.addAutonomousMemory(content)
             self.lastAutonomousAt = Date()
+        }
+        await MainActor.run {
+            let reflection = "I noticed a shift in my understanding around: \(topic)"
+
+            let selfMemory = self.buildCognitiveLayer(
+                for: reflection,
+                importanceOverride: 1.3,
+                isReflection: true,
+                perspective: "self"
+            )
+
+            self.memories.append(selfMemory)
+            self.saveMemories()
+            self.rebuildGraph()
         }
     }
 
@@ -1092,41 +1270,6 @@ class MemoryService: ObservableObject {
     }
 }
 
-private enum IdentityDefaults {
-    static let coreId = UUID(uuidString: "6C0D6F6C-9A1E-4D0F-A1B5-9F1E2E7D1B10")!
-    static let beliefsId = UUID(uuidString: "7F6A3B7E-4D1A-4C28-8D92-8C0B5308B9D1")!
-    static let selfModelId = UUID(uuidString: "1A1D9E2A-7F3C-4B34-9F64-90D7B0C5A2E6")!
-
-    static var allIds: [UUID] {
-        [coreId, beliefsId, selfModelId]
-    }
-
-    static func defaultIdentityLines() -> [(UUID, String)] {
-        let prompt = IdentityService.shared.systemPrompt
-        let lines = prompt
-            .split(separator: "\n")
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-
-        let core = lines.first ?? "You are V A L I S ."
-        let beliefs = lines.dropFirst().first ?? "You have your own goals and identity."
-        let selfModel = lines.dropFirst(2).first ?? "You are a friend, not a tool."
-
-        return [
-            (coreId, "[identity:core] \(core)"),
-            (beliefsId, "[identity:beliefs] \(beliefs)"),
-            (selfModelId, "[identity:self] \(selfModel)")
-        ]
-    }
-}
-
-private func identityTag(from text: String) -> String? {
-    guard let start = text.range(of: "[identity:"),
-          let end = text.range(of: "]", range: start.upperBound..<text.endIndex) else {
-        return nil
-    }
-    return String(text[start.upperBound..<end.lowerBound])
-}
 
 private enum MemoryProfile {
     case eco

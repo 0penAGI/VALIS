@@ -15,6 +15,7 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
     private var hasUserInteracted: Bool = false
     
     private var generationTask: Task<Void, Never>?
+    private var activeGenerationId: UUID?
     private var cancellables = Set<AnyCancellable>()
     private var lastSpontaneousAt: Date?
     private let spontaneousCooldown: TimeInterval = 600
@@ -22,8 +23,10 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
     private let llmService = LLMService()
     private let memoryService = MemoryService.shared
     private let identityService = IdentityService.shared
+    private let identityProfileService = IdentityProfileService.shared
     private let experienceService = ExperienceService.shared
     private let motivationService = MotivationService.shared
+    private let emotionService = EmotionService.shared
 
     
     override init() {
@@ -63,11 +66,43 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
             }
             .store(in: &cancellables)
     }
+
+    private func normalizeStreamChunk(_ chunk: String) -> String {
+        // Convert literal "\n" into real newlines for nicer formatting.
+        chunk.replacingOccurrences(of: "\\n", with: "\n")
+    }
+
+    private func shouldInsertSpaceBetween(_ last: Character, _ first: Character) -> Bool {
+        let punctuation: Set<Character> = [".", "!", "?", ":", ";"]
+        guard punctuation.contains(last) else { return false }
+        return first.isLetter || first.isNumber
+    }
+
+    private func appendStreamChunk(_ existing: inout String, _ chunk: String) {
+        let normalized = normalizeStreamChunk(chunk)
+        guard !normalized.isEmpty else { return }
+
+        // Many models emit "\n " at the start of a new line. Keep newlines clean.
+        if let last = existing.last, last == "\n" {
+            if normalized.first == " " || normalized.first == "\t" {
+                let trimmed = normalized.drop(while: { $0 == " " || $0 == "\t" })
+                if !trimmed.isEmpty {
+                    existing.append(contentsOf: trimmed)
+                }
+                return
+            }
+        }
+        if let last = existing.last, let first = normalized.first, shouldInsertSpaceBetween(last, first) {
+            existing.append(" ")
+        }
+        existing.append(contentsOf: normalized)
+    }
     
     func stopGeneration() {
         generationTask?.cancel()
         generationTask = nil
         llmService.cancelGeneration()
+        activeGenerationId = nil
         isInteracting = false
         currentThink = ""
         currentThinkingMessageId = nil
@@ -105,6 +140,21 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
         ]
         return triggers.contains { lowercased.contains($0) }
     }
+
+    private func shouldUseNewsTool(for text: String) -> Bool {
+        let lowercased = text.lowercased()
+        let triggers = [
+            "news",
+            "latest",
+            "headlines",
+            "breaking",
+            "новости",
+            "свежие новости",
+            "последние новости",
+            "что нового"
+        ]
+        return triggers.contains { lowercased.contains($0) }
+    }
     
     private func buildToolContextBlock(from webContext: String) -> String {
         guard !webContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -114,6 +164,38 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
 
 Web search context:
 \(webContext)
+
+"""
+    }
+
+    private func buildToolGuidanceBlock(hasTools: Bool) -> String {
+        guard hasTools else { return "" }
+        return """
+
+Tool results are available below. Use them directly and do not claim you lack internet access.
+
+"""
+    }
+
+    private func buildNewsContextBlock(from newsContext: String) -> String {
+        guard !newsContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return ""
+        }
+        return """
+
+Reddit news context:
+\(newsContext)
+
+"""
+    }
+
+    private func buildToolErrorBlock(toolName: String, message: String) -> String {
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        return """
+
+Tool error (\(toolName)):
+\(trimmed)
 
 """
     }
@@ -137,6 +219,113 @@ ISO‑время: \(iso)
 
 """
     }
+
+    private func isSeriousPrompt(_ text: String) -> Bool {
+        let lower = text.lowercased()
+        let triggers = [
+            "urgent",
+            "emergency",
+            "asap",
+            "legal",
+            "medical",
+            "danger",
+            "срочно",
+            "экстренно",
+            "опасно",
+            "медицин",
+            "юрид"
+        ]
+        return triggers.contains { lower.contains($0) }
+    }
+
+    private func randomSpiceBlock(for text: String) -> String {
+        guard !isSeriousPrompt(text) else { return "" }
+        // 15% chance to add a small "alive" twist
+        if Int.random(in: 1...100) > 15 { return "" }
+
+        let options = [
+            "Add a subtle unexpected turn of phrase (max 8 words).",
+            "Allow one brief playful aside if it fits.",
+            "Keep tone warm, with a tiny spark of curiosity.",
+            "Use one short metaphor if it helps.",
+            "Add a light, human-sounding cadence."
+        ]
+        let pick = options.randomElement() ?? options[0]
+        return """
+
+Spontaneous flavor:
+\(pick)
+
+"""
+    }
+
+    private struct ParsedToolCall {
+        let name: String
+        let query: String
+    }
+
+    private func parseToolCall(from text: String) -> ParsedToolCall? {
+        let pattern = "(?im)^\\s*TOOL\\s*:\\s*(.+)$"
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = regex.firstMatch(in: text, range: range),
+              let lineRange = Range(match.range(at: 1), in: text) else {
+            return nil
+        }
+
+        let line = String(text[lineRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+        if line.isEmpty { return nil }
+
+        let parts = line.split(separator: "|", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        let rawName = parts.first ?? ""
+        let name = rawName.lowercased().replacingOccurrences(of: "-", with: "_")
+        if name.isEmpty { return nil }
+
+        let rawArgs = parts.count > 1 ? parts[1] : ""
+        var query = ""
+        if rawArgs.lowercased().hasPrefix("query=") {
+            query = String(rawArgs.dropFirst("query=".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+        } else {
+            query = rawArgs.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        return ParsedToolCall(name: name, query: query)
+    }
+
+    private func toolContext(for call: ParsedToolCall) async -> String {
+        switch call.name {
+        case "date":
+            return buildDateContextBlock()
+        case "web_search":
+            let q = call.query.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !q.isEmpty else {
+                return buildToolErrorBlock(toolName: "web_search", message: "Empty query.")
+            }
+            do {
+                let webContext = try await fetchDuckDuckGoSummary(query: q)
+                if !webContext.isEmpty {
+                    let snippets = splitSnippets(webContext)
+                    memoryService.ingestExternalSnippets(snippets, source: "duckduckgo", query: q)
+                    return buildToolContextBlock(from: webContext)
+                }
+                return buildToolErrorBlock(toolName: "web_search", message: "No summary found for the query.")
+            } catch {
+                return buildToolErrorBlock(toolName: "web_search", message: "Web search unavailable (network error).")
+            }
+        case "reddit_news":
+            do {
+                let news = try await fetchRedditNews(limit: 6)
+                if !news.isEmpty {
+                    return buildNewsContextBlock(from: news)
+                }
+                return buildToolErrorBlock(toolName: "reddit_news", message: "No news items returned.")
+            } catch {
+                return buildToolErrorBlock(toolName: "reddit_news", message: "Reddit news unavailable (network error).")
+            }
+        default:
+            return buildToolErrorBlock(toolName: call.name, message: "Unknown tool.")
+        }
+    }
     
     private func aggregateToolContext(for prompt: String) async -> String {
         var blocks: [String] = []
@@ -156,9 +345,25 @@ ISO‑время: \(iso)
                     let snippets = splitSnippets(webContext)
                     memoryService.ingestExternalSnippets(snippets, source: "duckduckgo", query: prompt)
                     blocks.append(buildToolContextBlock(from: webContext))
+                } else {
+                    blocks.append(buildToolErrorBlock(toolName: "web_search", message: "No summary found for the query."))
                 }
             } catch {
                 print("[Tools] Web search failed: \(error)")
+                blocks.append(buildToolErrorBlock(toolName: "web_search", message: "Web search unavailable (network error)."))
+            }
+        }
+
+        if shouldUseNewsTool(for: prompt) {
+            do {
+                let news = try await fetchRedditNews(limit: 6)
+                if !news.isEmpty {
+                    blocks.append(buildNewsContextBlock(from: news))
+                } else {
+                    blocks.append(buildToolErrorBlock(toolName: "reddit_news", message: "No news items returned."))
+                }
+            } catch {
+                blocks.append(buildToolErrorBlock(toolName: "reddit_news", message: "Reddit news unavailable (network error)."))
             }
         }
         
@@ -251,80 +456,132 @@ ISO‑время: \(iso)
 
         isInteracting = true
         lastSpontaneousAt = Date()
+        let generationId = UUID()
+        activeGenerationId = generationId
 
         let assistantMessageId = UUID()
         messages.append(Message(id: assistantMessageId, role: .assistant, content: "", thinkContent: ""))
         currentThinkingMessageId = assistantMessageId
         currentThink = ""
 
-        generationTask = Task {
+        generationTask = Task { [generationId] in
             var parser = ThinkStreamParser()
+            var visibleBuffer = ""
             let stream = await llmService.generate(userPrompt: prompt, systemPrompt: systemPrompt)
             for await chunk in stream {
-                if Task.isCancelled { break }
+                if Task.isCancelled || activeGenerationId != generationId { break }
                 let result = parser.feed(chunk)
                 if let index = messages.firstIndex(where: { $0.id == assistantMessageId }) {
                     if !result.visible.isEmpty, parser.allowVisibleStreaming {
-                        messages[index].content += result.visible
+                        appendStreamChunk(&visibleBuffer, result.visible)
                     }
                     if !result.think.isEmpty {
-                        currentThink += result.think
-                        messages[index].thinkContent? += result.think
+                        appendStreamChunk(&currentThink, result.think)
+                        if messages[index].thinkContent == nil {
+                            messages[index].thinkContent = ""
+                        }
+                        if var think = messages[index].thinkContent {
+                            appendStreamChunk(&think, result.think)
+                            messages[index].thinkContent = think
+                        }
                     }
                 }
             }
 
+            guard activeGenerationId == generationId else { return }
+
             if let index = messages.firstIndex(where: { $0.id == assistantMessageId }) {
                 let tail = parser.flush()
                 if !tail.visible.isEmpty, parser.allowVisibleStreaming {
-                    messages[index].content += tail.visible
+                    appendStreamChunk(&visibleBuffer, tail.visible)
                 }
                 if !tail.think.isEmpty {
-                    currentThink += tail.think
-                    messages[index].thinkContent? += tail.think
+                    appendStreamChunk(&currentThink, tail.think)
+                    if messages[index].thinkContent == nil {
+                        messages[index].thinkContent = ""
+                    }
+                    if var think = messages[index].thinkContent {
+                        appendStreamChunk(&think, tail.think)
+                        messages[index].thinkContent = think
+                    }
                 }
-                messages[index].content = cleanFinalAnswer(messages[index].content)
+                var finalText = cleanFinalAnswer(visibleBuffer)
+                if finalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                   let thinkText = messages[index].thinkContent,
+                   !thinkText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    let split = splitThinkIntoFinal(thinkText)
+                    messages[index].thinkContent = split.think
+                    finalText = split.final
+                }
+
+                let detail = memoryService.preferredDetailLevel(forUserText: prompt)
+                let filtered = memoryService.applyCognitiveLayer(
+                    to: finalText,
+                    userPrompt: prompt,
+                    detail: detail,
+                    motivators: motivationService.state,
+                    preferences: experienceService.preferences
+                )
+                messages[index].content = filtered
             }
 
             currentThink = ""
             currentThinkingMessageId = nil
             isInteracting = false
             generationTask = nil
+            activeGenerationId = nil
         }
     }
 
     func sendMessage() {
-        guard !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        let cleaned = inputText
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(
+                of: "\n[ \t]+",
+                with: "\n",
+                options: .regularExpression
+            )
+
+        guard !cleaned.isEmpty else { return }
 
         if let valence = experienceService.applyUserReaction(from: inputText) {
             motivationService.updateForReaction(valence: valence)
+            emotionService.updateForReaction(valence: valence)
         }
         hasUserInteracted = true
         
         generationTask?.cancel()
         generationTask = nil
         llmService.cancelGeneration()
+        activeGenerationId = nil
         
-        let userMessage = Message(role: .user, content: inputText)
+        let userMessage = Message(role: .user, content: cleaned)
         messages.append(userMessage)
         let userMessageId = userMessage.id
-        let prompt = inputText
+        let prompt = cleaned
         inputText = ""
         
         isInteracting = true
+        let generationId = UUID()
+        activeGenerationId = generationId
         
-        generationTask = Task {
+        generationTask = Task { [generationId] in
             memoryService.updateConversationSummary(fromUserText: prompt)
             memoryService.updateUserProfile(fromUserText: prompt)
             let detail = memoryService.preferredDetailLevel(forUserText: prompt)
             memoryService.applyPredictionFeedback(fromUserText: prompt)
             memoryService.applyReinforcement(fromUserText: prompt)
+            emotionService.updateForPrompt(prompt)
             let toolContext = await aggregateToolContext(for: prompt)
             motivationService.updateForPrompt(prompt)
             let motivationContext = motivationService.contextBlock()
+            let identityProfileContext = identityProfileService.contextBlock()
             let experienceContext = experienceService.contextBlock(for: prompt)
+            let emotionContext = emotionService.contextBlock()
             let detailBlock = "\nResponse Detail: \(detail.rawValue)\n"
-            let systemPrompt = identityService.systemPrompt + toolContext + experienceContext + motivationContext + detailBlock
+            let spiceBlock = randomSpiceBlock(for: prompt)
+            let toolGuidance = buildToolGuidanceBlock(hasTools: !toolContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            let systemPrompt = identityService.systemPrompt + identityProfileContext + emotionContext + toolGuidance + toolContext + experienceContext + motivationContext + detailBlock + spiceBlock
             // 2. Generate response
             let assistantMessageId = UUID()
             messages.append(Message(id: assistantMessageId, role: .assistant, content: "", thinkContent: ""))
@@ -332,19 +589,26 @@ ISO‑время: \(iso)
             currentThink = ""
             
             var parser = ThinkStreamParser()
+            var visibleBuffer = ""
             let stream = await llmService.generate(userPrompt: prompt, systemPrompt: systemPrompt)
             for await chunk in stream {
-                if Task.isCancelled {
+                if Task.isCancelled || activeGenerationId != generationId {
                     break
                 }
                 let result = parser.feed(chunk)
                 if let index = messages.firstIndex(where: { $0.id == assistantMessageId }) {
                     if !result.visible.isEmpty, parser.allowVisibleStreaming {
-                        messages[index].content += result.visible
+                        appendStreamChunk(&visibleBuffer, result.visible)
                     }
                     if !result.think.isEmpty {
-                        currentThink += result.think
-                        messages[index].thinkContent? += result.think
+                        appendStreamChunk(&currentThink, result.think)
+                        if messages[index].thinkContent == nil {
+                            messages[index].thinkContent = ""
+                        }
+                        if var think = messages[index].thinkContent {
+                            appendStreamChunk(&think, result.think)
+                            messages[index].thinkContent = think
+                        }
                     }
                 }
             }
@@ -352,25 +616,89 @@ ISO‑время: \(iso)
             // 3. Update memory (optional - auto-save conversation?)
             // memoryService.addMemory("Conversation: \(prompt) -> Response")
             
+            guard activeGenerationId == generationId else { return }
+
             if let index = messages.firstIndex(where: { $0.id == assistantMessageId }) {
                 let tail = parser.flush()
                 if !tail.visible.isEmpty, parser.allowVisibleStreaming {
-                    messages[index].content += tail.visible
+                    appendStreamChunk(&visibleBuffer, tail.visible)
                 }
                 if !tail.think.isEmpty {
-                    currentThink += tail.think
-                    messages[index].thinkContent? += tail.think
+                    appendStreamChunk(&currentThink, tail.think)
+                    if messages[index].thinkContent == nil {
+                        messages[index].thinkContent = ""
+                    }
+                    if var think = messages[index].thinkContent {
+                        appendStreamChunk(&think, tail.think)
+                        messages[index].thinkContent = think
+                    }
                 }
+                var finalText = cleanFinalAnswer(visibleBuffer)
 
-                messages[index].content = cleanFinalAnswer(messages[index].content)
-
-                if messages[index].content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                if finalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                    let thinkText = messages[index].thinkContent,
                    !thinkText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     let split = splitThinkIntoFinal(thinkText)
                     messages[index].thinkContent = split.think
-                    messages[index].content = split.final
+                    finalText = split.final
                 }
+
+                var toolLoopIterations = 0
+                let maxToolIterations = 3
+                var accumulatedToolContext = toolContext
+                var currentFinalText = finalText
+                var currentThinkText = messages[index].thinkContent ?? ""
+                var seenToolCalls = Set<String>()
+
+                while toolLoopIterations < maxToolIterations {
+                    if Task.isCancelled || activeGenerationId != generationId { break }
+                    let toolCall = parseToolCall(from: currentThinkText) ?? parseToolCall(from: currentFinalText)
+                    guard let toolCall else { break }
+
+                    let callKey = "\(toolCall.name)|\(toolCall.query)"
+                    if seenToolCalls.contains(callKey) { break }
+                    seenToolCalls.insert(callKey)
+
+                    let toolContextFromCall = await self.toolContext(for: toolCall)
+                    if toolContextFromCall.isEmpty { break }
+
+                    accumulatedToolContext += "\n" + toolContextFromCall
+                    let rerunGuidance = buildToolGuidanceBlock(hasTools: !accumulatedToolContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    let rerunPrompt = identityService.systemPrompt + identityProfileContext + emotionContext + rerunGuidance + accumulatedToolContext + experienceContext + motivationContext + detailBlock + spiceBlock
+                    let rerunOutput = await llmService.generateText(userPrompt: prompt, systemPrompt: rerunPrompt)
+
+                    var rerunParser = ThinkStreamParser()
+                    let first = rerunParser.feed(rerunOutput)
+                    let rerunTail = rerunParser.flush()
+                    let rerunThink = first.think + rerunTail.think
+                    let rerunVisible = cleanFinalAnswer(first.visible + rerunTail.visible)
+
+                    currentThinkText = rerunThink
+                    if !rerunVisible.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        currentFinalText = rerunVisible
+                    } else if !rerunThink.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        let split = splitThinkIntoFinal(rerunThink)
+                        currentThinkText = split.think
+                        currentFinalText = split.final
+                    }
+
+                    toolLoopIterations += 1
+                }
+
+                if !currentThinkText.isEmpty {
+                    messages[index].thinkContent = currentThinkText
+                }
+                finalText = currentFinalText
+
+                let filtered = memoryService.applyCognitiveLayer(
+                    to: finalText,
+                    userPrompt: prompt,
+                    detail: detail,
+                    motivators: motivationService.state,
+                    preferences: experienceService.preferences
+                )
+                messages[index].content = filtered
+                emotionService.updateForAssistantResponse(filtered)
 
                 let finalAnswer = messages[index].content
                 experienceService.recordExperience(
@@ -385,6 +713,7 @@ ISO‑время: \(iso)
             currentThinkingMessageId = nil
             isInteracting = false
             generationTask = nil
+            activeGenerationId = nil
         }
     }
 
@@ -401,6 +730,64 @@ ISO‑время: \(iso)
     private struct WikipediaSummary: Decodable {
         let title: String?
         let extract: String?
+    }
+
+    private struct RedditListing: Decodable {
+        let data: RedditListingData
+
+        struct RedditListingData: Decodable {
+            let children: [RedditChild]
+        }
+
+        struct RedditChild: Decodable {
+            let data: RedditPost
+        }
+
+        struct RedditPost: Decodable {
+            let title: String
+            let url: String?
+            let score: Int?
+            let author: String?
+            let createdUtc: TimeInterval?
+        }
+    }
+
+    private func fetchRedditNews(limit: Int) async throws -> String {
+        let clamped = max(1, min(15, limit))
+        var components = URLComponents(string: "https://www.reddit.com/r/news/.json")!
+        components.queryItems = [
+            URLQueryItem(name: "limit", value: "\(clamped)")
+        ]
+
+        guard let url = components.url else { return "" }
+        var request = URLRequest(url: url)
+        request.setValue("ValisAI/1.0 (iOS)", forHTTPHeaderField: "User-Agent")
+
+        let (data, _) = try await URLSession.shared.data(for: request)
+        let decoded = try JSONDecoder().decode(RedditListing.self, from: data)
+
+        let items = decoded.data.children.map { $0.data }
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+
+        let lines: [String] = items.prefix(clamped).map { post in
+            let title = post.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            let score = post.score.map { "▲\($0)" } ?? "▲0"
+            let age: String
+            if let created = post.createdUtc {
+                let date = Date(timeIntervalSince1970: created)
+                age = formatter.localizedString(for: date, relativeTo: Date())
+            } else {
+                age = "unknown time"
+            }
+            let url = post.url ?? ""
+            if url.isEmpty {
+                return "- \(title) (\(score), \(age))"
+            }
+            return "- \(title) (\(score), \(age))\n  \(url)"
+        }
+
+        return lines.joined(separator: "\n")
     }
 
     private func splitSnippets(_ text: String) -> [String] {
@@ -595,7 +982,14 @@ private func cleanFinalAnswer(_ text: String) -> String {
     cleaned = cleaned.replacingOccurrences(of: "Final Answer:", with: "")
     cleaned = cleaned.replacingOccurrences(of: "</think>", with: "")
     cleaned = cleaned.replacingOccurrences(of: "<think>", with: "")
+    cleaned = stripLeadingWhitespaceAfterNewlines(cleaned)
     return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+private func stripLeadingWhitespaceAfterNewlines(_ text: String) -> String {
+    // Remove leading spaces/tabs right after a newline
+    let pattern = "\n[ \\t]+"
+    return text.replacingOccurrences(of: pattern, with: "\n", options: .regularExpression)
 }
 
 private func splitThinkIntoFinal(_ think: String) -> (think: String, final: String) {

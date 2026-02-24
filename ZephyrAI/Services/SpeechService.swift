@@ -15,6 +15,8 @@ final class SpeechService {
     
     func speak(text: String, voice: VoiceKind) {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+
+        prepareAudioSession()
         
         let utterance = AVSpeechUtterance(string: text)
         utterance.rate = AVSpeechUtteranceDefaultSpeechRate
@@ -23,24 +25,33 @@ final class SpeechService {
         synthesizer.stopSpeaking(at: .immediate)
         synthesizer.speak(utterance)
     }
+
+    private func prepareAudioSession() {
+        let session = AVAudioSession.sharedInstance()
+        do {
+            try session.setCategory(.playback, mode: .spokenAudio, options: [.duckOthers, .interruptSpokenAudioAndMixWithOthers])
+            try session.setActive(true, options: [])
+        } catch {
+            print("SpeechService audio session error: \(error)")
+        }
+    }
     
     private func pickVoice(kind: VoiceKind) -> AVSpeechSynthesisVoice? {
-        let language = Locale.preferredLanguages.first ?? "en-US"
+        let preferred = Locale.preferredLanguages.first ?? "en-US"
         let voices = AVSpeechSynthesisVoice.speechVoices()
-            .filter { v in
-                v.language == language
-            }
+        let exact = voices.filter { $0.language == preferred }
+        let prefix = voices.filter { $0.language.hasPrefix(String(preferred.prefix(2))) }
+        let pool = !exact.isEmpty ? exact : (!prefix.isEmpty ? prefix : voices)
         
-        if voices.isEmpty {
-            return AVSpeechSynthesisVoice(language: language)
+        if pool.isEmpty {
+            return AVSpeechSynthesisVoice(language: "en-US")
         }
         
         switch kind {
         case .female:
-            return voices.first
+            return pool.first
         case .male:
-            return voices.dropFirst().first ?? voices.first
+            return pool.dropFirst().first ?? pool.first
         }
     }
 }
-

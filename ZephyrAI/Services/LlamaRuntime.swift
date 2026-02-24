@@ -97,37 +97,43 @@ final class LlamaRuntime {
         llama_backend_free()
     }
 
-    func generateStream(prompt: String, maxTokens: Int, shouldCancel: () -> Bool, onToken: (String) -> Void) throws {
+    private func rebuildContext() throws {
+        guard let model = self.model else {
+            throw LlamaRuntimeError.contextInitFailed
+        }
+        if let ctx = context {
+            llama_free(ctx)
+        }
+
+        var ctxParams = llama_context_default_params()
+        ctxParams.n_ctx = UInt32(max(1, self.contextSize))
+        ctxParams.n_batch = UInt32(max(1, Int(self.batchSize)))
+
+        guard let newCtx = llama_init_from_model(model, ctxParams) else {
+            throw LlamaRuntimeError.contextInitFailed
+        }
+
+        self.context = newCtx
+        self.tokenCount = 0
+
+        let threads = max(1, ProcessInfo.processInfo.activeProcessorCount - 1)
+        llama_set_n_threads(newCtx, Int32(threads), Int32(threads))
+    }
+
+    func generateStream(prompt: String, maxTokens: Int, shouldStop: () -> Bool, onToken: (String) -> Void) throws {
         guard var ctx = context, let vocab = vocab else {
             throw LlamaRuntimeError.contextInitFailed
         }
 
-        if shouldCancel() { return }
+        if shouldStop() { return }
 
-        // Do NOT reset tokenCount on every call (keeps context stable)
-        // tokenCount = 0
-
-        // Reset context safely if near limit (prevents decode crashes)
-        if tokenCount > contextSize - 512 {
-            print("[Llama] Resetting context (KV cache full via context reset)")
-            // Hard reset: recreate context (compatible with older llama.cpp)
-            if let model = self.model {
-                llama_free(ctx)
-
-                var ctxParams = llama_context_default_params()
-                ctxParams.n_ctx = UInt32(max(1, self.contextSize))
-                ctxParams.n_batch = UInt32(min(256, Int(self.contextSize)))
-
-                guard let newCtx = llama_init_from_model(model, ctxParams) else {
-                    throw LlamaRuntimeError.contextInitFailed
-                }
-
-                self.context = newCtx
-                ctx = newCtx   // IMPORTANT: update local ctx reference
-
-                let threads = max(1, ProcessInfo.processInfo.activeProcessorCount - 1)
-                llama_set_n_threads(newCtx, Int32(threads), Int32(threads))
+        // We re-decode the full prompt each request; keep KV cache clean.
+        if tokenCount > 0 {
+            try rebuildContext()
+            guard let refreshed = context else {
+                throw LlamaRuntimeError.contextInitFailed
             }
+            ctx = refreshed
         }
 
         print("[Llama] Tokenizing prompt (len=\(prompt.count))")
@@ -146,7 +152,7 @@ final class LlamaRuntime {
 
         func decodeChunk(_ chunk: [llama_token]) throws {
             if chunk.isEmpty { return }
-            if shouldCancel() { return }
+            if shouldStop() { return }
 
             var local = chunk
             let result = local.withUnsafeMutableBufferPointer { buffer -> Int32 in
@@ -173,7 +179,7 @@ final class LlamaRuntime {
 
         var index = 0
         while index < tokensForDecode.count {
-            if shouldCancel() { return }
+            if shouldStop() { return }
             let end = min(tokensForDecode.count, index + Int(batchSize))
             let slice = Array(tokensForDecode[index..<end])
             try decodeChunk(slice)
@@ -188,7 +194,7 @@ final class LlamaRuntime {
         }
 
         for _ in 0..<generationLimit {
-            if shouldCancel() { return }
+            if shouldStop() { return }
             guard let logits = llama_get_logits_ith(ctx, -1) else { break }
             let nVocab = Int(llama_vocab_n_tokens(vocab))
 
@@ -232,7 +238,7 @@ final class LlamaRuntime {
             }
         }
 
-        if shouldCancel() { return }
+        if shouldStop() { return }
 
         if !utf8Buffer.isEmpty {
             if let tail = String(bytes: utf8Buffer, encoding: .utf8) {

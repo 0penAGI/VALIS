@@ -4,6 +4,8 @@ import AVFoundation
 struct ChatView: View {
     @StateObject private var viewModel = ChatViewModel()
     @State private var showSettings = false
+    @State private var showSandwich: Bool = true
+    @State private var sandwichHideTask: Task<Void, Never>?
     @FocusState private var isInputFocused: Bool
     
     @State private var isRecording: Bool = false
@@ -17,26 +19,44 @@ struct ChatView: View {
         VStack(spacing: 0) {
             // Header / Status
             ZStack {
-                // Center title
+
+                // Tap area (doesn't block buttons)
+                Color.clear
+                    .contentShape(Rectangle())
+                    .allowsHitTesting(false)
+
+                // Title center
                 Text("V A L I S")
                     .font(.system(size: 16, weight: .medium))
 
-                // Right controls
-                HStack {
+                // Right side (status + sandwich)
+                HStack(spacing: 8) {
                     Spacer()
+
                     Text(viewModel.status)
                         .font(.system(size: 11))
                         .foregroundColor(.secondary)
+                        .lineLimit(1)
+
                     Button {
                         showSettings = true
+                        restartSandwichTimer()
                     } label: {
                         Image(systemName: "line.3.horizontal")
                             .foregroundColor(.primary)
+                            .opacity(showSandwich ? 1 : 0.15)
+                            .allowsHitTesting(showSandwich)
+                            .scaleEffect(showSandwich ? 1 : 0.8)
+                            .animation(.easeInOut(duration: 0.25), value: showSandwich)
                     }
-                    .padding(.leading, 8)
                 }
             }
-            .padding()
+            .frame(height: 44)
+            .padding(.horizontal)
+            .onTapGesture {
+                showSandwich = true
+                restartSandwichTimer()
+            }
             .background(Color(UIColor.systemBackground))
             
             // Message List
@@ -183,20 +203,26 @@ struct ChatView: View {
             }
         }
         .onTapGesture {
+            showSandwich = true
+            restartSandwichTimer()
             UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
         }
         .onChange(of: viewModel.isInteracting) { _, newValue in
             if newValue {
                 isInputFocused = false
+                restartSandwichTimer()
             } else {
                 isInputFocused = false
+                restartSandwichTimer()
             }
         }
         .navigationBarHidden(true)
         .sheet(isPresented: $showSettings) {
             SettingsView()
+                .presentationBackground(.clear)
         }
         .onAppear {
+            restartSandwichTimer()
         }
     }
     
@@ -299,11 +325,25 @@ struct ChatView: View {
     private func getDocumentsDirectory() -> URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
     }
+    private func restartSandwichTimer() {
+        sandwichHideTask?.cancel()
+
+        sandwichHideTask = Task {
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            await MainActor.run {
+                withAnimation {
+                    showSandwich = false
+                }
+            }
+        }
+    }
 }
 
 struct ThinkingPanel: View {
     let text: String
+    let isThinking: Bool
     @State private var isExpanded: Bool = false
+    @State private var pulse = false
     
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -312,6 +352,14 @@ struct ThinkingPanel: View {
                     Text("Through")
                         .font(.caption)
                         .foregroundColor(.secondary)
+                        .scaleEffect(pulse ? 1.05 : 1.0)
+                        .opacity(pulse ? 1.0 : 0.7)
+                        .animation(
+                            pulse
+                            ? .easeInOut(duration: 1.2).repeatForever(autoreverses: true)
+                            : .easeOut(duration: 0.2),
+                            value: pulse
+                        )
                     Spacer()
                     Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
                         .font(.caption2)
@@ -346,8 +394,106 @@ struct ThinkingPanel: View {
                 }
             }
         }
+        .onAppear {
+            pulse = isThinking
+        }
+        .onDisappear {
+            pulse = false
+        }
+        .onChange(of: isThinking) { _, newValue in
+            pulse = newValue
+        }
         .padding(8)
         .background(Color.clear)
+    }
+}
+
+struct TypewriterText: View {
+    let text: String
+
+    @State private var displayed: String = ""
+    @State private var task: Task<Void, Never>?
+    @State private var hasFinished: Bool = false
+    @State private var lastText: String = ""
+
+    var body: some View {
+        Text(displayed.isEmpty ? text : displayed)
+            .id("TYPEWRITER_BOTTOM")
+            .opacity((displayed.isEmpty && !hasFinished) ? 0 : 1)
+            .offset(y: (displayed.isEmpty && !hasFinished) ? -8 : 0)
+            .animation(.easeOut(duration: 0.25), value: displayed)
+            .onAppear {
+                if !hasFinished {
+                    startTyping()
+                }
+            }
+            .onChange(of: text) { _, newValue in
+                if newValue != lastText && !hasFinished {
+                    startTyping()
+                }
+            }
+    }
+
+    private func startTyping() {
+        task?.cancel()
+
+        displayed = ""
+        hasFinished = false
+        lastText = text
+
+        let words = text.split(separator: " ", omittingEmptySubsequences: false)
+
+        task = Task {
+            for i in words.indices {
+                try? await Task.sleep(nanoseconds: 40_000_000)
+
+                await MainActor.run {
+                    if displayed.isEmpty {
+                        displayed = String(words[i])
+                    } else {
+                        displayed += " " + words[i]
+                    }
+                }
+            }
+
+            await MainActor.run {
+                hasFinished = true
+            }
+        }
+    }
+}
+
+struct TypingIndicatorView: View {
+    @State private var animate = false
+
+    var body: some View {
+        HStack(spacing: 6) {
+            dot(delay: 0)
+            dot(delay: 0.2)
+            dot(delay: 0.4)
+        }
+        .padding(.leading, 11)
+        .onAppear {
+            animate = true
+        }
+        .onDisappear {
+            animate = false
+        }
+        .accessibilityLabel("Generating response")
+    }
+
+    private func dot(delay: Double) -> some View {
+        Circle()
+            .fill(Color.secondary.opacity(0.7))
+            .frame(width: 3.14, height: 3.14)
+            .scaleEffect(animate ? 1.4 : 0.9)
+            .opacity(animate ? 1.0 : 0.3)
+            .animation(
+                .easeInOut(duration: 0.6)
+                    .repeatForever(autoreverses: true)
+                    .delay(delay),
+                value: animate
+            )
     }
 }
 
@@ -521,7 +667,11 @@ struct MessageView: View {
                     ForEach(Array(segments.enumerated()), id: \.offset) { _, seg in
                         switch seg {
                         case .text(let t):
-                            md(t)
+                            if message.role == .assistant {
+                                TypewriterText(text: t)
+                            } else {
+                                md(t)
+                            }
                         case .code(let code, let lang):
                             CodeBlockView(content: code, language: lang)
                         case .quote(let q):
@@ -573,15 +723,22 @@ struct MessageView: View {
                             .foregroundColor(.gray)
                     } else {
                         if isThinkingForMessage || ((message.thinkContent ?? "").isEmpty == false) {
-                            ThinkingPanel(text: isThinkingForMessage ? currentThink : (message.thinkContent ?? ""))
-                                .padding(.bottom, 4)
+                            ThinkingPanel(
+                                text: isThinkingForMessage ? currentThink : (message.thinkContent ?? ""),
+                                isThinking: isThinkingForMessage
+                            )
+                            .padding(.bottom, 4)
                         }
                         if !message.content.isEmpty {
                             VStack(alignment: .leading, spacing: 8) {
                                 ForEach(Array(segments.enumerated()), id: \.offset) { _, seg in
                                     switch seg {
                                     case .text(let t):
-                                        md(t)
+                                        if message.role == .assistant {
+                                            TypewriterText(text: t)
+                                        } else {
+                                            md(t)
+                                        }
                                     case .code(let code, let lang):
                                         CodeBlockView(content: code, language: lang)
                                     case .quote(let q):
@@ -627,6 +784,9 @@ struct MessageView: View {
                                         }
                                     }
                                 }
+                        }
+                        else if isThinkingForMessage || !(currentThink.isEmpty) {
+                            TypingIndicatorView()
                         }
                     }
                 }
