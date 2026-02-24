@@ -22,7 +22,7 @@ VALIS is an on-device AI chat app for iOS built with SwiftUI and `llama.cpp` (GG
   - Settings and Memories use a lightweight “liquid glass” distortion shader backdrop.
 - **Privacy First**: All data and inference stay on your device.
 
-![chat](https://github.com/0penAGI/VALIS/blob/main/IMG_8566.png)
+![chat](https://github.com/0penAGI/VALIS/blob/main/IMG_9344.png)
 ![chat](https://github.com/0penAGI/VALIS/blob/main/IMG_8567.png)
 
 ## Architecture Overview
