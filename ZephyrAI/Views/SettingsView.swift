@@ -2,10 +2,10 @@ import SwiftUI
 
 struct SettingsView: View {
     // Glass tuning
-    private let glassOpacityDark: Double = 0.92
-    private let glassOpacityLight: Double = 0.94
-    private let glassOverlayOpacityDark: Double = 0.8
-    private let glassOverlayOpacityLight: Double = 0.8
+    private let glassOpacityDark: Double = 0.32
+    private let glassOpacityLight: Double = 0.44
+    private let glassOverlayOpacityDark: Double = 0.5
+    private let glassOverlayOpacityLight: Double = 0.4
     private let glassBlurRadius: CGFloat = 4
     private let glassMaxOffset: CGFloat = 18
     @Environment(\.dismiss) private var dismiss
@@ -15,6 +15,7 @@ struct SettingsView: View {
     @State private var isEditingPrompt = false
     @State private var isGlassActive = false
     @Environment(\.colorScheme) private var colorScheme
+    @AppStorage(LLMModelStorage.key) private var selectedModelRaw: String = LLMModelStorage.defaultValue.rawValue
 
     private var glassBackground: some View {
         let baseOpacity = colorScheme == .dark ? glassOpacityDark : glassOpacityLight
@@ -66,9 +67,27 @@ struct SettingsView: View {
                                 RoundedRectangle(cornerRadius: 8)
                                     .stroke(colorScheme == .dark ? Color.white.opacity(0.08) : Color.black.opacity(0.08), lineWidth: 1)
                             )
-                            .onChange(of: masterPrompt) {
+                            .onChange(of: masterPrompt) { _, _ in
                                 isEditingPrompt = true
                             }
+                    }
+                    .padding(.vertical, 6)
+                }
+                .listRowBackground(Color.clear)
+
+                Section("Model") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Picker("Model Size", selection: $selectedModelRaw) {
+                            ForEach(LLMModelChoice.allCases) { model in
+                                Text("\(model.displayName) \(model.detailLabel)")
+                                    .tag(model.rawValue)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .onChange(of: selectedModelRaw) { _, newValue in
+                            guard let choice = LLMModelChoice(rawValue: newValue) else { return }
+                            LLMModelStorage.save(choice)
+                        }
                     }
                     .padding(.vertical, 6)
                 }
@@ -91,7 +110,7 @@ struct SettingsView: View {
             }
             .scrollContentBackground(.hidden)
             .listStyle(.insetGrouped)
-            .background(.ultraThinMaterial.opacity(0.3))
+            .background(.ultraThinMaterial.opacity(0.78))
             }
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
@@ -122,9 +141,8 @@ struct SettingsView: View {
                 isEditingPrompt = false
             }
             .tint(colorScheme == .dark ? .white : .black)
-            .toolbarBackground(.visible, for: .navigationBar)
-            .toolbarBackground(colorScheme == .dark ? AnyShapeStyle(Color.black) : AnyShapeStyle(Color.clear), for: .navigationBar)
-            .toolbarColorScheme(colorScheme == .dark ? .dark : .light, for: .navigationBar)
+            .toolbarBackground(.hidden, for: .navigationBar)
+            .toolbarBackground(Color.clear, for: .navigationBar)
         }
         .onAppear { isGlassActive = true }
         .onDisappear { isGlassActive = false }
@@ -168,8 +186,8 @@ private struct GlassDistortionLayer: View {
                 if isActive {
                     TimelineView(.animation) { timeline in
                         let t = Float(timeline.date.timeIntervalSinceReferenceDate)
-                        let w = Float(proxy.size.width)
-                        let h = Float(proxy.size.height)
+                        let w = Float(max(1.0, proxy.size.width))
+                        let h = Float(max(1.0, proxy.size.height))
                         Rectangle()
                             .fill(.ultraThinMaterial)
                             .distortionEffect(

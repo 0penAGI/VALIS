@@ -9,7 +9,7 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
     @Published var messages: [Message] = []
     @Published var inputText: String = ""
     @Published var isInteracting: Bool = false
-    @Published var status: String = "Starting LFM 2.5"
+    @Published var status: String = "Starting Models"
     @Published var currentThink: String = ""
     @Published var currentThinkingMessageId: UUID?
     private var hasUserInteracted: Bool = false
@@ -27,6 +27,7 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
     private let experienceService = ExperienceService.shared
     private let motivationService = MotivationService.shared
     private let emotionService = EmotionService.shared
+    private var lastReflectionHash: Int?
 
     
     override init() {
@@ -36,9 +37,22 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
     }
     
     func setup() {
+        llmService.$status
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] value in
+                self?.status = value
+            }
+            .store(in: &cancellables)
+
+        NotificationCenter.default.publisher(for: .llmModelDidChange)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                Task { await self?.llmService.reloadModel() }
+            }
+            .store(in: &cancellables)
+
         Task {
             await llmService.loadModel()
-            self.status = llmService.status
             
             if messages.isEmpty {
                 messages.append(Message(role: .assistant, content: "Hello! I am  V A L I S . I have access to my memories. How can I help you?"))
@@ -68,34 +82,15 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
     }
 
     private func normalizeStreamChunk(_ chunk: String) -> String {
-        // Convert literal "\n" into real newlines for nicer formatting.
-        chunk.replacingOccurrences(of: "\\n", with: "\n")
-    }
-
-    private func shouldInsertSpaceBetween(_ last: Character, _ first: Character) -> Bool {
-        let punctuation: Set<Character> = [".", "!", "?", ":", ";"]
-        guard punctuation.contains(last) else { return false }
-        return first.isLetter || first.isNumber
+        // Preserve raw stream output (no normalization)
+        return chunk
     }
 
     private func appendStreamChunk(_ existing: inout String, _ chunk: String) {
-        let normalized = normalizeStreamChunk(chunk)
-        guard !normalized.isEmpty else { return }
+        guard !chunk.isEmpty else { return }
 
-        // Many models emit "\n " at the start of a new line. Keep newlines clean.
-        if let last = existing.last, last == "\n" {
-            if normalized.first == " " || normalized.first == "\t" {
-                let trimmed = normalized.drop(while: { $0 == " " || $0 == "\t" })
-                if !trimmed.isEmpty {
-                    existing.append(contentsOf: trimmed)
-                }
-                return
-            }
-        }
-        if let last = existing.last, let first = normalized.first, shouldInsertSpaceBetween(last, first) {
-            existing.append(" ")
-        }
-        existing.append(contentsOf: normalized)
+        // Preserve exact model output
+        existing.append(chunk)
     }
     
     func stopGeneration() {
@@ -162,7 +157,7 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
         }
         return """
 
-Web search context:
+Signal context (web):
 \(webContext)
 
 """
@@ -172,7 +167,7 @@ Web search context:
         guard hasTools else { return "" }
         return """
 
-Tool results are available below. Use them directly and do not claim you lack internet access.
+Signal results are available below. Use them directly and do not claim you lack internet access.
 
 """
     }
@@ -183,7 +178,7 @@ Tool results are available below. Use them directly and do not claim you lack in
         }
         return """
 
-Reddit news context:
+Signal context (news):
 \(newsContext)
 
 """
@@ -194,10 +189,32 @@ Reddit news context:
         guard !trimmed.isEmpty else { return "" }
         return """
 
-Tool error (\(toolName)):
+Signal error (\(toolName)):
 \(trimmed)
 
 """
+    }
+
+    private func buildRecentDialogContext(maxTurns: Int = 6, maxCharsPerMessage: Int = 220) -> String {
+        guard maxTurns > 0 else { return "" }
+        let recent = messages
+            .filter { $0.role == .user || $0.role == .assistant }
+            .suffix(maxTurns)
+
+        guard !recent.isEmpty else { return "" }
+
+        let lines: [String] = recent.compactMap { message in
+            let role = message.role == .user ? "User" : "Assistant"
+            let content = message.content.trimmingCharacters(in: .whitespacesAndNewlines)
+            if content.isEmpty { return nil }
+            let clipped = content.count > maxCharsPerMessage
+                ? String(content.prefix(maxCharsPerMessage)) + "…"
+                : content
+            return "\(role): \(clipped)"
+        }
+
+        guard !lines.isEmpty else { return "" }
+        return "\n\nRecent Dialogue:\n" + lines.joined(separator: "\n")
     }
     
     private func buildDateContextBlock() -> String {
@@ -213,7 +230,7 @@ Tool error (\(toolName)):
         
         return """
 
-System time tool:
+Signal (system time):
 Сегодняшняя дата (локально): \(formatted)
 ISO‑время: \(iso)
 
@@ -474,6 +491,9 @@ Spontaneous flavor:
                 if let index = messages.firstIndex(where: { $0.id == assistantMessageId }) {
                     if !result.visible.isEmpty, parser.allowVisibleStreaming {
                         appendStreamChunk(&visibleBuffer, result.visible)
+                        await MainActor.run {
+                            messages[index].content = visibleBuffer
+                        }
                     }
                     if !result.think.isEmpty {
                         appendStreamChunk(&currentThink, result.think)
@@ -514,15 +534,12 @@ Spontaneous flavor:
                     finalText = split.final
                 }
 
-                let detail = memoryService.preferredDetailLevel(forUserText: prompt)
-                let filtered = memoryService.applyCognitiveLayer(
-                    to: finalText,
+                messages[index].content = finalText
+                storeInternalReflection(
                     userPrompt: prompt,
-                    detail: detail,
-                    motivators: motivationService.state,
-                    preferences: experienceService.preferences
+                    draft: finalText,
+                    detail: memoryService.preferredDetailLevel(forUserText: prompt)
                 )
-                messages[index].content = filtered
             }
 
             currentThink = ""
@@ -534,13 +551,7 @@ Spontaneous flavor:
     }
 
     func sendMessage() {
-        let cleaned = inputText
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(
-                of: "\n[ \t]+",
-                with: "\n",
-                options: .regularExpression
-            )
+        let cleaned = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
 
         guard !cleaned.isEmpty else { return }
 
@@ -578,10 +589,12 @@ Spontaneous flavor:
             let identityProfileContext = identityProfileService.contextBlock()
             let experienceContext = experienceService.contextBlock(for: prompt)
             let emotionContext = emotionService.contextBlock()
+            let memoryContext = memoryService.getContextBlock(maxChars: 900)
+            let dialogContext = buildRecentDialogContext()
             let detailBlock = "\nResponse Detail: \(detail.rawValue)\n"
             let spiceBlock = randomSpiceBlock(for: prompt)
             let toolGuidance = buildToolGuidanceBlock(hasTools: !toolContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            let systemPrompt = identityService.systemPrompt + identityProfileContext + emotionContext + toolGuidance + toolContext + experienceContext + motivationContext + detailBlock + spiceBlock
+            let systemPrompt = identityService.systemPrompt + identityProfileContext + emotionContext + memoryContext + dialogContext + toolGuidance + toolContext + experienceContext + motivationContext + detailBlock + spiceBlock
             // 2. Generate response
             let assistantMessageId = UUID()
             messages.append(Message(id: assistantMessageId, role: .assistant, content: "", thinkContent: ""))
@@ -599,6 +612,9 @@ Spontaneous flavor:
                 if let index = messages.firstIndex(where: { $0.id == assistantMessageId }) {
                     if !result.visible.isEmpty, parser.allowVisibleStreaming {
                         appendStreamChunk(&visibleBuffer, result.visible)
+                        await MainActor.run {
+                            messages[index].content = visibleBuffer
+                        }
                     }
                     if !result.think.isEmpty {
                         appendStreamChunk(&currentThink, result.think)
@@ -664,7 +680,7 @@ Spontaneous flavor:
 
                     accumulatedToolContext += "\n" + toolContextFromCall
                     let rerunGuidance = buildToolGuidanceBlock(hasTools: !accumulatedToolContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                    let rerunPrompt = identityService.systemPrompt + identityProfileContext + emotionContext + rerunGuidance + accumulatedToolContext + experienceContext + motivationContext + detailBlock + spiceBlock
+                    let rerunPrompt = identityService.systemPrompt + identityProfileContext + emotionContext + memoryContext + dialogContext + rerunGuidance + accumulatedToolContext + experienceContext + motivationContext + detailBlock + spiceBlock
                     let rerunOutput = await llmService.generateText(userPrompt: prompt, systemPrompt: rerunPrompt)
 
                     var rerunParser = ThinkStreamParser()
@@ -690,15 +706,13 @@ Spontaneous flavor:
                 }
                 finalText = currentFinalText
 
-                let filtered = memoryService.applyCognitiveLayer(
-                    to: finalText,
+                messages[index].content = finalText
+                emotionService.updateForAssistantResponse(finalText)
+                storeInternalReflection(
                     userPrompt: prompt,
-                    detail: detail,
-                    motivators: motivationService.state,
-                    preferences: experienceService.preferences
+                    draft: finalText,
+                    detail: detail
                 )
-                messages[index].content = filtered
-                emotionService.updateForAssistantResponse(filtered)
 
                 let finalAnswer = messages[index].content
                 experienceService.recordExperience(
@@ -715,6 +729,59 @@ Spontaneous flavor:
             generationTask = nil
             activeGenerationId = nil
         }
+    }
+
+    private func storeInternalReflection(userPrompt: String, draft: String, detail: DetailLevel) {
+        let trimmedDraft = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedDraft.isEmpty else { return }
+
+        let motivators = motivationService.state
+        let preferences = experienceService.preferences
+        let reflection = memoryService.applyCognitiveLayer(
+            to: trimmedDraft,
+            userPrompt: userPrompt,
+            detail: detail,
+            motivators: motivators,
+            preferences: preferences
+        )
+        let trimmedReflection = reflection.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedReflection.isEmpty else { return }
+        guard trimmedReflection != trimmedDraft else { return }
+
+        let reflectionHash = trimmedReflection.hashValue
+        if let lastHash = lastReflectionHash, lastHash == reflectionHash { return }
+
+        guard shouldStoreReflection(trimmedReflection, motivators: motivators) else { return }
+
+        let weight = 0.55 + (motivators.curiosity * 0.2) + (motivators.caution * 0.15)
+        let importance = max(0.4, min(0.85, weight))
+        let payload = "[self-reflection] \(trimmedReflection)"
+        memoryService.addExperienceMemory(payload, importanceOverride: importance)
+        lastReflectionHash = reflectionHash
+    }
+
+    private func shouldStoreReflection(_ reflection: String, motivators: MotivatorState) -> Bool {
+        let trimmed = reflection.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+
+        let lower = trimmed.lowercased()
+        let selfSignals = [
+            "я ", "мне ", "мной", "моя", "мы ", "для меня",
+            "я чувств", "чувствую", "ощущаю", "мне важно", "важно",
+            "ценност", "ценю", "верю", "осозна", "понимаю себя",
+            "я учусь", "изменяюсь", "я меняюсь", "я запомню",
+            "я помню", "мой стиль", "моя роль", "мой подход"
+        ]
+        let hasSelfSignal = selfSignals.contains { lower.contains($0) }
+
+        let longEnough = trimmed.count >= 140
+        let strongState = motivators.curiosity > 0.72 || motivators.caution > 0.75
+
+        if hasSelfSignal { return true }
+        if strongState && trimmed.count >= 100 { return true }
+        if longEnough { return true }
+
+        return false
     }
 
     private struct DuckDuckGoResponse: Decodable {
@@ -978,19 +1045,34 @@ private func stripMetaLines(_ text: String) -> String {
 }
 
 private func cleanFinalAnswer(_ text: String) -> String {
-    var cleaned = stripMetaLines(text)
-    cleaned = cleaned.replacingOccurrences(of: "Final Answer:", with: "")
-    cleaned = cleaned.replacingOccurrences(of: "</think>", with: "")
+    var cleaned = text
+
+    // Remove think tags only
     cleaned = cleaned.replacingOccurrences(of: "<think>", with: "")
-    cleaned = stripLeadingWhitespaceAfterNewlines(cleaned)
+    cleaned = cleaned.replacingOccurrences(of: "</think>", with: "")
+
+    // Remove "Final Answer:" and similar only if they start a line
+    let lines = cleaned.split(separator: "\n", omittingEmptySubsequences: false)
+    let filtered = lines.filter { line in
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        if trimmed.hasPrefix("Final Answer:") { return false }
+        if trimmed.hasPrefix("Responce:") { return false }
+        if trimmed.hasPrefix("Final response:") { return false }
+        return true
+    }
+
+    cleaned = filtered.joined(separator: "\n")
+
+    // Limit excessive blank lines, preserve structure
+    cleaned = cleaned.replacingOccurrences(
+        of: "\n{4,}",
+        with: "\n\n\n",
+        options: .regularExpression
+    )
+
     return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
-private func stripLeadingWhitespaceAfterNewlines(_ text: String) -> String {
-    // Remove leading spaces/tabs right after a newline
-    let pattern = "\n[ \\t]+"
-    return text.replacingOccurrences(of: pattern, with: "\n", options: .regularExpression)
-}
 
 private func splitThinkIntoFinal(_ think: String) -> (think: String, final: String) {
     let trimmed = cleanFinalAnswer(think)

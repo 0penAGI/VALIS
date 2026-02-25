@@ -412,54 +412,45 @@ struct TypewriterText: View {
     let text: String
 
     @State private var displayed: String = ""
-    @State private var task: Task<Void, Never>?
-    @State private var hasFinished: Bool = false
     @State private var lastText: String = ""
 
     var body: some View {
-        Text(displayed.isEmpty ? text : displayed)
+        md(displayed)
             .id("TYPEWRITER_BOTTOM")
-            .opacity((displayed.isEmpty && !hasFinished) ? 0 : 1)
-            .offset(y: (displayed.isEmpty && !hasFinished) ? -8 : 0)
-            .animation(.easeOut(duration: 0.25), value: displayed)
+            .opacity(displayed.isEmpty ? 0 : 1)
+            .animation(.easeOut(duration: 0.2), value: displayed)
             .onAppear {
-                if !hasFinished {
-                    startTyping()
-                }
+                displayed = text
+                lastText = text
             }
             .onChange(of: text) { _, newValue in
-                if newValue != lastText && !hasFinished {
-                    startTyping()
+                // If new text is an append, just add the delta
+                if newValue.hasPrefix(displayed) {
+                    let diff = String(newValue.dropFirst(displayed.count))
+                    displayed += diff
+                } else {
+                    // Otherwise replace completely
+                    displayed = newValue
                 }
+                lastText = newValue
             }
     }
 
-    private func startTyping() {
-        task?.cancel()
-
-        displayed = ""
-        hasFinished = false
-        lastText = text
-
-        let words = text.split(separator: " ", omittingEmptySubsequences: false)
-
-        task = Task {
-            for i in words.indices {
-                try? await Task.sleep(nanoseconds: 40_000_000)
-
-                await MainActor.run {
-                    if displayed.isEmpty {
-                        displayed = String(words[i])
-                    } else {
-                        displayed += " " + words[i]
-                    }
-                }
-            }
-
-            await MainActor.run {
-                hasFinished = true
-            }
+    private func md(_ s: String) -> some View {
+        let base: Text
+        if let a = try? AttributedString(
+            markdown: s,
+            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        ) {
+            base = Text(a)
+        } else {
+            base = Text(s)
         }
+        return base
+            .fixedSize(horizontal: false, vertical: true)
+            .lineLimit(nil)
+            .multilineTextAlignment(.leading)
+            .textSelection(.enabled)
     }
 }
 
@@ -517,7 +508,10 @@ struct MessageView: View {
     
     private func md(_ s: String) -> some View {
         let base: Text
-        if let a = try? AttributedString(markdown: s) {
+        if let a = try? AttributedString(
+            markdown: s,
+            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        ) {
             base = Text(a)
         } else {
             base = Text(s)
@@ -668,7 +662,7 @@ struct MessageView: View {
                         switch seg {
                         case .text(let t):
                             if message.role == .assistant {
-                                TypewriterText(text: t)
+                                md(t)
                             } else {
                                 md(t)
                             }
@@ -732,13 +726,13 @@ struct MessageView: View {
                         if !message.content.isEmpty {
                             VStack(alignment: .leading, spacing: 8) {
                                 ForEach(Array(segments.enumerated()), id: \.offset) { _, seg in
-                                    switch seg {
-                                    case .text(let t):
-                                        if message.role == .assistant {
-                                            TypewriterText(text: t)
-                                        } else {
-                                            md(t)
-                                        }
+                                switch seg {
+                                case .text(let t):
+                                    if message.role == .assistant {
+                                        md(t)
+                                    } else {
+                                        md(t)
+                                    }
                                     case .code(let code, let lang):
                                         CodeBlockView(content: code, language: lang)
                                     case .quote(let q):

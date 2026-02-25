@@ -6,7 +6,7 @@ VALIS is an on-device AI chat app for iOS built with SwiftUI and `llama.cpp` (GG
 
 ## Features
 
-- **Fully Offline**: Runs entirely on-device using GGUF models via `llama.cpp`.
+- **On-device inference**: Runs locally using GGUF models via `llama.cpp`.
 - **Plastic Brain**: Memories have emotion tags, importance, embeddings, associative links, and activation/decay.
 - **Thinking UI**: Streams model output and parses `<think>...</think>` to show a separate thinking panel.
 - **Tools (optional network)**:
@@ -93,18 +93,32 @@ The app executes the tool, injects results (or a tool error block), and re-runs 
 
 - Xcode 15+ (iOS 17+ target)
 - `Frameworks/llama.xcframework`
-- A GGUF model bundled in the app (default: `LFM2.5-1.2B-Thinking-Q8_0.gguf`)
+- A GGUF model available either:
+  - bundled in the app (`ZephyrAI/Resources/Models/`), or
+  - downloaded on first launch (see “Model Download” below).
 
 ## Quick Start
 
 1. Ensure `Frameworks/llama.xcframework` exists.
-2. Put a GGUF in `ZephyrAI/Resources/Models/`.
-3. Update `modelFilename` in `ZephyrAI/Services/LLMService.swift`.
-4. Build and run `ZephyrAI.xcodeproj` on device.
+2. Choose model strategy:
+   - Bundle a model in `ZephyrAI/Resources/Models/`, or
+   - Enable first-run download in `ZephyrAI/Services/LLMService.swift` by setting `modelDownloadURLString`.
+3. Build and run `ZephyrAI.xcodeproj` on device.
+
+## Model Download
+
+`LLMService` searches for the model in this order:
+
+1. `Application Support/VALIS/` (download location)
+2. App bundle (bundled models in `ZephyrAI/Resources/Models/`)
+3. `Documents/` (manual drop-in)
+
+If the model is missing and `modelDownloadURLString` is set, the app downloads the model and shows download progress via the UI status.
 
 ## Troubleshooting
 
-- **Model not found**: confirm the GGUF is included in Copy Bundle Resources or present in Documents.
+- **Model not found**: confirm the GGUF is included in Copy Bundle Resources, present in `Application Support/VALIS/`, or present in Documents.
+- **Download doesn't start**: check that `modelDownloadURLString` is set and the device has network access.
 - **`Decode failed with code 1`**: KV cache slot failure. The runtime clamps context to model `n_ctx_train`, limits batch size, trims prompts, and will split prompt decode batches. If it persists, try a smaller model or lower context.
 - **No sound for TTS**: `SpeechService` configures `AVAudioSession` for spoken audio; if still silent, check device mute switch and audio route.
 - **Shader build errors**: the glass distortion shader is `ZephyrAI/Resources/glassDistortion.metal` and must match the SwiftUI stitchable signature expected by `distortionEffect`.

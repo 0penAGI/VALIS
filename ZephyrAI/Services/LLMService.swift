@@ -1,7 +1,7 @@
 import Foundation
-
 import Combine
 import UIKit
+import CryptoKit
 
 
 extension UIDevice {
@@ -33,8 +33,19 @@ final class LLMService: ObservableObject {
     private var runtime: LlamaRuntime?
     private let memoryService = MemoryService.shared
 
-    // 2B class model model recommendation (GGUF)
-    private let modelFilename = "LFM2.5-1.2B-Thinking-Q8_0.gguf"
+    private var selectedModel: LLMModelChoice {
+        LLMModelStorage.load()
+    }
+
+    private var modelFilename: String {
+        selectedModel.filename
+    }
+
+    private var modelDownloadURLString: String? {
+        selectedModel.downloadURLString
+    }
+    // Optional SHA256 to verify the downloaded file. Leave nil to skip.
+    private let modelSHA256: String? = nil
     private let contextSize: Int32 = 4096
 
     enum PerformanceProfile {
@@ -72,6 +83,10 @@ final class LLMService: ObservableObject {
             runtime = try LlamaRuntime(modelPath: modelURL.path, contextSize: contextSize)
             status = ""
         } catch {
+            if case LlamaRuntimeError.modelNotFound = error {
+                await handleMissingModel()
+                return
+            }
             status = "Load error: \(error.localizedDescription)"
             print(error)
         }
@@ -80,6 +95,13 @@ final class LLMService: ObservableObject {
     // MARK: Generate
     func cancelGeneration() {
         currentToken?.cancel()
+    }
+
+    func reloadModel() async {
+        cancelGeneration()
+        runtime = nil
+        cache.removeAllObjects()
+        await loadModel()
     }
 
     func generate(
@@ -159,12 +181,20 @@ final class LLMService: ObservableObject {
                 let maxPromptChars = Int(effectiveContextSize) * approxCharsPerToken
                 let systemAndUserChars = systemPrompt.count + userPrompt.count + 200
                 let memoryBudget = max(0, maxPromptChars - systemAndUserChars)
-                let memoryContext = await MemoryService.shared.getContextBlock(maxChars: memoryBudget)
+                let fieldState = await MemoryService.shared.fieldStateSnapshot()
+                let includeMemory = fieldState.activationLevel >= 0.25
+                let memoryContext = includeMemory
+                    ? await MemoryService.shared.getContextBlock(maxChars: memoryBudget)
+                    : ""
+                let hiddenPrefix = await self.buildHiddenPrefix(from: fieldState)
+                let sampling = await self.samplingConfig(from: fieldState)
+                let kvInjection = KVInjection(fieldVector: fieldState.fieldVector, beta: 0.03)
 
                 let prompt = """
 <|im_start|>system
 \(systemPrompt)
-Memory context: \(memoryContext)
+\(hiddenPrefix)
+\(memoryContext.isEmpty ? "" : "Memory context: \(memoryContext)")
 <|im_end|>
 <|im_start|>user
 \(userPrompt)
@@ -177,6 +207,8 @@ Memory context: \(memoryContext)
                     try runtime.generateStream(
                         prompt: prompt,
                         maxTokens: maxTokens,
+                        kvInjection: kvInjection,
+                        sampling: sampling,
                         shouldStop: { token.isCancelled },
                         onToken: { chunk in
                             if token.isCancelled { return }
@@ -276,6 +308,11 @@ Memory context: \(memoryContext)
         let name = (modelFilename as NSString).deletingPathExtension
         let ext = (modelFilename as NSString).pathExtension
 
+        if let supportURL = modelSupportURL(), FileManager.default.fileExists(atPath: supportURL.path) {
+            print("[LLM] Model found in Application Support")
+            return supportURL
+        }
+
         if let url = Bundle.main.url(forResource: name, withExtension: ext) {
             print("[LLM] Model found in bundle")
             return url
@@ -290,8 +327,181 @@ Memory context: \(memoryContext)
             }
         }
 
-        print("[LLM] Model not found in bundle or Documents")
+        print("[LLM] Model not found in Application Support, bundle, or Documents")
         throw LlamaRuntimeError.modelNotFound(expectedFilename: modelFilename)
+    }
+
+    private func modelSupportURL() -> URL? {
+        guard let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            return nil
+        }
+        let dir = appSupport.appendingPathComponent("VALIS", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        } catch {
+            print("[LLM] Failed to create Application Support dir: \(error)")
+            return nil
+        }
+        return dir.appendingPathComponent(modelFilename)
+    }
+
+    private func handleMissingModel() async {
+        guard let downloadURL = modelDownloadURL() else {
+            status = "Model missing. Set a download URL."
+            return
+        }
+
+        status = "Model missing. Downloading..."
+        progress = 0
+
+        do {
+            let modelURL = try await downloadModel(from: downloadURL)
+            runtime = try LlamaRuntime(modelPath: modelURL.path, contextSize: contextSize)
+            status = ""
+        } catch {
+            status = "Download error: \(error.localizedDescription)"
+            print(error)
+        }
+    }
+
+    private func modelDownloadURL() -> URL? {
+        guard let string = modelDownloadURLString, !string.isEmpty else { return nil }
+        return URL(string: string)
+    }
+
+    private func downloadModel(from url: URL) async throws -> URL {
+        guard let destinationURL = modelSupportURL() else {
+            throw LlamaRuntimeError.modelNotFound(expectedFilename: modelFilename)
+        }
+
+        if FileManager.default.fileExists(atPath: destinationURL.path) {
+            return destinationURL
+        }
+
+        let (bytes, response) = try await URLSession.shared.bytes(from: url)
+        let expectedLength = response.expectedContentLength
+
+        if FileManager.default.fileExists(atPath: destinationURL.path) {
+            try FileManager.default.removeItem(at: destinationURL)
+        }
+        FileManager.default.createFile(atPath: destinationURL.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: destinationURL)
+        defer { try? handle.close() }
+
+        var received: Int64 = 0
+        var buffer = Data()
+        buffer.reserveCapacity(1 << 20)
+
+        for try await byte in bytes {
+            buffer.append(byte)
+            received += 1
+
+            if buffer.count >= 1 << 20 {
+                try handle.write(contentsOf: buffer)
+                buffer.removeAll(keepingCapacity: true)
+            }
+
+            if expectedLength > 0 {
+                let pct = Double(received) / Double(expectedLength)
+                await MainActor.run {
+                    self.progress = pct
+                    let percent = Int(pct * 100)
+                    self.status = "Downloading model \(percent)%"
+                }
+            }
+        }
+
+        if !buffer.isEmpty {
+            try handle.write(contentsOf: buffer)
+        }
+
+        if let expectedHash = modelSHA256 {
+            let actual = try sha256(of: destinationURL)
+            if actual.lowercased() != expectedHash.lowercased() {
+                try FileManager.default.removeItem(at: destinationURL)
+                throw LlamaRuntimeError.modelLoadFailed(path: "SHA256 mismatch")
+            }
+        }
+
+        return destinationURL
+    }
+
+    private func sha256(of url: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+
+        var hasher = SHA256()
+        while true {
+            let data = try handle.read(upToCount: 1 << 20)
+            guard let data = data, !data.isEmpty else { break }
+            hasher.update(data: data)
+        }
+        let digest = hasher.finalize()
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+private extension LLMService {
+    func buildHiddenPrefix(from state: FieldStateSnapshot) -> String {
+        let field = serializeFieldVector(state.fieldVector, targetCount: 10)
+        let v = String(format: "%.2f", state.avgValence)
+        let i = String(format: "%.2f", state.avgIntensity)
+        let a = String(format: "%.2f", state.activationLevel)
+        let lines = [
+            "<internal>",
+            "F:\(field)",
+            "E:v=\(v),i=\(i)",
+            "A:mean=\(a)",
+            "</internal>"
+        ]
+        return lines.joined(separator: "\n")
+    }
+
+    func serializeFieldVector(_ field: [Double], targetCount: Int) -> String {
+        guard !field.isEmpty else { return "" }
+        let target = min(max(1, targetCount), field.count)
+        if field.count <= target {
+            return field.map { String(format: "%.2f", $0) }.joined(separator: ",")
+        }
+        let chunkSize = Double(field.count) / Double(target)
+        var out: [String] = []
+        out.reserveCapacity(target)
+        for i in 0..<target {
+            let start = Int(Double(i) * chunkSize)
+            let end = min(field.count, Int(Double(i + 1) * chunkSize))
+            if start >= end {
+                out.append("0.00")
+                continue
+            }
+            let slice = field[start..<end]
+            let avg = slice.reduce(0.0, +) / Double(slice.count)
+            out.append(String(format: "%.2f", avg))
+        }
+        return out.joined(separator: ",")
+    }
+
+    func samplingConfig(from state: FieldStateSnapshot) -> SamplingConfig {
+        let intensity = max(0.0, min(1.0, state.avgIntensity))
+        let activation = max(0.0, min(1.0, state.activationLevel))
+
+        let temperature: Float
+        if activation < 0.35 {
+            temperature = 0.0
+        } else if activation < 0.7 {
+            temperature = Float(0.6 + 0.4 * intensity)
+        } else {
+            temperature = Float(0.8 + 0.6 * intensity)
+        }
+
+        let topK = 40
+        let repetitionPenalty = Float(1.05 + 0.15 * (1.0 - activation))
+
+        return SamplingConfig(
+            temperature: temperature,
+            topK: topK,
+            repetitionPenalty: repetitionPenalty,
+            repeatLastN: 32
+        )
     }
 }
 

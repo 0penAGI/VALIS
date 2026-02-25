@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 enum LlamaRuntimeError: LocalizedError {
     case modelNotFound(expectedFilename: String)
@@ -24,6 +25,20 @@ enum LlamaRuntimeError: LocalizedError {
             return "Decode failed with code \(code)."
         }
     }
+}
+
+struct SamplingConfig {
+    let temperature: Float
+    let topK: Int
+    let repetitionPenalty: Float
+    let repeatLastN: Int
+
+    static let `default` = SamplingConfig(
+        temperature: 0.7,
+        topK: 40,
+        repetitionPenalty: 1.1,
+        repeatLastN: 64
+    )
 }
 
 final class LlamaRuntime {
@@ -120,7 +135,14 @@ final class LlamaRuntime {
         llama_set_n_threads(newCtx, Int32(threads), Int32(threads))
     }
 
-    func generateStream(prompt: String, maxTokens: Int, shouldStop: () -> Bool, onToken: (String) -> Void) throws {
+    func generateStream(
+        prompt: String,
+        maxTokens: Int,
+        kvInjection: KVInjection? = nil,
+        sampling: SamplingConfig = .default,
+        shouldStop: () -> Bool,
+        onToken: (String) -> Void
+    ) throws {
         guard var ctx = context, let vocab = vocab else {
             throw LlamaRuntimeError.contextInitFailed
         }
@@ -186,6 +208,18 @@ final class LlamaRuntime {
             index = end
         }
 
+        if let kvInjection, let model = model {
+            let nEmb = Int(llama_model_n_embd(model))
+            let projected = projectFieldVector(kvInjection.fieldVector, targetCount: nEmb)
+            if !projected.isEmpty {
+                _ = KVCacheInjector.applyV(
+                    ctx: ctx,
+                    vector: projected,
+                    beta: kvInjection.beta
+                )
+            }
+        }
+
         var utf8Buffer: [UInt8] = []
         let availableTokens = max(32, Int(contextSize) - Int(tokenCount) - 32)
         let generationLimit = min(maxTokens, availableTokens)
@@ -193,22 +227,33 @@ final class LlamaRuntime {
             print("[Llama] Capping maxTokens to \(generationLimit) to fit context.")
         }
 
+        var recentTokens: [llama_token] = []
+
         for _ in 0..<generationLimit {
             if shouldStop() { return }
             guard let logits = llama_get_logits_ith(ctx, -1) else { break }
             let nVocab = Int(llama_vocab_n_tokens(vocab))
 
-            var bestToken = 0
-            var bestLogit = -Float.greatestFiniteMagnitude
-            for i in 0..<nVocab {
-                let v = logits[i]
-                if v > bestLogit {
-                    bestLogit = v
-                    bestToken = i
+            let token: llama_token
+            if sampling.temperature <= 0 {
+                var bestToken = 0
+                var bestLogit = -Float.greatestFiniteMagnitude
+                for i in 0..<nVocab {
+                    let v = logits[i]
+                    if v > bestLogit {
+                        bestLogit = v
+                        bestToken = i
+                    }
                 }
+                token = llama_token(bestToken)
+            } else {
+                token = sampleToken(
+                    logits: logits,
+                    nVocab: nVocab,
+                    sampling: sampling,
+                    recentTokens: recentTokens
+                )
             }
-
-            let token = llama_token(bestToken)
             if llama_vocab_is_eog(vocab, token) { break }
 
             var nextTokens = [token]
@@ -223,6 +268,11 @@ final class LlamaRuntime {
 
             if decodeResult != 0 {
                 throw LlamaRuntimeError.decodeFailed(code: decodeResult)
+            }
+
+            recentTokens.append(token)
+            if recentTokens.count > sampling.repeatLastN, sampling.repeatLastN > 0 {
+                recentTokens.removeFirst(recentTokens.count - sampling.repeatLastN)
             }
 
             if let bytes = tokenToPieceBytes(token, vocab: vocab) {
@@ -336,4 +386,134 @@ final class LlamaRuntime {
         return bytes.count
     }
 
+}
+
+private extension LlamaRuntime {
+    func sampleToken(
+        logits: UnsafePointer<Float>,
+        nVocab: Int,
+        sampling: SamplingConfig,
+        recentTokens: [llama_token]
+    ) -> llama_token {
+        var local = [Float](repeating: 0, count: nVocab)
+        for i in 0..<nVocab {
+            local[i] = logits[i]
+        }
+
+        if sampling.repetitionPenalty > 1.0, sampling.repeatLastN > 0, !recentTokens.isEmpty {
+            let penalty = sampling.repetitionPenalty
+            for token in recentTokens.suffix(sampling.repeatLastN) {
+                let idx = Int(token)
+                guard idx >= 0 && idx < nVocab else { continue }
+                let v = local[idx]
+                local[idx] = v < 0 ? v * penalty : v / penalty
+            }
+        }
+
+        let temp = max(0.01, sampling.temperature)
+        for i in 0..<nVocab {
+            local[i] /= temp
+        }
+
+        let k = max(1, min(sampling.topK, nVocab))
+        let pool = selectTopK(from: local, k: k)
+        guard !pool.isEmpty else {
+            return llama_token(0)
+        }
+
+        var maxLogit = -Float.greatestFiniteMagnitude
+        for item in pool {
+            if item.logit > maxLogit { maxLogit = item.logit }
+        }
+
+        var probs: [Float] = []
+        probs.reserveCapacity(pool.count)
+        var sum: Float = 0
+        for item in pool {
+            let p = expf(item.logit - maxLogit)
+            probs.append(p)
+            sum += p
+        }
+        if sum <= 0 {
+            return llama_token(pool[0].index)
+        }
+
+        for i in 0..<probs.count {
+            probs[i] /= sum
+        }
+
+        let r = Float.random(in: 0..<1)
+        var acc: Float = 0
+        for i in 0..<pool.count {
+            acc += probs[i]
+            if r <= acc {
+                return llama_token(pool[i].index)
+            }
+        }
+
+        return llama_token(pool.first?.index ?? 0)
+    }
+
+    func selectTopK(from logits: [Float], k: Int) -> [(index: Int, logit: Float)] {
+        guard k > 0 else { return [] }
+        var indices: [Int] = []
+        var values: [Float] = []
+        indices.reserveCapacity(k)
+        values.reserveCapacity(k)
+
+        for i in 0..<logits.count {
+            let v = logits[i]
+            if indices.count < k {
+                indices.append(i)
+                values.append(v)
+                continue
+            }
+
+            var minIdx = 0
+            var minVal = values[0]
+            for j in 1..<values.count {
+                if values[j] < minVal {
+                    minVal = values[j]
+                    minIdx = j
+                }
+            }
+
+            if v > minVal {
+                indices[minIdx] = i
+                values[minIdx] = v
+            }
+        }
+
+        var out: [(index: Int, logit: Float)] = []
+        out.reserveCapacity(indices.count)
+        for i in 0..<indices.count {
+            out.append((index: indices[i], logit: values[i]))
+        }
+        return out
+    }
+}
+
+private extension LlamaRuntime {
+    func projectFieldVector(_ field: [Double], targetCount: Int) -> [Float] {
+        guard !field.isEmpty else { return [] }
+        let target = max(1, targetCount)
+        if field.count == target {
+            return field.map { Float($0) }
+        }
+        var out: [Float] = []
+        out.reserveCapacity(target)
+        let chunkSize = Double(field.count) / Double(target)
+        for i in 0..<target {
+            let start = Int(Double(i) * chunkSize)
+            let end = min(field.count, Int(Double(i + 1) * chunkSize))
+            if start >= end {
+                out.append(0)
+                continue
+            }
+            let slice = field[start..<end]
+            let avg = slice.reduce(0.0, +) / Double(slice.count)
+            out.append(Float(avg))
+        }
+        return out
+    }
 }

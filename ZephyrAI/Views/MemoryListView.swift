@@ -46,8 +46,8 @@ struct MemoryListView: View {
         .sheet(isPresented: $isPresentingEditor) {
             editorSheet
         }
-        .toolbarBackground(.visible, for: .navigationBar)
-        .toolbarBackground(colorScheme == .dark ? AnyShapeStyle(.ultraThinMaterial) : AnyShapeStyle(Color.clear), for: .navigationBar)
+        .toolbarBackground(.hidden, for: .navigationBar)
+        .toolbarBackground(Color.clear, for: .navigationBar)
         .toolbarColorScheme(colorScheme == .dark ? .dark : .light, for: .navigationBar)
         .onAppear { isGlassActive = true }
         .onDisappear { isGlassActive = false }
@@ -310,8 +310,8 @@ private struct GlassDistortionLayer: View {
                 if isActive {
                     TimelineView(.animation) { timeline in
                         let t = Float(timeline.date.timeIntervalSinceReferenceDate)
-                        let w = Float(proxy.size.width)
-                        let h = Float(proxy.size.height)
+                        let w = Float(max(1.0, proxy.size.width))
+                        let h = Float(max(1.0, proxy.size.height))
                         Rectangle()
                             .fill(.ultraThinMaterial)
                             .distortionEffect(

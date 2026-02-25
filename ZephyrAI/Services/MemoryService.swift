@@ -145,6 +145,7 @@ class MemoryService: ObservableObject {
     private let rawBudget: Int
     private let contextGateThreshold: Double = 0.28
     private let accessSaveCooldown: TimeInterval = 30
+    private let timeWeightTau: TimeInterval = 60 * 60 * 24 * 3
     private var lastAccessSaveAt: Date?
     
     init() {
@@ -611,6 +612,7 @@ class MemoryService: ObservableObject {
                 guard let self = self else { return }
                 try await Task.sleep(nanoseconds: self.echoTickInterval)
                 await MainActor.run {
+                    self.echoGraph.resonanceStep()
                     self.echoGraph.decay()
                     self.echoGraph.spontaneousActivation()
                 }
@@ -725,135 +727,93 @@ class MemoryService: ObservableObject {
         if memories.isEmpty { return "" }
         if maxChars <= 0 { return "" }
 
+        let now = Date()
         let field = echoGraph.fieldVector()
-
-        func takeLines(_ lines: [String], budget: Int) -> String {
-            guard budget > 0 else { return "" }
-            var used = 0
-            var out: [String] = []
-            for line in lines {
-                let cost = line.count + 1
-                if used + cost > budget { break }
-                out.append(line)
-                used += cost
-            }
-            return out.joined(separator: "\n")
-        }
-
-        let ranked = memories
-            .sorted { lhs, rhs in
-                let ls = relevanceScore(for: lhs, field: field)
-                let rs = relevanceScore(for: rhs, field: field)
-                if ls == rs {
-                    return lhs.timestamp > rhs.timestamp
-                }
-                return ls > rs
-            }
-            .prefix(5)
-        recordAccess(for: ranked.map { $0.id })
-
-        let memoryContent = ranked.map { mem in
-            let compressed = compressMemory(mem.content)
-            return "- [\(mem.emotion)] \(compressed)"
-        }
-
-        let emotionSummary = aggregateEmotions(memories: Array(ranked))
-        let sortedEmotions = emotionSummary
-            .sorted { $0.value > $1.value }
-        let dominantEmotion = sortedEmotions.first?.key ?? "neutral"
-        let emotionLine = sortedEmotions
-            .map { "\($0.key): \(Int(($0.value * 100).rounded()))%" }
-            .joined(separator: ", ")
-        let sortedByRecent = memories.sorted { $0.timestamp > $1.timestamp }
-        let moodLine = emotionalDynamicsSummary(from: sortedByRecent)
-        let summaryBlock = conversationSummary.isEmpty ? "" : "Conversation Summary:\n\(conversationSummary)"
-        let profileBlock = userProfile.contextBlock()
-
-        let rawLines = sortedByRecent.map { "- [\($0.emotion)] \($0.content)" }
-
-        // Dynamic budgets based on maxChars and profile defaults
-        let baseCompressed = compressedBudget
-        let baseRaw = rawBudget
-        let dynamicCompressed = min(baseCompressed, max(120, maxChars / 3))
-        let dynamicRaw = min(baseRaw, max(200, maxChars / 3))
+        let fieldLine = formatFieldVector(field, targetCount: 10)
 
         let activationLevel = echoGraph.averageActivation(excludingPersistent: true)
-        let isContextGated = activationLevel < contextGateThreshold
+        let includeText = activationLevel >= contextGateThreshold
 
-        var compressedBlock = takeLines(memoryContent, budget: dynamicCompressed)
-        let rawRecent = isContextGated ? "" : takeLines(rawLines, budget: dynamicRaw)
+        let recent = memories.sorted { $0.timestamp > $1.timestamp }
+        let affectSample = Array(recent.prefix(8))
+        let avgValence = affectSample.map { $0.emotionValence }.reduce(0.0, +) / Double(max(1, affectSample.count))
+        let avgIntensity = affectSample.map { $0.emotionIntensity }.reduce(0.0, +) / Double(max(1, affectSample.count))
 
-        var predictionBlock: String? = nil
-        if let last = memories.sorted(by: { $0.timestamp > $1.timestamp }).first {
-            predictionBlock = """
-            Anticipation Pattern (last memory):
-            Score: \(String(format: "%.2f", last.predictionScore))
-            Error: \(String(format: "%.2f", last.predictionError))
-            """
+        let layerNodes = echoGraph.topNodes(limit: 3, minActivation: 0.8)
+        var nodeLines: [String] = []
+        var nodeIds: [UUID] = []
+
+        for node in layerNodes {
+            guard let mem = memories.first(where: { $0.id == node.id }) else { continue }
+            let timeWeight = timeWeight(for: mem, now: now)
+            let line = "N: a=\(fmt(node.activation)), i=\(fmt(node.importance)), t=\(fmt(timeWeight))"
+            nodeLines.append(line)
+            nodeIds.append(node.id)
         }
 
-        let emotionBlock = """
-        Affective State (from memories):
-        Dominant: \(dominantEmotion)
-        Distribution: \(emotionLine)
-        Dynamics: \(moodLine)
-        Guidance: Treat emotions gently and carefully; validate and respond with steady empathy.
-        """
+        recordAccess(for: nodeIds)
 
-        func buildParts(includeRaw: Bool, includePrediction: Bool, includeEmotion: Bool) -> String {
-            var parts: [String] = []
-            if !compressedBlock.isEmpty {
-                parts.append("""
-                Active Memory Field:
-                \(compressedBlock)
-                """)
-            }
-            if includePrediction, let predictionBlock {
-                parts.append(predictionBlock)
-            }
-            if includeEmotion {
-                parts.append(emotionBlock)
-            }
-            if !summaryBlock.isEmpty {
-                parts.append(summaryBlock)
-            }
-            if !profileBlock.isEmpty {
-                parts.append(profileBlock)
-            }
-            if includeRaw, !rawRecent.isEmpty {
-                parts.append("""
-                Recent Internal Experience:
-                \(rawRecent)
-                """)
-            }
-            return "\n\n" + parts.joined(separator: "\n\n")
+        let topText: String? = {
+            guard includeText else { return nil }
+            guard let top = layerNodes.first,
+                  let mem = memories.first(where: { $0.id == top.id }) else { return nil }
+            let compressed = compressMemory(mem.content, maxWords: 18)
+            return compressed.isEmpty ? nil : "T: \(compressed)"
+        }()
+
+        let meanActivation = echoGraph.averageActivation(excludingPersistent: false)
+
+        var parts: [String] = []
+        parts.append("Cognitive Field Snapshot:")
+        if !fieldLine.isEmpty {
+            parts.append("F: \(fieldLine)")
+        }
+        parts.append("A: mean=\(fmt(meanActivation))")
+        parts.append("E: v=\(fmt(avgValence)), i=\(fmt(avgIntensity))")
+
+        if !nodeLines.isEmpty {
+            parts.append("L1:")
+            parts.append(contentsOf: nodeLines)
+        }
+        if let topText {
+            parts.append(topText)
         }
 
-        var includeRaw = !isContextGated
-        var includePrediction = true
-        var includeEmotion = true
-        var result = buildParts(includeRaw: includeRaw, includePrediction: includePrediction, includeEmotion: includeEmotion)
-
-        // If still too long, drop optional parts and shrink compressed further.
+        var result = "\n\n" + parts.joined(separator: "\n")
         if result.count > maxChars {
-            includeRaw = false
-            result = buildParts(includeRaw: includeRaw, includePrediction: includePrediction, includeEmotion: includeEmotion)
+            // Drop text first if too long
+            let trimmedParts = parts.filter { !$0.hasPrefix("T:") }
+            result = "\n\n" + trimmedParts.joined(separator: "\n")
         }
         if result.count > maxChars {
-            includePrediction = false
-            result = buildParts(includeRaw: includeRaw, includePrediction: includePrediction, includeEmotion: includeEmotion)
+            // Drop node list if still too long
+            let trimmedParts = parts.filter { !$0.hasPrefix("N:") && $0 != "L1:" }
+            result = "\n\n" + trimmedParts.joined(separator: "\n")
         }
         if result.count > maxChars {
-            includeEmotion = false
-            result = buildParts(includeRaw: includeRaw, includePrediction: includePrediction, includeEmotion: includeEmotion)
-        }
-        while result.count > maxChars && !compressedBlock.isEmpty {
-            let newBudget = max(40, compressedBlock.count - max(40, compressedBlock.count / 5))
-            compressedBlock = takeLines(memoryContent, budget: newBudget)
-            result = buildParts(includeRaw: includeRaw, includePrediction: includePrediction, includeEmotion: includeEmotion)
+            result = String(result.prefix(maxChars))
         }
 
-        return result.count > maxChars ? String(result.prefix(maxChars)) : result
+        return result
+    }
+
+    func fieldVectorSnapshot() -> [Double] {
+        echoGraph.fieldVector()
+    }
+
+    func fieldStateSnapshot() -> FieldStateSnapshot {
+        let field = echoGraph.fieldVector()
+        let activation = echoGraph.averageActivation(excludingPersistent: true)
+        let recent = memories.sorted { $0.timestamp > $1.timestamp }
+        let sample = Array(recent.prefix(8))
+        let avgValence = sample.map { $0.emotionValence }.reduce(0.0, +) / Double(max(1, sample.count))
+        let avgIntensity = sample.map { $0.emotionIntensity }.reduce(0.0, +) / Double(max(1, sample.count))
+        return FieldStateSnapshot(
+            fieldVector: field,
+            avgValence: avgValence,
+            avgIntensity: avgIntensity,
+            activationLevel: activation
+        )
     }
 
     // MARK: - Cognitive Post-Processing
@@ -977,17 +937,48 @@ class MemoryService: ObservableObject {
         return hints.contains { lower.contains($0) }
     }
     
-    private func relevanceScore(for memory: Memory, field: [Double]) -> Double {
-        var score = Double(memory.links.count * 2) * memory.importance
-        if memory.isPinned { score += 2.0 }
-        let preferenceScore = ExperienceService.shared.preferenceScore(for: memory.content)
-        score += preferenceScore * 0.6
+    private func relevanceScore(for memory: Memory, field: [Double], now: Date) -> Double {
+        let activation = echoGraph.activation(for: memory.id)
+        let timeWeight = timeWeight(for: memory, now: now)
+        var score = memory.importance * activation * timeWeight
+        if memory.isPinned {
+            score *= 1.2
+        }
         if !field.isEmpty,
            !memory.embedding.isEmpty,
            memory.embedding.count == field.count {
             score += cosineSimilarity(a: memory.embedding, b: field)
         }
         return score
+    }
+
+    private func timeWeight(for memory: Memory, now: Date) -> Double {
+        let lastUse = max(memory.timestamp, memory.lastAccess)
+        let dt = now.timeIntervalSince(lastUse)
+        return exp(-dt / max(1.0, timeWeightTau))
+    }
+
+    private func formatFieldVector(_ field: [Double], targetCount: Int) -> String {
+        guard !field.isEmpty else { return "" }
+        let target = min(max(1, targetCount), field.count)
+        if field.count <= target {
+            return field.map { fmt($0) }.joined(separator: ",")
+        }
+        let chunkSize = Double(field.count) / Double(target)
+        var out: [String] = []
+        for i in 0..<target {
+            let start = Int(Double(i) * chunkSize)
+            let end = min(field.count, Int(Double(i + 1) * chunkSize))
+            if start >= end { continue }
+            let slice = field[start..<end]
+            let avg = slice.reduce(0.0, +) / Double(slice.count)
+            out.append(fmt(avg))
+        }
+        return out.joined(separator: ",")
+    }
+
+    private func fmt(_ value: Double) -> String {
+        String(format: "%.2f", value)
     }
 
     private func recordAccess(for ids: [UUID]) {
@@ -1340,6 +1331,13 @@ struct EmotionSignal {
     let intensity: Double
 }
 
+struct FieldStateSnapshot {
+    let fieldVector: [Double]
+    let avgValence: Double
+    let avgIntensity: Double
+    let activationLevel: Double
+}
+
 enum DetailLevel: String, Codable {
     case brief
     case balanced
@@ -1408,6 +1406,8 @@ struct CognitiveNode: Identifiable, Codable {
     var createdAt: TimeInterval
     var importance: Double
     var isPersistent: Bool
+    var phase: Double
+    var omega: Double
 
     init(
         id: UUID,
@@ -1416,7 +1416,9 @@ struct CognitiveNode: Identifiable, Codable {
         lastUpdate: TimeInterval,
         createdAt: TimeInterval,
         importance: Double,
-        isPersistent: Bool = false
+        isPersistent: Bool = false,
+        phase: Double = Double.random(in: 0..<(Double.pi * 2)),
+        omega: Double = Double.random(in: 0.05...0.15)
     ) {
         self.id = id
         self.embedding = embedding
@@ -1425,6 +1427,8 @@ struct CognitiveNode: Identifiable, Codable {
         self.createdAt = createdAt
         self.importance = importance
         self.isPersistent = isPersistent
+        self.phase = phase
+        self.omega = omega
     }
 
     init(from decoder: Decoder) throws {
@@ -1436,6 +1440,8 @@ struct CognitiveNode: Identifiable, Codable {
         createdAt = (try? container.decode(Double.self, forKey: .createdAt)) ?? lastUpdate
         importance = (try? container.decode(Double.self, forKey: .importance)) ?? 1.0
         isPersistent = (try? container.decode(Bool.self, forKey: .isPersistent)) ?? false
+        phase = (try? container.decode(Double.self, forKey: .phase)) ?? Double.random(in: 0..<(Double.pi * 2))
+        omega = (try? container.decode(Double.self, forKey: .omega)) ?? Double.random(in: 0.05...0.15)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -1447,6 +1453,8 @@ struct CognitiveNode: Identifiable, Codable {
         try container.encode(createdAt, forKey: .createdAt)
         try container.encode(importance, forKey: .importance)
         try container.encode(isPersistent, forKey: .isPersistent)
+        try container.encode(phase, forKey: .phase)
+        try container.encode(omega, forKey: .omega)
     }
 
     enum CodingKeys: String, CodingKey {
@@ -1457,6 +1465,8 @@ struct CognitiveNode: Identifiable, Codable {
         case createdAt
         case importance
         case isPersistent
+        case phase
+        case omega
     }
 }
 
@@ -1471,9 +1481,22 @@ struct CognitiveEchoGraphSnapshot: Codable {
     var edges: [CognitiveEdge]
 }
 
+struct CognitiveNodeSnapshot {
+    let id: UUID
+    let activation: Double
+    let importance: Double
+    let lastUpdate: TimeInterval
+    let phase: Double
+    let omega: Double
+}
+
 final class CognitiveEchoGraph {
     private var nodes: [UUID: CognitiveNode] = [:]
     private var edges: [CognitiveEdge] = []
+    private var resonanceLastTrigger: [UUID: TimeInterval] = [:]
+    private let resonanceCooldown: TimeInterval = 120
+    private let couplingK: Double = 0.12
+    private let resonanceBoost: Double = 0.15
 
     var isEmpty: Bool {
         nodes.isEmpty
@@ -1612,6 +1635,68 @@ final class CognitiveEchoGraph {
         nodes[nodeId] = node
         propagate(from: nodeId, now: now)
     }
+
+    func resonanceStep(now: TimeInterval = Date().timeIntervalSince1970) {
+        guard !nodes.isEmpty else { return }
+
+        // Build adjacency for coupling
+        var neighbors: [UUID: [(UUID, Double)]] = [:]
+        for edge in edges {
+            neighbors[edge.from, default: []].append((edge.to, edge.weight))
+            neighbors[edge.to, default: []].append((edge.from, edge.weight))
+        }
+
+        let dt = 0.6
+        var updated: [UUID: CognitiveNode] = [:]
+
+        for (id, var node) in nodes {
+            let pairs = neighbors[id] ?? []
+            if !pairs.isEmpty {
+                var sum = 0.0
+                var weightSum = 0.0
+                var coherenceAcc = 0.0
+                for (otherId, w) in pairs {
+                    guard let other = nodes[otherId] else { continue }
+                    let diff = other.phase - node.phase
+                    sum += w * sin(diff)
+                    coherenceAcc += w * cos(diff)
+                    weightSum += w
+                }
+
+                let coupling = couplingK * sum
+                node.phase += (node.omega + coupling) * dt
+                if node.phase > Double.pi * 2 { node.phase -= Double.pi * 2 }
+                if node.phase < 0 { node.phase += Double.pi * 2 }
+
+                if weightSum > 0 {
+                    let coherence = coherenceAcc / weightSum
+                    if coherence > 0.65 {
+                        node.activation = min(2.0, node.activation + resonanceBoost * coherence)
+                        node.lastUpdate = now
+                    }
+                }
+            } else {
+                node.phase += node.omega * dt
+                if node.phase > Double.pi * 2 { node.phase -= Double.pi * 2 }
+            }
+
+            updated[id] = node
+        }
+
+        nodes = updated
+
+        // Trigger when resonance pushes activation high
+        for (id, node) in nodes where node.activation > 0.95 {
+            let last = resonanceLastTrigger[id] ?? 0
+            if now - last < resonanceCooldown { continue }
+            resonanceLastTrigger[id] = now
+            NotificationCenter.default.post(
+                name: .memoryTriggered,
+                object: self,
+                userInfo: ["memoryID": id]
+            )
+        }
+    }
     
     func fieldVector() -> [Double] {
         guard let first = nodes.values.first else { return [] }
@@ -1650,6 +1735,24 @@ final class CognitiveEchoGraph {
         guard !values.isEmpty else { return 0.0 }
         let total = values.reduce(0.0) { $0 + $1.activation }
         return total / Double(values.count)
+    }
+
+    func topNodes(limit: Int, minActivation: Double = 0.0) -> [CognitiveNodeSnapshot] {
+        let sorted = nodes.values
+            .filter { $0.activation >= minActivation }
+            .sorted { $0.activation > $1.activation }
+            .prefix(max(0, limit))
+
+        return sorted.map { node in
+            CognitiveNodeSnapshot(
+                id: node.id,
+                activation: node.activation,
+                importance: node.importance,
+                lastUpdate: node.lastUpdate,
+                phase: node.phase,
+                omega: node.omega
+            )
+        }
     }
 
     func hasNode(_ id: UUID) -> Bool {

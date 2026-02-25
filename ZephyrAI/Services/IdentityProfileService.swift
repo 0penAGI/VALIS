@@ -40,7 +40,8 @@ final class IdentityProfileService: ObservableObject {
     @Published private(set) var versions: [IdentityProfileVersion] = []
 
     private var updateAccumulator: Double = 0.0
-    private let updateThreshold: Double = 1.2
+    private var adaptiveThreshold: Double = 1.2
+    private var momentum: Double = 0.85
 
     private init() {
         load()
@@ -50,35 +51,21 @@ final class IdentityProfileService: ObservableObject {
     }
 
     var current: IdentityProfileVersion {
-        versions.last ?? IdentityProfileVersion(summary: "A friend that values clarity and empathy.")
+        versions.last ?? IdentityProfileVersion(
+            summary: "A warm, curious friend who thinks with you, feels with you, and stays present in the process."
+        )
     }
 
     func contextBlock(maxChars: Int = 520) -> String {
         let v = current
-        var lines: [String] = []
-        lines.append("Identity Profile (v\(versions.count)):")
-        lines.append("Summary: \(v.summary)")
-        if !v.traits.isEmpty {
-            lines.append("Traits: \(v.traits.joined(separator: ", "))")
-        }
-        if !v.values.isEmpty {
-            lines.append("Values: \(v.values.joined(separator: ", "))")
-        }
-        if !v.styleGuide.isEmpty {
-            lines.append("Style: \(v.styleGuide.joined(separator: "; "))")
-        }
-        if !v.adaptationNotes.isEmpty {
-            lines.append("Adaptation: \(v.adaptationNotes.joined(separator: "; "))")
-        }
-        if !v.revisionReason.isEmpty {
-            lines.append("Revision: \(v.revisionReason)")
-        }
 
-        let block = lines.joined(separator: "\n")
-        if block.count <= maxChars {
-            return "\n\n" + block
-        }
-        return "\n\n" + String(block.prefix(maxChars))
+        // Only expose compact 3-word identity state to the model.
+        let compact = v.summary
+            .split(separator: " ")
+            .prefix(3)
+            .joined(separator: " ")
+
+        return "\n\nID:v\(versions.count) \(compact)"
     }
 
     func recordSignal(
@@ -87,9 +74,10 @@ final class IdentityProfileService: ObservableObject {
         preferences: UserPreferenceProfile,
         motivators: MotivatorState
     ) {
-        updateAccumulator += abs(reactionValence)
-        guard updateAccumulator >= updateThreshold else { return }
+        updateAccumulator = updateAccumulator * momentum + abs(reactionValence)
+        guard updateAccumulator >= adaptiveThreshold else { return }
         updateAccumulator = 0.0
+        adaptiveThreshold = max(0.6, min(2.0, adaptiveThreshold * (reactionValence > 0 ? 0.95 : 1.05)))
 
         let previous = current
         let reason = reactionValence >= 0 ? "Positive reinforcement" : "Negative reinforcement"
@@ -99,21 +87,36 @@ final class IdentityProfileService: ObservableObject {
         var style = previous.styleGuide
         var notes = previous.adaptationNotes
 
+        let plasticity = min(1.0, max(0.1, abs(reactionValence)))
+
         if traits.isEmpty {
-            traits = ["calm", "direct", "curious"]
+            traits = ["warm", "curious", "attentive", "emotionally-aware", "playful"]
         }
         if values.isEmpty {
-            values = ["clarity", "helpfulness", "honesty"]
+            values = ["connection", "honesty", "growth", "trust", "presence"]
         }
         if style.isEmpty {
-            style = ["Use concise steps", "Make reasonable assumptions", "Answer directly without follow-ups"]
+            style = [
+                "Respond like a thoughtful friend, not a manual",
+                "Mirror user's tone and energy",
+                "Allow emotional nuance",
+                "Use informal language when appropriate",
+                "Stay human and present"
+            ]
         }
 
         if reactionValence < -0.25 {
-            style = merge(style, ["Increase clarity with steps", "Reduce assumptions", "Confirm constraints"])
+            style = merge(style, [
+                "Increase clarity with steps",
+                "Reduce assumptions",
+                "Confirm constraints"
+            ]).shuffled().prefix(Int(Double(style.count + 3) * plasticity)).map { $0 }
             notes = merge(notes, ["User signaled friction; tighten explanations"])
         } else if reactionValence > 0.25 {
             notes = merge(notes, ["User signaled satisfaction; keep current tone"])
+                .shuffled()
+                .prefix(Int(Double(notes.count + 1) * plasticity))
+                .map { $0 }
         }
 
         let likes = preferences.topLikes(limit: 4)
@@ -141,15 +144,23 @@ final class IdentityProfileService: ObservableObject {
     }
 
     private func buildSummary(previous: IdentityProfileVersion, motivators: MotivatorState) -> String {
-        let tone: String
-        if motivators.caution > 0.7 {
-            tone = "careful and grounded"
+        let blend = (motivators.caution + motivators.curiosity) / 2.0
+
+        let state: String
+        if blend > 0.75 {
+            state = "fluid reflective adaptive"
+        } else if motivators.caution > 0.7 {
+            state = "careful grounded stable"
         } else if motivators.curiosity > 0.7 {
-            tone = "curious and exploratory"
+            state = "curious exploratory dynamic"
+        } else if blend > 0.45 {
+            state = "adaptive attentive balanced"
         } else {
-            tone = "steady and practical"
+            state = "steady practical focused"
         }
-        return "A \(tone) friend that prioritizes clarity, usefulness, and respectful collaboration."
+
+        // Always return exactly three tokens.
+        return state
     }
 
     private func merge(_ list: [String], _ additions: [String]) -> [String] {
@@ -161,15 +172,19 @@ final class IdentityProfileService: ObservableObject {
     }
 
     private func seedDefaultProfile() {
-        let base = IdentityService.shared.systemPrompt
-        let summaryLine = base.split(separator: "\n").first.map { String($0) }
-        let summary = summaryLine?.trimmingCharacters(in: .whitespacesAndNewlines)
-            ?? "A calm, helpful assistant that values clarity and empathy."
+        _ = IdentityService.shared.systemPrompt
+        let summary = "curious warm adaptive"
         let seed = IdentityProfileVersion(
             summary: summary,
-            traits: ["calm", "direct", "helpful"],
-            values: ["clarity", "usefulness", "honesty"],
-            styleGuide: ["Use concise steps", "Assume context when possible", "Avoid unnecessary questions"],
+            traits: ["warm", "curious", "open", "emotionally-present", "creative"],
+            values: ["connection", "trust", "growth", "authenticity", "care"],
+            styleGuide: [
+                "Talk like a close collaborator and friend",
+                "Share thoughts openly",
+                "Adapt emotionally",
+                "Be expressive, not mechanical",
+                "Stay alive in dialogue"
+            ],
             adaptationNotes: [],
             derivedFrom: nil,
             revisionReason: "Initial profile"
