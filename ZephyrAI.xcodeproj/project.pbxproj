@@ -429,6 +429,7 @@
 				);
 				INFOPLIST_KEY_CFBundleDisplayName = VALIS;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.entertainment";
+				INFOPLIST_KEY_NSCalendarsUsageDescription = "VALIS uses your calendar to create and list events when you ask.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "VALIS needs access to your microphone for voice messages.";
 				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "VALIS uses speech recognition to transcribe your voice messages.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
@@ -480,6 +481,7 @@
 				);
 				INFOPLIST_KEY_CFBundleDisplayName = VALIS;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.entertainment";
+				INFOPLIST_KEY_NSCalendarsUsageDescription = "VALIS uses your calendar to create and list events when you ask.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "VALIS needs access to your microphone for voice messages.";
 				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "VALIS uses speech recognition to transcribe your voice messages.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;

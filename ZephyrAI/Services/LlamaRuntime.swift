@@ -46,6 +46,9 @@ final class LlamaRuntime {
     private var context: OpaquePointer?
     private var vocab: OpaquePointer?
     private var tokenCount: Int32 = 0
+    private var samplingTopIndices: [Int] = []
+    private var samplingTopLogits: [Float] = []
+    private var samplingProbs: [Float] = []
 
     var contextSize: Int32
     private let batchSize: Int32
@@ -227,7 +230,16 @@ final class LlamaRuntime {
             print("[Llama] Capping maxTokens to \(generationLimit) to fit context.")
         }
 
-        var recentTokens: [llama_token] = []
+        let repeatWindow = max(0, sampling.repeatLastN)
+        var recentRing: [llama_token] = repeatWindow > 0
+            ? [llama_token](repeating: 0, count: repeatWindow)
+            : []
+        var recentCounts: [Int: Int] = [:]
+        if repeatWindow > 0 {
+            recentCounts.reserveCapacity(repeatWindow)
+        }
+        var recentUsed = 0
+        var recentHead = 0
 
         for _ in 0..<generationLimit {
             if shouldStop() { return }
@@ -251,7 +263,7 @@ final class LlamaRuntime {
                     logits: logits,
                     nVocab: nVocab,
                     sampling: sampling,
-                    recentTokens: recentTokens
+                    recentTokenCounts: recentCounts
                 )
             }
             if llama_vocab_is_eog(vocab, token) { break }
@@ -270,9 +282,29 @@ final class LlamaRuntime {
                 throw LlamaRuntimeError.decodeFailed(code: decodeResult)
             }
 
-            recentTokens.append(token)
-            if recentTokens.count > sampling.repeatLastN, sampling.repeatLastN > 0 {
-                recentTokens.removeFirst(recentTokens.count - sampling.repeatLastN)
+            if repeatWindow > 0 {
+                if recentUsed < repeatWindow {
+                    recentRing[recentUsed] = token
+                    recentUsed += 1
+                } else {
+                    let oldToken = recentRing[recentHead]
+                    let oldIndex = Int(oldToken)
+                    if let oldCount = recentCounts[oldIndex] {
+                        if oldCount <= 1 {
+                            recentCounts.removeValue(forKey: oldIndex)
+                        } else {
+                            recentCounts[oldIndex] = oldCount - 1
+                        }
+                    }
+                    recentRing[recentHead] = token
+                    recentHead += 1
+                    if recentHead == repeatWindow {
+                        recentHead = 0
+                    }
+                }
+
+                let idx = Int(token)
+                recentCounts[idx, default: 0] += 1
             }
 
             if let bytes = tokenToPieceBytes(token, vocab: vocab) {
@@ -393,103 +425,95 @@ private extension LlamaRuntime {
         logits: UnsafePointer<Float>,
         nVocab: Int,
         sampling: SamplingConfig,
-        recentTokens: [llama_token]
+        recentTokenCounts: [Int: Int]
     ) -> llama_token {
-        var local = [Float](repeating: 0, count: nVocab)
-        for i in 0..<nVocab {
-            local[i] = logits[i]
+        let k = max(1, min(sampling.topK, nVocab))
+        if samplingTopIndices.count < k {
+            samplingTopIndices = [Int](repeating: 0, count: k)
         }
-
-        if sampling.repetitionPenalty > 1.0, sampling.repeatLastN > 0, !recentTokens.isEmpty {
-            let penalty = sampling.repetitionPenalty
-            for token in recentTokens.suffix(sampling.repeatLastN) {
-                let idx = Int(token)
-                guard idx >= 0 && idx < nVocab else { continue }
-                let v = local[idx]
-                local[idx] = v < 0 ? v * penalty : v / penalty
-            }
+        if samplingTopLogits.count < k {
+            samplingTopLogits = [Float](repeating: 0, count: k)
         }
 
         let temp = max(0.01, sampling.temperature)
+        let invTemp: Float = 1 / temp
+        let penalty = sampling.repetitionPenalty
+        let usePenalty = penalty > 1.0 && sampling.repeatLastN > 0 && !recentTokenCounts.isEmpty
+        var selected = 0
+        var minPos = 0
+        var minLogit = Float.greatestFiniteMagnitude
+
         for i in 0..<nVocab {
-            local[i] /= temp
+            var v = logits[i]
+            if usePenalty, let repeatCount = recentTokenCounts[i], repeatCount > 0 {
+                let scale = powf(penalty, Float(repeatCount))
+                v = v < 0 ? v * scale : v / scale
+            }
+            v *= invTemp
+
+            if selected < k {
+                samplingTopIndices[selected] = i
+                samplingTopLogits[selected] = v
+                if v < minLogit {
+                    minLogit = v
+                    minPos = selected
+                }
+                selected += 1
+                continue
+            }
+
+            if v > minLogit {
+                samplingTopIndices[minPos] = i
+                samplingTopLogits[minPos] = v
+
+                minPos = 0
+                minLogit = samplingTopLogits[0]
+                for j in 1..<k {
+                    let candidate = samplingTopLogits[j]
+                    if candidate < minLogit {
+                        minLogit = candidate
+                        minPos = j
+                    }
+                }
+            }
         }
 
-        let k = max(1, min(sampling.topK, nVocab))
-        let pool = selectTopK(from: local, k: k)
-        guard !pool.isEmpty else {
+        guard selected > 0 else {
             return llama_token(0)
         }
 
         var maxLogit = -Float.greatestFiniteMagnitude
-        for item in pool {
-            if item.logit > maxLogit { maxLogit = item.logit }
+        for i in 0..<selected {
+            let v = samplingTopLogits[i]
+            if v > maxLogit {
+                maxLogit = v
+            }
         }
 
-        var probs: [Float] = []
-        probs.reserveCapacity(pool.count)
+        if samplingProbs.count < selected {
+            samplingProbs = [Float](repeating: 0, count: selected)
+        }
         var sum: Float = 0
-        for item in pool {
-            let p = expf(item.logit - maxLogit)
-            probs.append(p)
+        for i in 0..<selected {
+            let p = expf(samplingTopLogits[i] - maxLogit)
+            samplingProbs[i] = p
             sum += p
         }
         if sum <= 0 {
-            return llama_token(pool[0].index)
-        }
-
-        for i in 0..<probs.count {
-            probs[i] /= sum
+            return llama_token(samplingTopIndices[0])
         }
 
         let r = Float.random(in: 0..<1)
         var acc: Float = 0
-        for i in 0..<pool.count {
-            acc += probs[i]
+        let invSum: Float = 1 / sum
+        for i in 0..<selected {
+            acc += samplingProbs[i] * invSum
             if r <= acc {
-                return llama_token(pool[i].index)
+                return llama_token(samplingTopIndices[i])
             }
         }
 
-        return llama_token(pool.first?.index ?? 0)
-    }
-
-    func selectTopK(from logits: [Float], k: Int) -> [(index: Int, logit: Float)] {
-        guard k > 0 else { return [] }
-        var indices: [Int] = []
-        var values: [Float] = []
-        indices.reserveCapacity(k)
-        values.reserveCapacity(k)
-
-        for i in 0..<logits.count {
-            let v = logits[i]
-            if indices.count < k {
-                indices.append(i)
-                values.append(v)
-                continue
-            }
-
-            var minIdx = 0
-            var minVal = values[0]
-            for j in 1..<values.count {
-                if values[j] < minVal {
-                    minVal = values[j]
-                    minIdx = j
-                }
-            }
-
-            if v > minVal {
-                indices[minIdx] = i
-                values[minIdx] = v
-            }
-        }
-
-        var out: [(index: Int, logit: Float)] = []
-        out.reserveCapacity(indices.count)
-        for i in 0..<indices.count {
-            out.append((index: indices[i], logit: values[i]))
-        }
-        return out
+        return llama_token(samplingTopIndices[0])
     }
 }
 

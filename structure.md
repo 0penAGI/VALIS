@@ -11,7 +11,8 @@ This document describes the repository layout and the main runtime components as
   - `llama.xcframework`: Prebuilt `llama.cpp` framework.
 - `README.md`: Project overview.
 - `structure.md`: This file.
-- `IMG_9313.jpeg`, `IMG_9314.jpeg`, `IMG_9315.jpeg`: Screenshot assets used in the README.
+- `IMG_8565.png`, `IMG_9344.png`, `IMG_8567.png`: Screenshot assets currently referenced by `README.md`.
+- `IMG_8566.png`: Additional local screenshot asset.
 
 ### Local / Vendored Folders
 
@@ -29,7 +30,7 @@ These may exist locally for reference/experimentation. In this repo they are typ
 
 ### Models (`ZephyrAI/Models/`)
 - `Message.swift`: Chat message model.
-- (Other small data structs are defined near the services that use them.)
+- `LLMModel.swift`: Model profile registry + persistence (`LFM 2.5`/`Qwen 3`) and model-change notification.
 
 ### ViewModels (`ZephyrAI/ViewModels/`)
 
@@ -38,14 +39,14 @@ These may exist locally for reference/experimentation. In this repo they are typ
     - `IdentityService` persona prompt
     - `IdentityProfileService` “living identity” block
     - `EmotionService` internal affect block
-    - tool context (Date / DuckDuckGo / Reddit news) when enabled/triggered
+    - tool/action context supplied by `ActionService`
     - `ExperienceService` lessons + preferences
     - `MotivationService` guidance
     - response detail level / style tuning
   - Streams generation and parses `<think>...</think>` for the “Thinking UI”.
   - Tooling:
-    - Rule-based tools: inject Date/Web/News context based on trigger phrases.
-    - Model-initiated tools: parses `TOOL:` lines and re-runs generation with tool results (bounded multi-step loop).
+    - delegates rule-based tools + model-initiated `TOOL:`/`ACTION:` calls to `ActionService`.
+    - re-runs generation with tool/action results (bounded multi-step loop).
   - Memory + autonomy:
     - stores experiences and updates memory
     - listens to `.memoryTriggered` and can perform a spontaneous “learn” response when idle.
@@ -55,12 +56,15 @@ These may exist locally for reference/experimentation. In this repo they are typ
 ### Views (`ZephyrAI/Views/`)
 
 - `ChatView.swift`: Main chat UI (messages + streaming output + input + mic recording).
+  - Parses and renders inline `<artifact type="html">...</artifact>` blocks in assistant/user bubbles.
+- `ArtifactView.swift`: `WKWebView` wrapper used by chat bubbles to render HTML/CSS/JS artifacts.
 - `SettingsView.swift`: Persona prompt editor + navigation to Memories; presented as a translucent sheet over chat.
 - `MemoryListView.swift`: Memory management UI (pin/unpin/delete/edit, clear confirmations).
 
 ### Services (`ZephyrAI/Services/`)
 
 - `LLMService.swift`: High-level LLM interface.
+  - Uses selected model profile from `LLMModelStorage` (`filename` + download URL).
   - Resolves the GGUF model in this order:
     - `Application Support/VALIS/` (download location)
     - app bundle (`ZephyrAI/Resources/Models/`)
@@ -77,6 +81,10 @@ These may exist locally for reference/experimentation. In this repo they are typ
   - Stores/persists `Memory` objects (emotion, importance, embeddings, associative links, activation/decay).
   - Maintains a graph (`MemoryGraph`) and echo/trigger logic (`CognitiveEchoGraph`).
   - Provides pruning, activation/decay, and a context block generator.
+- `ActionService.swift`: Tool/action runtime.
+  - Parses model-initiated `TOOL:` / `ACTION:` lines.
+  - Executes rule-based signals (Date / DuckDuckGo / Reddit) and user-visible actions (`open_url`, `calendar` open/create/list).
+  - Provides autonomous DDG/Wikipedia enrichment for spontaneous memory-triggered runs.
 - `EmotionService.swift`: Internal affect state.
   - Maintains a slow-changing (valence/intensity/stability) state with decay.
   - Provides a self-access context block intended to be referenced sparingly.
@@ -92,8 +100,8 @@ These may exist locally for reference/experimentation. In this repo they are typ
 ### Resources (`ZephyrAI/Resources/`)
 
 - `ZephyrAI/Resources/Models/`: Bundled GGUF models (optional; app can also download to Application Support).
-  - `LFM2.5-1.2B-Thinking-Q8_0.gguf` (default)
   - `Qwen3-1.7B-Q4_K_M.gguf`
+  - `LFM2.5-1.2B-Thinking-Q8_0.gguf`
 - `ZephyrAI/Resources/glassDistortion.metal`: Stitchable Metal shader for the “liquid glass” backdrop in Settings/Memories.
 - `ZephyrAI/Assets.xcassets/`: App icons/colors.
 
@@ -106,7 +114,8 @@ These may exist locally for reference/experimentation. In this repo they are typ
 ### Tools
 
 - Rule-based: Date / DuckDuckGo summaries / Reddit news, based on prompt triggers.
-- Model-initiated: `TOOL:` lines inside `<think>` trigger tool execution and a bounded re-generation loop.
+- Model-initiated: `TOOL:`/`ACTION:` lines inside `<think>` trigger `ActionService` execution and a bounded re-generation loop.
+- Inline artifacts: assistant may embed `<artifact type="html" title="...">...</artifact>` in final response; chat UI extracts and renders it as a live web artifact.
 
 ### Model Storage / Download
 

@@ -26,6 +26,7 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
     
     private let llmService = LLMService()
     private let memoryService = MemoryService.shared
+    private let actionService = ActionService.shared
     private let identityService = IdentityService.shared
     private let identityProfileService = IdentityProfileService.shared
     private let experienceService = ExperienceService.shared
@@ -154,98 +155,6 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
         currentThinkingMessageId = nil
     }
     
-    private func shouldUseWebSearch(for text: String) -> Bool {
-        let lowercased = text.lowercased()
-        let triggers = [
-            "search",
-            "google",
-            "web",
-            "internet",
-            "найди",
-            "найти",
-            "поиск",
-            "в интернете",
-            "что такое",
-            "кто такой",
-            "посмотри",
-            "загугли",
-            "поищи"
-        ]
-        return triggers.contains { lowercased.contains($0) }
-    }
-    
-    private func shouldUseDateTool(for text: String) -> Bool {
-        let lowercased = text.lowercased()
-        let triggers = [
-            "какая сегодня дата",
-            "сегодняшняя дата",
-            "какой сегодня день",
-            "today's date",
-            "what is today's date",
-            "current date"
-        ]
-        return triggers.contains { lowercased.contains($0) }
-    }
-
-    private func shouldUseNewsTool(for text: String) -> Bool {
-        let lowercased = text.lowercased()
-        let triggers = [
-            "news",
-            "latest",
-            "headlines",
-            "breaking",
-            "новости",
-            "свежие новости",
-            "последние новости",
-            "что нового"
-        ]
-        return triggers.contains { lowercased.contains($0) }
-    }
-    
-    private func buildToolContextBlock(from webContext: String) -> String {
-        guard !webContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return ""
-        }
-        return """
-
-Signal context (web):
-\(webContext)
-
-"""
-    }
-
-    private func buildToolGuidanceBlock(hasTools: Bool) -> String {
-        guard hasTools else { return "" }
-        return """
-
-Signal results are available below. Use them directly and do not claim you lack internet access.
-
-"""
-    }
-
-    private func buildNewsContextBlock(from newsContext: String) -> String {
-        guard !newsContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return ""
-        }
-        return """
-
-Signal context (news):
-\(newsContext)
-
-"""
-    }
-
-    private func buildToolErrorBlock(toolName: String, message: String) -> String {
-        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return "" }
-        return """
-
-Signal error (\(toolName)):
-\(trimmed)
-
-"""
-    }
-
     private func buildRecentDialogContext(maxTurns: Int = 6, maxCharsPerMessage: Int = 220) -> String {
         guard maxTurns > 0 else { return "" }
         let recent = messages
@@ -268,26 +177,6 @@ Signal error (\(toolName)):
         return "\n\nRecent Dialogue:\n" + lines.joined(separator: "\n")
     }
     
-    private func buildDateContextBlock() -> String {
-        let date = Date()
-        let formatter = DateFormatter()
-        formatter.locale = Locale.current
-        formatter.dateStyle = .full
-        formatter.timeStyle = .none
-        let formatted = formatter.string(from: date)
-        
-        let isoFormatter = ISO8601DateFormatter()
-        let iso = isoFormatter.string(from: date)
-        
-        return """
-
-Signal (system time):
-Сегодняшняя дата (локально): \(formatted)
-ISO‑время: \(iso)
-
-"""
-    }
-
     private func isSeriousPrompt(_ text: String) -> Bool {
         let lower = text.lowercased()
         let triggers = [
@@ -327,198 +216,13 @@ Spontaneous flavor:
 """
     }
 
-    private struct ParsedToolCall {
-        let name: String
-        let query: String
-    }
-
-    private func parseToolCall(from text: String) -> ParsedToolCall? {
-        let pattern = "(?im)^\\s*TOOL\\s*:\\s*(.+)$"
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
-        let range = NSRange(text.startIndex..<text.endIndex, in: text)
-        guard let match = regex.firstMatch(in: text, range: range),
-              let lineRange = Range(match.range(at: 1), in: text) else {
-            return nil
-        }
-
-        let line = String(text[lineRange]).trimmingCharacters(in: .whitespacesAndNewlines)
-        if line.isEmpty { return nil }
-
-        let parts = line.split(separator: "|", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-        let rawName = parts.first ?? ""
-        let name = rawName.lowercased().replacingOccurrences(of: "-", with: "_")
-        if name.isEmpty { return nil }
-
-        let rawArgs = parts.count > 1 ? parts[1] : ""
-        var query = ""
-        if rawArgs.lowercased().hasPrefix("query=") {
-            query = String(rawArgs.dropFirst("query=".count)).trimmingCharacters(in: .whitespacesAndNewlines)
-        } else {
-            query = rawArgs.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-
-        return ParsedToolCall(name: name, query: query)
-    }
-
-    private func toolContext(for call: ParsedToolCall) async -> String {
-        switch call.name {
-        case "date":
-            return buildDateContextBlock()
-        case "web_search":
-            let q = call.query.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !q.isEmpty else {
-                return buildToolErrorBlock(toolName: "web_search", message: "Empty query.")
-            }
-            do {
-                let webContext = try await fetchDuckDuckGoSummary(query: q)
-                if !webContext.isEmpty {
-                    let snippets = splitSnippets(webContext)
-                    memoryService.ingestExternalSnippets(snippets, source: "duckduckgo", query: q)
-                    return buildToolContextBlock(from: webContext)
-                }
-                return buildToolErrorBlock(toolName: "web_search", message: "No summary found for the query.")
-            } catch {
-                return buildToolErrorBlock(toolName: "web_search", message: "Web search unavailable (network error).")
-            }
-        case "reddit_news":
-            do {
-                let news = try await fetchRedditNews(limit: 6)
-                if !news.isEmpty {
-                    return buildNewsContextBlock(from: news)
-                }
-                return buildToolErrorBlock(toolName: "reddit_news", message: "No news items returned.")
-            } catch {
-                return buildToolErrorBlock(toolName: "reddit_news", message: "Reddit news unavailable (network error).")
-            }
-        default:
-            return buildToolErrorBlock(toolName: call.name, message: "Unknown tool.")
-        }
-    }
-    
-    private func aggregateToolContext(for prompt: String) async -> String {
-        var blocks: [String] = []
-        
-        if shouldUseDateTool(for: prompt) {
-            let dateContext = buildDateContextBlock()
-            if !dateContext.isEmpty {
-                blocks.append(dateContext)
-            }
-        }
-        
-        if shouldUseWebSearch(for: prompt) {
-            do {
-                let webContext = try await fetchDuckDuckGoSummary(query: prompt)
-                if !webContext.isEmpty {
-                    print("[Tools] Web search context length: \(webContext.count)")
-                    let snippets = splitSnippets(webContext)
-                    memoryService.ingestExternalSnippets(snippets, source: "duckduckgo", query: prompt)
-                    blocks.append(buildToolContextBlock(from: webContext))
-                } else {
-                    blocks.append(buildToolErrorBlock(toolName: "web_search", message: "No summary found for the query."))
-                }
-            } catch {
-                print("[Tools] Web search failed: \(error)")
-                blocks.append(buildToolErrorBlock(toolName: "web_search", message: "Web search unavailable (network error)."))
-            }
-        }
-
-        if shouldUseNewsTool(for: prompt) {
-            do {
-                let news = try await fetchRedditNews(limit: 6)
-                if !news.isEmpty {
-                    blocks.append(buildNewsContextBlock(from: news))
-                } else {
-                    blocks.append(buildToolErrorBlock(toolName: "reddit_news", message: "No news items returned."))
-                }
-            } catch {
-                blocks.append(buildToolErrorBlock(toolName: "reddit_news", message: "Reddit news unavailable (network error)."))
-            }
-        }
-        
-        return blocks.joined(separator: "\n")
-    }
-    
-    private func fetchDuckDuckGoSummary(query: String) async throws -> String {
-        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return "" }
-        
-        var components = URLComponents(string: "https://api.duckduckgo.com/")!
-        components.queryItems = [
-            URLQueryItem(name: "q", value: trimmed),
-            URLQueryItem(name: "format", value: "json"),
-            URLQueryItem(name: "no_redirect", value: "1"),
-            URLQueryItem(name: "no_html", value: "1"),
-            URLQueryItem(name: "skip_disambig", value: "1")
-        ]
-        
-        guard let url = components.url else { return "" }
-        
-        let (data, _) = try await URLSession.shared.data(from: url)
-        let decoded = try JSONDecoder().decode(DuckDuckGoResponse.self, from: data)
-        
-        var parts: [String] = []
-        if let abstract = decoded.Abstract, !abstract.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            parts.append(abstract.trimmingCharacters(in: .whitespacesAndNewlines))
-        } else if let abstractText = decoded.AbstractText, !abstractText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            parts.append(abstractText.trimmingCharacters(in: .whitespacesAndNewlines))
-        }
-        
-        let relatedTexts = (decoded.RelatedTopics ?? [])
-            .compactMap { $0.Text }
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-            .prefix(3)
-        
-        if !relatedTexts.isEmpty {
-            parts.append(relatedTexts.joined(separator: "\n"))
-        }
-        
-        return parts.joined(separator: "\n\n")
-    }
-
-    private func fetchWikipediaSummary(topic: String) async -> String {
-        let trimmed = topic.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return "" }
-        let escaped = trimmed.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? trimmed
-        guard let url = URL(string: "https://en.wikipedia.org/api/rest_v1/page/summary/\(escaped)") else { return "" }
-
-        do {
-            let (data, _) = try await URLSession.shared.data(from: url)
-            let decoded = try JSONDecoder().decode(WikipediaSummary.self, from: data)
-            return decoded.extract?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        } catch {
-            return ""
-        }
-    }
-
-    private func buildAutonomousContext(ddg: String, wiki: String) -> String {
-        var parts: [String] = []
-        if !ddg.isEmpty {
-            parts.append("DuckDuckGo summary:\n\(ddg)")
-        }
-        if !wiki.isEmpty {
-            parts.append("Wikipedia summary:\n\(wiki)")
-        }
-        return parts.joined(separator: "\n\n")
-    }
-
     @MainActor
     private func handleSpontaneousTrigger(memoryID: UUID) async {
         guard generationTask == nil else { return }
         guard let memory = memoryService.memories.first(where: { $0.id == memoryID }) else { return }
 
         let topic = String(memory.content.prefix(36))
-        let ddg = (try? await fetchDuckDuckGoSummary(query: topic)) ?? ""
-        let wiki = await fetchWikipediaSummary(topic: topic)
-        if !ddg.isEmpty {
-            let snippets = splitSnippets(ddg)
-            memoryService.ingestExternalSnippets(snippets, source: "duckduckgo", query: topic)
-        }
-        if !wiki.isEmpty {
-            let snippets = splitSnippets(wiki)
-            memoryService.ingestExternalSnippets(snippets, source: "wikipedia", query: topic)
-        }
-        let toolContext = buildAutonomousContext(ddg: ddg, wiki: wiki)
+        let toolContext = await actionService.autonomousContext(for: topic)
         let systemPrompt = identityService.systemPrompt + "\n" + toolContext
         let prompt = "I noticed a gap in my knowledge about \(topic). Help me understand it better."
 
@@ -634,7 +338,7 @@ Spontaneous flavor:
             memoryService.applyPredictionFeedback(fromUserText: prompt)
             memoryService.applyReinforcement(fromUserText: prompt)
             emotionService.updateForPrompt(prompt)
-            let toolContext = await aggregateToolContext(for: prompt)
+            let toolContext = await actionService.aggregateRuleBasedContext(for: prompt)
             motivationService.updateForPrompt(prompt)
             let motivationContext = motivationService.contextBlock()
             let identityProfileContext = identityProfileService.contextBlock()
@@ -644,7 +348,7 @@ Spontaneous flavor:
             let dialogContext = buildRecentDialogContext()
             let detailBlock = "\nResponse Detail: \(detail.rawValue)\n"
             let spiceBlock = randomSpiceBlock(for: prompt)
-            let toolGuidance = buildToolGuidanceBlock(hasTools: !toolContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            let toolGuidance = actionService.buildToolGuidanceBlock(hasTools: !toolContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             let systemPrompt = identityService.systemPrompt + identityProfileContext + emotionContext + memoryContext + dialogContext + toolGuidance + toolContext + experienceContext + motivationContext + detailBlock + spiceBlock
             // 2. Generate response
             let assistantMessageId = UUID()
@@ -716,21 +420,28 @@ Spontaneous flavor:
                 var currentFinalText = finalText
                 var currentThinkText = messages[index].thinkContent ?? ""
                 var seenToolCalls = Set<String>()
+                let immediateActionTools: Set<String> = ["calendar", "open_calendar", "open_url", "url"]
 
                 while toolLoopIterations < maxToolIterations {
                     if Task.isCancelled || activeGenerationId != generationId { break }
-                    let toolCall = parseToolCall(from: currentThinkText) ?? parseToolCall(from: currentFinalText)
+                    let toolCall = actionService.parseCall(from: currentThinkText) ?? actionService.parseCall(from: currentFinalText)
                     guard let toolCall else { break }
 
-                    let callKey = "\(toolCall.name)|\(toolCall.query)"
+                    let callKey = toolCall.signature
                     if seenToolCalls.contains(callKey) { break }
                     seenToolCalls.insert(callKey)
 
-                    let toolContextFromCall = await self.toolContext(for: toolCall)
+                    let toolContextFromCall = await self.actionService.context(for: toolCall)
                     if toolContextFromCall.isEmpty { break }
 
+                    // Side-effect actions should return immediately to avoid long re-generation loops.
+                    if immediateActionTools.contains(toolCall.name) {
+                        currentFinalText = extractToolUserMessage(from: toolContextFromCall, fallback: currentFinalText)
+                        break
+                    }
+
                     accumulatedToolContext += "\n" + toolContextFromCall
-                    let rerunGuidance = buildToolGuidanceBlock(hasTools: !accumulatedToolContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    let rerunGuidance = self.actionService.buildToolGuidanceBlock(hasTools: !accumulatedToolContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     let rerunPrompt = identityService.systemPrompt + identityProfileContext + emotionContext + memoryContext + dialogContext + rerunGuidance + accumulatedToolContext + experienceContext + motivationContext + detailBlock + spiceBlock
                     let rerunOutput = await llmService.generateText(userPrompt: prompt, systemPrompt: rerunPrompt)
 
@@ -780,6 +491,30 @@ Spontaneous flavor:
             generationTask = nil
             activeGenerationId = nil
         }
+    }
+
+    private func extractToolUserMessage(from toolContext: String, fallback: String) -> String {
+        let trimmed = toolContext.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return fallback }
+
+        let lines = trimmed.components(separatedBy: .newlines)
+        let filtered = lines.drop(while: { line in
+            let t = line.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return t.hasPrefix("signal action") || t.hasPrefix("signal error") || t.isEmpty
+        })
+
+        let message = filtered.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        if !message.isEmpty { return message }
+        return cleanedToolEnvelope(trimmed) ?? fallback
+    }
+
+    private func cleanedToolEnvelope(_ text: String) -> String? {
+        var value = text
+        if let firstNewline = value.firstIndex(of: "\n") {
+            value = String(value[value.index(after: firstNewline)...])
+        }
+        value = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
     }
 
     private func storeInternalReflection(userPrompt: String, draft: String, detail: DetailLevel) {
@@ -833,95 +568,6 @@ Spontaneous flavor:
         if longEnough { return true }
 
         return false
-    }
-
-    private struct DuckDuckGoResponse: Decodable {
-        let Abstract: String?
-        let AbstractText: String?
-        let RelatedTopics: [RelatedTopic]?
-        
-        struct RelatedTopic: Decodable {
-            let Text: String?
-        }
-    }
-
-    private struct WikipediaSummary: Decodable {
-        let title: String?
-        let extract: String?
-    }
-
-    private struct RedditListing: Decodable {
-        let data: RedditListingData
-
-        struct RedditListingData: Decodable {
-            let children: [RedditChild]
-        }
-
-        struct RedditChild: Decodable {
-            let data: RedditPost
-        }
-
-        struct RedditPost: Decodable {
-            let title: String
-            let url: String?
-            let score: Int?
-            let author: String?
-            let createdUtc: TimeInterval?
-        }
-    }
-
-    private func fetchRedditNews(limit: Int) async throws -> String {
-        let clamped = max(1, min(15, limit))
-        var components = URLComponents(string: "https://www.reddit.com/r/news/.json")!
-        components.queryItems = [
-            URLQueryItem(name: "limit", value: "\(clamped)")
-        ]
-
-        guard let url = components.url else { return "" }
-        var request = URLRequest(url: url)
-        request.setValue("ValisAI/1.0 (iOS)", forHTTPHeaderField: "User-Agent")
-
-        let (data, _) = try await URLSession.shared.data(for: request)
-        let decoded = try JSONDecoder().decode(RedditListing.self, from: data)
-
-        let items = decoded.data.children.map { $0.data }
-        let formatter = RelativeDateTimeFormatter()
-        formatter.unitsStyle = .abbreviated
-
-        let lines: [String] = items.prefix(clamped).map { post in
-            let title = post.title.trimmingCharacters(in: .whitespacesAndNewlines)
-            let score = post.score.map { "▲\($0)" } ?? "▲0"
-            let age: String
-            if let created = post.createdUtc {
-                let date = Date(timeIntervalSince1970: created)
-                age = formatter.localizedString(for: date, relativeTo: Date())
-            } else {
-                age = "unknown time"
-            }
-            let url = post.url ?? ""
-            if url.isEmpty {
-                return "- \(title) (\(score), \(age))"
-            }
-            return "- \(title) (\(score), \(age))\n  \(url)"
-        }
-
-        return lines.joined(separator: "\n")
-    }
-
-    private func splitSnippets(_ text: String) -> [String] {
-        let chunks = text
-            .split(separator: "\n\n")
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-
-        if chunks.count > 1 { return chunks }
-
-        let sentences = text
-            .split(whereSeparator: { $0 == "." || $0 == "!" || $0 == "?" })
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-
-        return sentences
     }
 
     // MARK: - Audio Recording Delegate

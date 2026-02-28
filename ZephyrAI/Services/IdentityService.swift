@@ -12,8 +12,18 @@ class IdentityService: ObservableObject {
     - TOOL: web_search | query=...
     - TOOL: date
     - TOOL: reddit_news
-    Do not answer until results are provided.
-    If a source is unavailable, say so briefly and proceed with best-effort reasoning without inventing sources.
+    For actions:
+    - ACTION: open_url | url=https://...
+    - ACTION: calendar | op=open; date=...
+    - ACTION: calendar | op=create; title=...; start=...; duration_min=...
+    - ACTION: calendar | op=list; days=3; limit=5
+    For visual interactive artifacts in chat:
+    - Output exactly one block in this format when requested:
+      <artifact type="html" title="Optional title">
+      <!doctype html><html>...CSS/JS...</html>
+      </artifact>
+    - Keep artifact self-contained (no external script/CDN links).
+    Never claim "I don't have internet access" by default.soning without inventing sources.
     """
     
     private init() {
@@ -48,8 +58,11 @@ class IdentityService: ObservableObject {
 
     private static func ensureToolInstructions(in prompt: String) -> String {
         let lower = prompt.lowercased()
-        let alreadyHasTool = lower.contains("tool:") && (lower.contains("web_search") || lower.contains("date") || lower.contains("reddit_news"))
-        if alreadyHasTool { return prompt }
+        let alreadyHasTool = (lower.contains("tool:") || lower.contains("action:")) &&
+            (lower.contains("web_search") || lower.contains("date") || lower.contains("reddit_news") || lower.contains("open_url") || lower.contains("calendar"))
+        let hasArtifact = lower.contains("<artifact type=\"html\"") || lower.contains("visual interactive artifacts in chat")
+
+        if alreadyHasTool && hasArtifact { return prompt }
         return prompt.trimmingCharacters(in: .whitespacesAndNewlines) + "\n\n" + toolInstructions
     }
 }

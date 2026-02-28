@@ -501,9 +501,29 @@ struct MessageView: View {
         case code(String, String?) // (content, language)
         case quote(String)
     }
-    
+
+    struct Artifact: Identifiable {
+        let id: String
+        let type: String
+        let title: String?
+        let payload: String
+    }
+
+    private var artifacts: [Artifact] {
+        parseArtifacts(from: message.content)
+    }
+
+    private var renderableContent: String {
+        stripArtifacts(from: message.content)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var hasRenderableText: Bool {
+        !renderableContent.isEmpty
+    }
+
     private var segments: [Segment] {
-        parseSegments(message.content)
+        parseSegments(renderableContent)
     }
     
     private func md(_ s: String) -> some View {
@@ -613,6 +633,63 @@ struct MessageView: View {
         
         return result
     }
+
+    private func parseArtifacts(from text: String) -> [Artifact] {
+        let pattern = "(?is)<artifact\\b([^>]*)>(.*?)</artifact>"
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let nsRange = NSRange(text.startIndex..<text.endIndex, in: text)
+        let matches = regex.matches(in: text, range: nsRange)
+
+        var out: [Artifact] = []
+        for (index, match) in matches.enumerated() {
+            guard let attrsRange = Range(match.range(at: 1), in: text),
+                  let bodyRange = Range(match.range(at: 2), in: text) else { continue }
+            let attrsRaw = String(text[attrsRange])
+            let payloadRaw = String(text[bodyRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if payloadRaw.isEmpty { continue }
+
+            let attrs = parseArtifactAttributes(attrsRaw)
+            let type = (attrs["type"] ?? "html").lowercased()
+            guard type == "html" else { continue }
+
+            let title = attrs["title"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let id = "\(message.id.uuidString)-artifact-\(index)"
+            out.append(Artifact(id: id, type: type, title: title, payload: payloadRaw))
+        }
+        return out
+    }
+
+    private func parseArtifactAttributes(_ raw: String) -> [String: String] {
+        let pattern = #"([A-Za-z0-9_\-]+)\s*=\s*("([^"]*)"|'([^']*)')"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [:] }
+        let nsRange = NSRange(raw.startIndex..<raw.endIndex, in: raw)
+        let matches = regex.matches(in: raw, range: nsRange)
+        var out: [String: String] = [:]
+
+        for match in matches {
+            guard let keyRange = Range(match.range(at: 1), in: raw) else { continue }
+            let key = String(raw[keyRange]).lowercased()
+            var value = ""
+
+            if let quoted = Range(match.range(at: 3), in: raw) {
+                value = String(raw[quoted])
+            } else if let singleQuoted = Range(match.range(at: 4), in: raw) {
+                value = String(raw[singleQuoted])
+            }
+            if !key.isEmpty {
+                out[key] = value
+            }
+        }
+        return out
+    }
+
+    private func stripArtifacts(from text: String) -> String {
+        text.replacingOccurrences(
+            of: "(?is)<artifact\\b[^>]*>.*?</artifact>",
+            with: "",
+            options: .regularExpression
+        )
+    }
     
     private struct CodeBlockView: View {
         let content: String
@@ -672,6 +749,9 @@ struct MessageView: View {
                             QuoteBlockView(content: q)
                         }
                     }
+                    ForEach(artifacts) { artifact in
+                        ArtifactBlockView(artifact: artifact)
+                    }
                 }
                     .padding()
                     .foregroundColor(.primary)
@@ -723,7 +803,7 @@ struct MessageView: View {
                             )
                             .padding(.bottom, 4)
                         }
-                        if !message.content.isEmpty {
+                        if hasRenderableText || !artifacts.isEmpty {
                             VStack(alignment: .leading, spacing: 8) {
                                 ForEach(Array(segments.enumerated()), id: \.offset) { _, seg in
                                 switch seg {
@@ -738,6 +818,9 @@ struct MessageView: View {
                                     case .quote(let q):
                                         QuoteBlockView(content: q)
                                     }
+                                }
+                                ForEach(artifacts) { artifact in
+                                    ArtifactBlockView(artifact: artifact)
                                 }
                             }
                                 .padding()
@@ -789,6 +872,114 @@ struct MessageView: View {
         }
     }
     
+}
+
+private struct ArtifactBlockView: View {
+    let artifact: MessageView.Artifact
+    @State private var showCode: Bool = false
+    @State private var showFullscreen: Bool = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Text(artifact.title?.isEmpty == false ? artifact.title! : "Artifact")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Spacer()
+                Button {
+                    showCode.toggle()
+                } label: {
+                    Image(systemName: showCode ? "play.rectangle" : "chevron.left.forwardslash.chevron.right")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.secondary)
+                }
+
+                Button {
+                    showFullscreen = true
+                } label: {
+                    Image(systemName: "arrow.up.left.and.arrow.down.right")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Group {
+                if showCode {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        Text(artifact.payload)
+                            .font(.system(.body, design: .monospaced))
+                            .textSelection(.enabled)
+                    }
+                    .padding(10)
+                    .background(Color(UIColor.secondarySystemBackground))
+                } else {
+                    ArtifactView(html: artifact.payload)
+                        .frame(minHeight: 180, maxHeight: 320)
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(Color(UIColor.quaternaryLabel), lineWidth: 0.7)
+            )
+        }
+        .fullScreenCover(isPresented: $showFullscreen) {
+            ArtifactFullscreenView(artifact: artifact)
+        }
+    }
+}
+
+private struct ArtifactFullscreenView: View {
+    let artifact: MessageView.Artifact
+    @Environment(\.dismiss) private var dismiss
+    @State private var showCode: Bool = false
+
+    var body: some View {
+        Group {
+            if showCode {
+                ScrollView([.vertical, .horizontal], showsIndicators: true) {
+                    Text(artifact.payload)
+                        .font(.system(.body, design: .monospaced))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                        .padding(16)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color(UIColor.systemBackground))
+            } else {
+                ArtifactView(html: artifact.payload)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .ignoresSafeArea()
+        .safeAreaInset(edge: .top) {
+            HStack {
+                Spacer()
+                HStack(spacing: 12) {
+                    Button {
+                        showCode.toggle()
+                    } label: {
+                        Image(systemName: showCode ? "play.rectangle" : "chevron.left.forwardslash.chevron.right")
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Button {
+                        dismiss()
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 9)
+                .background(.ultraThinMaterial, in: Capsule())
+            }
+            .padding(.horizontal, 10)
+            .padding(.top, 4)
+        }
+    }
 }
 
 #Preview {

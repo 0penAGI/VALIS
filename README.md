@@ -7,8 +7,10 @@ VALIS is an on-device AI chat app for iOS built with SwiftUI and `llama.cpp` (GG
 ## Features
 
 - **On-device inference**: Runs locally using GGUF models via `llama.cpp`.
+- **Model switching in Settings**: Runtime selection between bundled/downloadable profiles (`LFM 2.5 1.2B` and `Qwen 3 1.7B`) with hot reload.
 - **Plastic Brain**: Memories have emotion tags, importance, embeddings, associative links, and activation/decay.
 - **Thinking UI**: Streams model output and parses `<think>...</think>` to show a separate thinking panel.
+- **Inline Artifacts**: Assistant can return `<artifact type="html">...</artifact>` blocks that render live in chat bubbles via `WKWebView`.
 - **Tools (optional network)**:
   - Rule-based tool injection (Date, DuckDuckGo summaries, Reddit /r/news feed).
   - Model-initiated tools via `TOOL:` lines (app executes tools and re-runs generation with results).
@@ -33,8 +35,14 @@ SwiftUI + MVVM with a small service layer:
 - `ChatViewModel` is the orchestration layer:
   - builds system prompt blocks (identity + identity profile + affect + tools + experience lessons + motivators + detail level + optional “spice”),
   - streams generation and parses `<think>` tags,
-  - executes tool calls and re-runs generation with results (bounded multi-step tool loop),
+  - delegates tool/action parsing and execution to `ActionService` and re-runs generation with results (bounded multi-step loop),
   - records experiences and updates memory.
+
+- `ActionService` handles external actions/signals:
+  - rule-based tool context injection (Date / Web / News),
+  - model-initiated `TOOL:`/`ACTION:` parsing,
+  - action execution (`open_url`, `calendar` open/create/list),
+  - autonomous web/wiki enrichment used by spontaneous memory triggers.
 
 - `LLMService` wraps `LlamaRuntime` and handles:
   - model loading,
@@ -58,14 +66,14 @@ flowchart LR
   CVM --> ID["IdentityService"]
   CVM --> IDP["IdentityProfileService"]
   CVM --> AFF["EmotionService"]
-  CVM --> TOOLS["Tools (Date / DuckDuckGo / Reddit)"]
+  CVM --> ACT["ActionService (Tools + Actions)"]
   CVM --> EXP["ExperienceService"]
   CVM --> MOT["MotivationService"]
   CVM --> MEM["MemoryService"]
   ID --> SYS["System Prompt"]
   IDP --> SYS
   AFF --> SYS
-  TOOLS --> SYS
+  ACT --> SYS
   EXP --> SYS
   MOT --> SYS
   MEM --> SYS
@@ -88,6 +96,11 @@ The model can request tools inside `<think>` like:
 - `TOOL: date`
 - `TOOL: web_search | query=...`
 - `TOOL: reddit_news`
+- `ACTION: open_url | url=https://...`
+- `ACTION: calendar | op=open; date=2026-03-01T10:00:00Z`
+- `ACTION: calendar | op=create; title=Meeting; start=2026-03-01 18:30; duration_min=45`
+- `ACTION: calendar | op=list; days=3; limit=5`
+- `ARTIFACT: <artifact type="html" title="Demo">...</artifact>` (inside assistant answer)
 
 The parser is tolerant to variants like `TOOL: news`, `TOOL: reddit news`, and `TOOL: reddit_news(...)`.
 
@@ -105,17 +118,18 @@ The app executes the tool, injects results (or a tool error block), and re-runs 
 
 This repo currently includes these bundled models under `ZephyrAI/Resources/Models/`:
 
-- `LFM2.5-1.2B-Thinking-Q8_0.gguf` (default in `ZephyrAI/Services/LLMService.swift`)
-- `Qwen3-1.7B-Q4_K_M.gguf`
+- `Qwen3-1.7B-Q4_K_M.gguf` (default profile from `LLMModelStorage.defaultValue`)
+- `LFM2.5-1.2B-Thinking-Q8_0.gguf`
 
-To switch the default model, change `modelFilename` in `ZephyrAI/Services/LLMService.swift`.
+Model selection is stored in `UserDefaults` (`llm.selectedModel`) and can be changed in Settings.
+To change app default for first launch, update `defaultValue` in `ZephyrAI/Models/LLMModel.swift`.
 
 ## Quick Start
 
 1. Ensure `Frameworks/llama.xcframework` exists.
 2. Choose model strategy:
-   - Bundle a model in `ZephyrAI/Resources/Models/`, or
-   - Enable first-run download in `ZephyrAI/Services/LLMService.swift` by setting `modelDownloadURLString`.
+   - Bundle one/both models in `ZephyrAI/Resources/Models/`, or
+   - Rely on first-run download URLs defined in `ZephyrAI/Models/LLMModel.swift`.
 3. Build and run `ZephyrAI.xcodeproj` on device.
 
 ## Model Download
@@ -128,9 +142,10 @@ To switch the default model, change `modelFilename` in `ZephyrAI/Services/LLMSer
 
 If the model is missing and `modelDownloadURLString` is set, the app downloads the model and shows download progress via the UI status.
 
-The current download URL in code points to the Hugging Face GGUF release for:
+Current model download URLs in code point to:
 
 - `unsloth/LFM2.5-1.2B-Thinking-GGUF` (`LFM2.5-1.2B-Thinking-Q8_0.gguf`)
+- `unsloth/Qwen3-1.7B-GGUF` (`Qwen3-1.7B-Q4_K_M.gguf`)
 
 ## Troubleshooting
 
