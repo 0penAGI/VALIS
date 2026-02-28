@@ -92,6 +92,8 @@ These may exist locally for reference/experimentation. In this repo they are typ
 ### Resources (`ZephyrAI/Resources/`)
 
 - `ZephyrAI/Resources/Models/`: Bundled GGUF models (optional; app can also download to Application Support).
+  - `LFM2.5-1.2B-Thinking-Q8_0.gguf` (default)
+  - `Qwen3-1.7B-Q4_K_M.gguf`
 - `ZephyrAI/Resources/glassDistortion.metal`: Stitchable Metal shader for the “liquid glass” backdrop in Settings/Memories.
 - `ZephyrAI/Assets.xcassets/`: App icons/colors.
 
@@ -109,4 +111,3 @@ These may exist locally for reference/experimentation. In this repo they are typ
 ### Model Storage / Download
 
 If no model is found in the bundle, Documents, or Application Support, `LLMService` can download a model from a configured URL and store it in `Application Support/VALIS/` for future launches.
-

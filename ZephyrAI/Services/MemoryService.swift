@@ -144,6 +144,7 @@ class MemoryService: ObservableObject {
     private let compressedBudget: Int
     private let rawBudget: Int
     private let contextGateThreshold: Double = 0.28
+    private let noveltyWindowSize: Int = 6
     private let accessSaveCooldown: TimeInterval = 30
     private let timeWeightTau: TimeInterval = 60 * 60 * 24 * 3
     private var lastAccessSaveAt: Date?
@@ -277,6 +278,7 @@ class MemoryService: ObservableObject {
         saveMemories()
         updateGraph(for: enriched)
         echoGraph.activate(memoryId: enriched.id, embedding: enriched.embedding, importance: enriched.importance, isPersistent: enriched.isIdentity)
+        applyIdentityRestorationIfNeeded(from: enriched)
         saveGraph()
         saveEchoGraph()
     }
@@ -287,6 +289,7 @@ class MemoryService: ObservableObject {
         saveMemories()
         updateGraph(for: enriched)
         echoGraph.activate(memoryId: enriched.id, embedding: enriched.embedding, importance: enriched.importance, strength: 0.6, isPersistent: enriched.isIdentity)
+        applyIdentityRestorationIfNeeded(from: enriched)
         saveGraph()
         saveEchoGraph()
     }
@@ -303,6 +306,7 @@ class MemoryService: ObservableObject {
             strength: 0.35,
             isPersistent: enriched.isIdentity
         )
+        applyIdentityRestorationIfNeeded(from: enriched)
         saveGraph()
         saveEchoGraph()
     }
@@ -420,7 +424,8 @@ class MemoryService: ObservableObject {
         let m = memories[lastIndex]
         let userEmbedding = generateEmbedding(from: text)
         let score = cosineSimilarity(a: m.embedding, b: userEmbedding)
-        let error = max(0.0, 1.0 - score)
+        let instantaneousError = max(0.0, 1.0 - score)
+        let accumulatedError = min(2.5, (m.predictionError * 0.88) + instantaneousError)
         let adjustedImportance = max(0.1, min(2.5, m.importance + (score - 0.5) * 0.1))
 
         memories[lastIndex] = Memory(
@@ -434,7 +439,7 @@ class MemoryService: ObservableObject {
             links: m.links,
             importance: adjustedImportance,
             predictionScore: score,
-            predictionError: error,
+            predictionError: accumulatedError,
             isIdentity: m.isIdentity,
             isPinned: m.isPinned,
             lastAccess: m.lastAccess,
@@ -732,7 +737,8 @@ class MemoryService: ObservableObject {
         let fieldLine = formatFieldVector(field, targetCount: 10)
 
         let activationLevel = echoGraph.averageActivation(excludingPersistent: true)
-        let includeText = activationLevel >= contextGateThreshold
+        let dynamicThreshold = dynamicContextGateThreshold()
+        let includeText = activationLevel >= dynamicThreshold
 
         let recent = memories.sorted { $0.timestamp > $1.timestamp }
         let affectSample = Array(recent.prefix(8))
@@ -768,7 +774,7 @@ class MemoryService: ObservableObject {
         if !fieldLine.isEmpty {
             parts.append("F: \(fieldLine)")
         }
-        parts.append("A: mean=\(fmt(meanActivation))")
+        parts.append("A: mean=\(fmt(meanActivation)), gate=\(fmt(dynamicThreshold))")
         parts.append("E: v=\(fmt(avgValence)), i=\(fmt(avgIntensity))")
 
         if !nodeLines.isEmpty {
@@ -940,7 +946,8 @@ class MemoryService: ObservableObject {
     private func relevanceScore(for memory: Memory, field: [Double], now: Date) -> Double {
         let activation = echoGraph.activation(for: memory.id)
         let timeWeight = timeWeight(for: memory, now: now)
-        var score = memory.importance * activation * timeWeight
+        let surpriseBoost = surpriseRetention(for: memory) * 0.35
+        var score = (memory.importance + surpriseBoost) * activation * timeWeight
         if memory.isPinned {
             score *= 1.2
         }
@@ -1186,6 +1193,7 @@ class MemoryService: ObservableObject {
 
             if memory.importance >= 1.4 { return true }
             if activation >= 0.9 { return true }
+            if memory.predictionError >= 1.15 { return true }
             if age < maxAge && memory.importance >= importanceFloor && activation >= activationFloor {
                 return true
             }
@@ -1198,6 +1206,9 @@ class MemoryService: ObservableObject {
             if age < maxAge {
                 pruneProbability *= 0.5
             }
+            let surprise = surpriseRetention(for: memory)
+            pruneProbability *= (1.0 - (0.6 * surprise))
+            pruneProbability = max(0.0, min(1.0, pruneProbability))
 
             let roll = Double.random(in: 0...1)
             return roll >= pruneProbability
@@ -1256,8 +1267,56 @@ class MemoryService: ObservableObject {
             strength: 0.4,
             isPersistent: enriched.isIdentity
         )
+        applyIdentityRestorationIfNeeded(from: enriched)
         saveGraph()
         saveEchoGraph()
+    }
+
+    private func surpriseRetention(for memory: Memory) -> Double {
+        max(0.0, min(1.0, memory.predictionError / 1.6))
+    }
+
+    private func dynamicContextGateThreshold() -> Double {
+        let novelty = recentNoveltySignal(window: noveltyWindowSize)
+        let routineBoost = (1.0 - novelty) * 0.08
+        let noveltyDrop = novelty * 0.12
+        return max(0.12, min(0.42, contextGateThreshold + routineBoost - noveltyDrop))
+    }
+
+    private func recentNoveltySignal(window: Int) -> Double {
+        let recent = memories
+            .sorted { $0.timestamp > $1.timestamp }
+            .filter { !$0.embedding.isEmpty }
+        let recentEmbeddings = Array(recent.prefix(max(1, window))).map { $0.embedding }
+        guard !recentEmbeddings.isEmpty else { return 0.5 }
+
+        let historyEmbeddings = Array(recent.dropFirst(recentEmbeddings.count).prefix(64)).map { $0.embedding }
+        guard !historyEmbeddings.isEmpty else { return 0.85 }
+
+        let overlap = recentEmbeddings.map { recentEmbedding in
+            historyEmbeddings
+                .filter { $0.count == recentEmbedding.count }
+                .map { cosineSimilarity(a: recentEmbedding, b: $0) }
+                .max() ?? 0.0
+        }
+        guard !overlap.isEmpty else { return 0.7 }
+
+        let meanOverlap = overlap.reduce(0.0, +) / Double(overlap.count)
+        return max(0.0, min(1.0, 1.0 - meanOverlap))
+    }
+
+    private func applyIdentityRestorationIfNeeded(from memory: Memory) {
+        guard isIdentityAdjacent(memory.content), !memory.embedding.isEmpty else { return }
+        echoGraph.reinforcePersistentNeighbors(embedding: memory.embedding, strength: 0.2)
+    }
+
+    private func isIdentityAdjacent(_ text: String) -> Bool {
+        let lower = text.lowercased()
+        let markers = [
+            "i am", "i'm", "myself", "my values", "my identity", "who i am",
+            "self", "identity", "я ", "моя личность", "кто я", "мои ценности"
+        ]
+        return markers.contains { lower.contains($0) }
     }
 }
 
@@ -1493,10 +1552,14 @@ struct CognitiveNodeSnapshot {
 final class CognitiveEchoGraph {
     private var nodes: [UUID: CognitiveNode] = [:]
     private var edges: [CognitiveEdge] = []
+    private var persistentReinforcement: [UUID: Double] = [:]
     private var resonanceLastTrigger: [UUID: TimeInterval] = [:]
     private let resonanceCooldown: TimeInterval = 120
     private let couplingK: Double = 0.12
     private let resonanceBoost: Double = 0.15
+    private let standardDecayRate: Double = 0.1
+    private let persistentDecayRate: Double = 0.015
+    private let persistentActivationFloor: Double = 0.08
 
     var isEmpty: Bool {
         nodes.isEmpty
@@ -1577,12 +1640,32 @@ final class CognitiveEchoGraph {
     
     func decay(now: TimeInterval = Date().timeIntervalSince1970) {
         for (id, var node) in nodes {
-            if node.isPersistent { continue }
             let dt = now - node.lastUpdate
-            let factor = exp(-dt * 0.1)
-            node.activation *= factor
+            let decayRate = node.isPersistent ? persistentDecayRate : standardDecayRate
+            let factor = exp(-dt * decayRate)
+            let decayed = node.activation * factor
+            node.activation = node.isPersistent ? max(persistentActivationFloor, decayed) : decayed
             node.lastUpdate = now
             nodes[id] = node
+        }
+    }
+
+    func reinforcePersistentNeighbors(embedding: [Double], strength: Double = 0.2) {
+        guard !embedding.isEmpty else { return }
+
+        for (id, var node) in nodes where node.isPersistent && node.embedding.count == embedding.count {
+            let similarity = cosine(node.embedding, embedding)
+            guard similarity > 0.55 else { continue }
+
+            let increment = similarity * max(0.05, strength)
+            persistentReinforcement[id, default: 0.0] += increment
+            if persistentReinforcement[id, default: 0.0] >= 1.0 {
+                node.activation = min(2.0, node.activation + (0.2 + similarity * 0.25))
+                node.importance = min(2.5, node.importance + 0.05)
+                node.lastUpdate = Date().timeIntervalSince1970
+                nodes[id] = node
+                persistentReinforcement[id] = (persistentReinforcement[id] ?? 0.0) * 0.35
+            }
         }
     }
     

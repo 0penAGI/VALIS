@@ -3,6 +3,7 @@ import SwiftUI
 import AVFoundation
 import Speech
 import Combine
+import UIKit
 
 @MainActor
 class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
@@ -19,6 +20,9 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
     private var cancellables = Set<AnyCancellable>()
     private var lastSpontaneousAt: Date?
     private let spontaneousCooldown: TimeInterval = 600
+    private let siriPendingPromptKey = "siri.pendingPrompt"
+    private let siriPendingPromptTimestampKey = "siri.pendingPromptTimestamp"
+    private let siriPromptMaxAge: TimeInterval = 180
     
     private let llmService = LLMService()
     private let memoryService = MemoryService.shared
@@ -34,6 +38,7 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
         super.init()
         setup()
         observeMemoryTriggers()
+        observeSiriPromptQueue()
     }
     
     func setup() {
@@ -79,6 +84,52 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
                 Task { await self.handleSpontaneousTrigger(memoryID: id) }
             }
             .store(in: &cancellables)
+    }
+
+    private func observeSiriPromptQueue() {
+        NotificationCenter.default
+            .publisher(for: .valisSiriPromptQueued)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.consumePendingSiriPromptIfNeeded()
+            }
+            .store(in: &cancellables)
+
+        NotificationCenter.default
+            .publisher(for: UIApplication.didBecomeActiveNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.consumePendingSiriPromptIfNeeded()
+            }
+            .store(in: &cancellables)
+    }
+
+    private func consumePendingSiriPromptIfNeeded() {
+        guard !isInteracting else { return }
+
+        let defaults = UserDefaults.standard
+        guard let raw = defaults.string(forKey: siriPendingPromptKey) else { return }
+        let prompt = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prompt.isEmpty else {
+            defaults.removeObject(forKey: siriPendingPromptKey)
+            defaults.removeObject(forKey: siriPendingPromptTimestampKey)
+            return
+        }
+
+        let createdAt = defaults.double(forKey: siriPendingPromptTimestampKey)
+        if createdAt > 0 {
+            let age = Date().timeIntervalSince1970 - createdAt
+            if age > siriPromptMaxAge {
+                defaults.removeObject(forKey: siriPendingPromptKey)
+                defaults.removeObject(forKey: siriPendingPromptTimestampKey)
+                return
+            }
+        }
+
+        defaults.removeObject(forKey: siriPendingPromptKey)
+        defaults.removeObject(forKey: siriPendingPromptTimestampKey)
+        inputText = prompt
+        sendMessage()
     }
 
     private func normalizeStreamChunk(_ chunk: String) -> String {
@@ -1089,4 +1140,8 @@ private func splitThinkIntoFinal(_ think: String) -> (think: String, final: Stri
 
 
     return ("", trimmed)
+}
+
+extension Notification.Name {
+    static let valisSiriPromptQueued = Notification.Name("valis.siriPromptQueued")
 }

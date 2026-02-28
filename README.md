@@ -17,6 +17,7 @@ VALIS is an on-device AI chat app for iOS built with SwiftUI and `llama.cpp` (GG
 - **Motivators**: Maintains a small dynamic state (curiosity/helpfulness/caution) used to guide tone.
 - **Affect state (self-access)**: `EmotionService` keeps a slow-changing internal affect state injected into the system prompt (meant to be mentioned sparingly, only when relevant).
 - **Speech**: Speech-to-text for input and TTS for reading assistant messages.
+- **Siri Shortcut**: You can say “Ask VALIS …” and the prompt is sent directly into chat.
 - **UI / Glass**:
   - Translucent Settings sheet (chat visible underneath).
   - Settings and Memories use a lightweight “liquid glass” distortion shader backdrop.
@@ -45,6 +46,9 @@ SwiftUI + MVVM with a small service layer:
 - `MemoryService` is the “plastic brain”:
   - stores `Memory` objects (emotion, embeddings, importance, prediction signals),
   - maintains `MemoryGraph` + `CognitiveEchoGraph`,
+  - keeps an accumulated prediction-error signal so surprising/corrected memories decay and prune more slowly,
+  - uses a novelty-adaptive context gate (opens on novel turns, narrows on routine turns),
+  - applies slow identity-node decay with restoration-by-repetition (persistent, not frozen),
   - runs echo/spontaneous loops,
   - produces the `getContextBlock()` injected into the LLM prompt.
 
@@ -97,6 +101,15 @@ The app executes the tool, injects results (or a tool error block), and re-runs 
   - bundled in the app (`ZephyrAI/Resources/Models/`), or
   - downloaded on first launch (see “Model Download” below).
 
+## Local Models (GGUF)
+
+This repo currently includes these bundled models under `ZephyrAI/Resources/Models/`:
+
+- `LFM2.5-1.2B-Thinking-Q8_0.gguf` (default in `ZephyrAI/Services/LLMService.swift`)
+- `Qwen3-1.7B-Q4_K_M.gguf`
+
+To switch the default model, change `modelFilename` in `ZephyrAI/Services/LLMService.swift`.
+
 ## Quick Start
 
 1. Ensure `Frameworks/llama.xcframework` exists.
@@ -114,6 +127,10 @@ The app executes the tool, injects results (or a tool error block), and re-runs 
 3. `Documents/` (manual drop-in)
 
 If the model is missing and `modelDownloadURLString` is set, the app downloads the model and shows download progress via the UI status.
+
+The current download URL in code points to the Hugging Face GGUF release for:
+
+- `unsloth/LFM2.5-1.2B-Thinking-GGUF` (`LFM2.5-1.2B-Thinking-Q8_0.gguf`)
 
 ## Troubleshooting
 
