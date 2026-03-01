@@ -31,19 +31,24 @@ struct ChatView: View {
                     }
                     .padding()
                     .padding(.top, 56)
-                    .padding(.bottom, 88)
                 }
                 .scrollDismissesKeyboard(.interactively)
-                .onChange(of: viewModel.messages.last?.content) { oldValue, newValue in
-                    if let lastId = viewModel.messages.last?.id {
-                        withAnimation {
-                            proxy.scrollTo(lastId, anchor: .bottom)
-                        }
+                .onChange(of: viewModel.messages.last?.content) { _, _ in
+                    guard let lastId = viewModel.messages.last?.id else { return }
+                    DispatchQueue.main.async {
+                        proxy.scrollTo(lastId, anchor: .bottom)
                     }
                 }
-                .onChange(of: viewModel.currentThink) { oldValue, newValue in
-                    if let lastId = viewModel.messages.last?.id {
-                        withAnimation {
+                .onChange(of: viewModel.currentThink) { _, _ in
+                    guard let lastId = viewModel.messages.last?.id else { return }
+                    DispatchQueue.main.async {
+                        proxy.scrollTo(lastId, anchor: .bottom)
+                    }
+                }
+                .onChange(of: isInputFocused) { _, focused in
+                    guard focused, let lastId = viewModel.messages.last?.id else { return }
+                    DispatchQueue.main.async {
+                        withAnimation(.easeOut(duration: 0.2)) {
                             proxy.scrollTo(lastId, anchor: .bottom)
                         }
                     }
@@ -62,13 +67,6 @@ struct ChatView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                 .offset(y: -18)
                 .ignoresSafeArea(edges: .top)
-                .allowsHitTesting(false)
-
-            SoftBarBlurBackground(position: .bottom)
-                .frame(height: 220)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-                .offset(y: 64)
-                .ignoresSafeArea(edges: .bottom)
                 .allowsHitTesting(false)
 
             VStack(spacing: 0) {
@@ -115,122 +113,125 @@ struct ChatView: View {
                 .frame(height: 44)
                 .padding(.horizontal)
                 .background(Color.clear)
-
-                Spacer()
-
-                // Input Area
-                VStack(spacing: 0) {
-                    HStack(alignment: .bottom) {
-                        TextField("Type a message...", text: $viewModel.inputText, axis: .vertical)
-                            .focused($isInputFocused)
-                            .textFieldStyle(.plain)
-                            .lineLimit(1...5)
-                            .disabled(viewModel.isInteracting || isRecording)
-                        
-                        if viewModel.inputText.isEmpty && !viewModel.isInteracting {
-                            Button(action: {
-                                if isRecording {
-                                    stopRecording()
-                                } else {
-                                    startRecording()
-                                }
-                            }) {
-                                ZStack {
-                                    Circle()
-                                        .stroke(Color.primary.opacity(0.6), lineWidth: 1)
-                                        .frame(width: 34, height: 34)
-                                        .scaleEffect(isRecording ? 1.0 : 0.95)
-                                        .opacity(isRecording ? 0.0 : 1.0)
-                                        .animation(.easeInOut(duration: 1.5).repeatForever(autoreverses: true), value: isRecording)
-
-                                    Image(systemName: "waveform")
-                                        .font(.system(size: 16, weight: .medium))
-                                        .foregroundColor(.primary)
-                                        .scaleEffect(isRecording ? (0.6 + audioLevel * 1.4) : 1.0)
-                                        .opacity(
-                                            isRecording
-                                            ? (0.4 + audioLevel * 0.8)
-                                            : (sin(Date().timeIntervalSince1970 * 0.8) > 0 ? 0.7 : 0.0)
-                                        )
-                                        .animation(.easeInOut(duration: 0.2), value: audioLevel)
-                                        .animation(.easeInOut(duration: 1.5), value: isRecording)
-                                }
-                                .frame(width: 34, height: 34)
-                            }
-                        } else {
-                            Button(action: {
-                                if viewModel.isInteracting {
-                                    viewModel.stopGeneration()
-                                } else {
-                                    viewModel.sendMessage()
-                                }
-                            }) {
-                                ZStack {
-                                    // Animated ring / background (size grows on active)
-                                    let isActive = viewModel.isInteracting || !viewModel.inputText.isEmpty
-                                    Circle()
-                                        .fill(
-                                            isActive
-                                            ? Color.primary.opacity(viewModel.isInteracting ? 0.15 : 0.08)
-                                            : Color.clear
-                                        )
-                                        .overlay(
-                                            Circle()
-                                                .stroke(
-                                                    Color.primary,
-                                                    lineWidth: isActive ? 0 : 1.1
-                                                )
-                                        )
-                                        .frame(
-                                            width: isActive ? 34 : 27,
-                                            height: isActive ? 34 : 27
-                                        )
-                                        .rotationEffect(.degrees(viewModel.isInteracting ? 360 : 0))
-                                        .animation(
-                                            .spring(response: 0.25, dampingFraction: 0.75),
-                                            value: isActive
-                                        )
-                                        .animation(
-                                            viewModel.isInteracting
-                                            ? .linear(duration: 1).repeatForever(autoreverses: false)
-                                            : .easeOut(duration: 0.25),
-                                            value: viewModel.isInteracting
-                                        )
-
-                                    // Icon background
-                                    if viewModel.isInteracting || !viewModel.inputText.isEmpty {
-                                        Circle()
-                                            .fill(Color.primary)
-                                            .frame(width: 22, height: 22)
-                                            .transition(.scale.combined(with: .opacity))
-                                    }
-
-                                    // Icon
-                                    if viewModel.isInteracting {
-                                        Image(systemName: "stop.fill")
-                                            .font(.system(size: 11, weight: .bold))
-                                            .foregroundColor(Color(UIColor.systemBackground))
-                                            .transition(.scale.combined(with: .opacity))
-                                    } else if !viewModel.inputText.isEmpty {
-                                        Image(systemName: "arrow.up")
-                                            .font(.system(size: 10, weight: .bold))
-                                            .foregroundColor(Color(UIColor.systemBackground))
-                                            .transition(.scale.combined(with: .opacity))
-                                    }
-                                }
-                                .frame(width: 34, height: 34)
-                                .animation(.spring(response: 0.3, dampingFraction: 0.7), value: viewModel.isInteracting)
-                                .animation(.spring(response: 0.3, dampingFraction: 0.7), value: viewModel.inputText)
-                            }
-                            .disabled(!viewModel.isInteracting && viewModel.inputText.isEmpty)
-                        }
-                    }
-                    .padding()
-                    .background(Color.clear)
-                }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
+        .safeAreaInset(edge: .bottom) {
+            VStack(spacing: 0) {
+                HStack(alignment: .bottom) {
+                    TextField("Type a message...", text: $viewModel.inputText, axis: .vertical)
+                        .focused($isInputFocused)
+                        .textFieldStyle(.plain)
+                        .lineLimit(1...5)
+                        .disabled(viewModel.isInteracting || isRecording)
+
+                    if viewModel.inputText.isEmpty && !viewModel.isInteracting {
+                        Button(action: {
+                            if isRecording {
+                                stopRecording()
+                            } else {
+                                startRecording()
+                            }
+                        }) {
+                            ZStack {
+                                Circle()
+                                    .stroke(Color.primary.opacity(0.6), lineWidth: 1)
+                                    .frame(width: 34, height: 34)
+                                    .scaleEffect(isRecording ? 1.0 : 0.95)
+                                    .opacity(isRecording ? 0.0 : 1.0)
+                                    .animation(.easeInOut(duration: 1.5).repeatForever(autoreverses: true), value: isRecording)
+
+                                Image(systemName: "waveform")
+                                    .font(.system(size: 16, weight: .medium))
+                                    .foregroundColor(.primary)
+                                    .scaleEffect(isRecording ? (0.6 + audioLevel * 1.4) : 1.0)
+                                    .opacity(
+                                        isRecording
+                                        ? (0.4 + audioLevel * 0.8)
+                                        : (sin(Date().timeIntervalSince1970 * 0.8) > 0 ? 0.7 : 0.0)
+                                    )
+                                    .animation(.easeInOut(duration: 0.2), value: audioLevel)
+                                    .animation(.easeInOut(duration: 1.5), value: isRecording)
+                            }
+                            .frame(width: 34, height: 34)
+                        }
+                    } else {
+                        Button(action: {
+                            if viewModel.isInteracting {
+                                viewModel.stopGeneration()
+                            } else {
+                                viewModel.sendMessage()
+                            }
+                        }) {
+                            ZStack {
+                                let isActive = viewModel.isInteracting || !viewModel.inputText.isEmpty
+                                Circle()
+                                    .fill(
+                                        isActive
+                                        ? Color.primary.opacity(viewModel.isInteracting ? 0.15 : 0.08)
+                                        : Color.clear
+                                    )
+                                    .overlay(
+                                        Circle()
+                                            .stroke(
+                                                Color.primary,
+                                                lineWidth: isActive ? 0 : 1.1
+                                            )
+                                    )
+                                    .frame(
+                                        width: isActive ? 34 : 27,
+                                        height: isActive ? 34 : 27
+                                    )
+                                    .rotationEffect(.degrees(viewModel.isInteracting ? 360 : 0))
+                                    .animation(
+                                        .spring(response: 0.25, dampingFraction: 0.75),
+                                        value: isActive
+                                    )
+                                    .animation(
+                                        viewModel.isInteracting
+                                        ? .linear(duration: 1).repeatForever(autoreverses: false)
+                                        : .easeOut(duration: 0.25),
+                                        value: viewModel.isInteracting
+                                    )
+
+                                if viewModel.isInteracting || !viewModel.inputText.isEmpty {
+                                    Circle()
+                                        .fill(Color.primary)
+                                        .frame(width: 22, height: 22)
+                                        .transition(.scale.combined(with: .opacity))
+                                }
+
+                                if viewModel.isInteracting {
+                                    Image(systemName: "stop.fill")
+                                        .font(.system(size: 11, weight: .bold))
+                                        .foregroundColor(Color(UIColor.systemBackground))
+                                        .transition(.scale.combined(with: .opacity))
+                                } else if !viewModel.inputText.isEmpty {
+                                    Image(systemName: "arrow.up")
+                                        .font(.system(size: 10, weight: .bold))
+                                        .foregroundColor(Color(UIColor.systemBackground))
+                                        .transition(.scale.combined(with: .opacity))
+                                }
+                            }
+                            .frame(width: 34, height: 34)
+                            .animation(.spring(response: 0.3, dampingFraction: 0.7), value: viewModel.isInteracting)
+                            .animation(.spring(response: 0.3, dampingFraction: 0.7), value: viewModel.inputText)
+                        }
+                        .disabled(!viewModel.isInteracting && viewModel.inputText.isEmpty)
+                    }
+                }
+                .padding()
+                .background(Color.clear)
+            }
+            .background(alignment: .bottom) {
+                SoftBarBlurBackground(position: .bottom)
+                    .frame(height: 153)
+                    .offset(y: 42)
+                    .ignoresSafeArea(edges: .bottom)
+                    .allowsHitTesting(false)
+            }
+        }
+        // .ignoresSafeArea(.keyboard, edges: .bottom)
         .onChange(of: viewModel.isInteracting) { _, newValue in
             if newValue {
                 isInputFocused = false
@@ -361,6 +362,7 @@ struct ChatView: View {
             }
         }
     }
+
 }
 
 struct ThinkingPanel: View {

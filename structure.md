@@ -82,6 +82,9 @@ These may exist locally for reference/experimentation. In this repo they are typ
 - `MemoryService.swift`: “Plastic Brain” memory system.
   - Stores/persists `Memory` objects (emotion, importance, embeddings, associative links, activation/decay).
   - Maintains a graph (`MemoryGraph`) and echo/trigger logic (`CognitiveEchoGraph`).
+  - Uses temporal U-shape weighting for context relevance (recently revisited + deep older memory revival).
+  - Uses power-law echo activation decay (sharp early drop, long-tail plateau).
+  - Applies associative-link immunity multiplier for highly connected nodes (>3 links) during decay.
   - Provides pruning, activation/decay, and a context block generator.
 - `ActionService.swift`: Tool/action runtime.
   - Parses model-initiated `TOOL:` / `ACTION:` lines.

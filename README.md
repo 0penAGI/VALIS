@@ -9,6 +9,9 @@ VALIS is an on-device AI chat app for iOS built with SwiftUI and `llama.cpp` (GG
 - **On-device inference**: Runs locally using GGUF models via `llama.cpp`.
 - **Model switching in Settings**: Runtime selection between bundled/downloadable profiles (`LFM 2.5 1.2B` and `Qwen 3 1.7B`) with hot reload.
 - **Plastic Brain**: Memories have emotion tags, importance, embeddings, associative links, and activation/decay.
+  - Context ranking now uses a temporal U-shape signal (recently revisited memories and deep older memories are both prioritized).
+  - Echo activation decay now uses power-law behavior (fast initial drop, long tail plateau).
+  - Nodes with strong associative connectivity (>3 links) get a decay immunity multiplier.
 - **Thinking UI**: Streams model output and parses `<think>...</think>` to show a separate thinking panel.
 - **Inline Artifacts**: Assistant can return `<artifact type="html">...</artifact>` blocks that render live in chat bubbles via `WKWebView`. And you can edit code in Artifact with updated preview.
 - **Tools (optional network)**:
@@ -54,6 +57,9 @@ SwiftUI + MVVM with a small service layer:
 - `MemoryService` is the “plastic brain”:
   - stores `Memory` objects (emotion, embeddings, importance, prediction signals),
   - maintains `MemoryGraph` + `CognitiveEchoGraph`,
+  - ranks recall/context with temporal U-shape weighting (recency + deep-age revival),
+  - uses power-law activation decay in the echo graph (instead of plain exponential),
+  - applies associative-link immunity to highly connected nodes during decay,
   - keeps an accumulated prediction-error signal so surprising/corrected memories decay and prune more slowly,
   - uses a novelty-adaptive context gate (opens on novel turns, narrows on routine turns),
   - applies slow identity-node decay with restoration-by-repetition (persistent, not frozen),

@@ -147,6 +147,8 @@ class MemoryService: ObservableObject {
     private let noveltyWindowSize: Int = 6
     private let accessSaveCooldown: TimeInterval = 30
     private let timeWeightTau: TimeInterval = 60 * 60 * 24 * 3
+    private let temporalAgeOnset: TimeInterval = 60 * 60 * 24 * 18
+    private let temporalAgeSlope: TimeInterval = 60 * 60 * 24 * 6
     private var lastAccessSaveAt: Date?
     
     init() {
@@ -960,9 +962,17 @@ class MemoryService: ObservableObject {
     }
 
     private func timeWeight(for memory: Memory, now: Date) -> Double {
-        let lastUse = max(memory.timestamp, memory.lastAccess)
-        let dt = now.timeIntervalSince(lastUse)
-        return exp(-dt / max(1.0, timeWeightTau))
+        // U-shape temporal importance:
+        // 1) recently revisited memories stay salient,
+        // 2) very old memories regain salience (long-tail autobiographical recall).
+        let sinceLastAccess = max(0.0, now.timeIntervalSince(memory.lastAccess))
+        let age = max(0.0, now.timeIntervalSince(memory.timestamp))
+
+        let recency = exp(-sinceLastAccess / max(1.0, timeWeightTau))
+        let antiquity = 1.0 / (1.0 + exp(-(age - temporalAgeOnset) / max(1.0, temporalAgeSlope)))
+
+        let uShape = max(recency, antiquity)
+        return 0.35 + (0.65 * uShape)
     }
 
     private func formatFieldVector(_ field: [Double], targetCount: Int) -> String {
@@ -1560,6 +1570,9 @@ final class CognitiveEchoGraph {
     private let standardDecayRate: Double = 0.1
     private let persistentDecayRate: Double = 0.015
     private let persistentActivationFloor: Double = 0.08
+    private let powerLawExponent: Double = 1.25
+    private let associativeImmunityThreshold: Int = 3
+    private let associativeImmunityMultiplier: Double = 0.62
 
     var isEmpty: Bool {
         nodes.isEmpty
@@ -1640,14 +1653,30 @@ final class CognitiveEchoGraph {
     
     func decay(now: TimeInterval = Date().timeIntervalSince1970) {
         for (id, var node) in nodes {
-            let dt = now - node.lastUpdate
-            let decayRate = node.isPersistent ? persistentDecayRate : standardDecayRate
-            let factor = exp(-dt * decayRate)
+            let dt = max(0.0, now - node.lastUpdate)
+            let baseRate = node.isPersistent ? persistentDecayRate : standardDecayRate
+            let linkCount = associativeLinkCount(for: id)
+            let immunity = linkCount > associativeImmunityThreshold ? associativeImmunityMultiplier : 1.0
+            let effectiveRate = baseRate * immunity
+
+            // Power-law decay: sharp initial drop, then long plateau.
+            let factor = pow(1.0 + (effectiveRate * dt), -powerLawExponent)
             let decayed = node.activation * factor
             node.activation = node.isPersistent ? max(persistentActivationFloor, decayed) : decayed
             node.lastUpdate = now
             nodes[id] = node
         }
+    }
+
+    private func associativeLinkCount(for id: UUID) -> Int {
+        var set = Set<UUID>()
+        for edge in edges where edge.from == id {
+            set.insert(edge.to)
+        }
+        for edge in edges where edge.to == id {
+            set.insert(edge.from)
+        }
+        return set.count
     }
 
     func reinforcePersistentNeighbors(embedding: [Double], strength: Double = 0.2) {
