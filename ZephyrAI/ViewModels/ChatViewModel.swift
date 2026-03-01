@@ -65,7 +65,9 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
             await llmService.loadModel()
             
             if messages.isEmpty {
-                messages.append(Message(role: .assistant, content: "Hello! I am  V A L I S . I have access to my memories. How can I help you?"))
+                let greeting = "Hello! I am  V A L I S . I have access to my memories. How can I help you?"
+                MarkdownRenderer.prewarmInline(greeting)
+                messages.append(Message(role: .assistant, content: greeting))
             }
         }
     }
@@ -311,6 +313,7 @@ Spontaneous flavor:
                     finalText = split.final
                 }
 
+                MarkdownRenderer.prewarmInline(finalText)
                 messages[index].content = finalText
                 storeInternalReflection(
                     userPrompt: prompt,
@@ -343,6 +346,7 @@ Spontaneous flavor:
         llmService.cancelGeneration()
         activeGenerationId = nil
         
+        MarkdownRenderer.prewarmInline(cleaned)
         let userMessage = Message(role: .user, content: cleaned)
         messages.append(userMessage)
         let userMessageId = userMessage.id
@@ -491,6 +495,7 @@ Spontaneous flavor:
                 }
                 finalText = currentFinalText
 
+                MarkdownRenderer.prewarmInline(finalText)
                 messages[index].content = finalText
                 emotionService.updateForAssistantResponse(finalText)
                 storeInternalReflection(

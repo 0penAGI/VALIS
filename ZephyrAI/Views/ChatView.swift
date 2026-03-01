@@ -464,10 +464,7 @@ struct TypewriterText: View {
 
     private func md(_ s: String) -> some View {
         let base: Text
-        if let a = try? AttributedString(
-            markdown: s,
-            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
-        ) {
+        if let a = MarkdownRenderer.renderInline(s) {
             base = Text(a)
         } else {
             base = Text(s)
@@ -558,10 +555,7 @@ struct MessageView: View {
     
     private func md(_ s: String) -> some View {
         let base: Text
-        if let a = try? AttributedString(
-            markdown: s,
-            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
-        ) {
+        if let a = MarkdownRenderer.renderInline(s) {
             base = Text(a)
         } else {
             base = Text(s)
