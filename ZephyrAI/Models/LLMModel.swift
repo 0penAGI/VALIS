@@ -19,6 +19,7 @@ enum LLMModelChoice: String, CaseIterable, Identifiable {
         switch self {
         case .small:
             return "1.2B"
+            
         case .medium:
             return "1.7B"
         }

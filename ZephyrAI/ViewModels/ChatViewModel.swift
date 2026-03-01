@@ -27,12 +27,14 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
     private let llmService = LLMService()
     private let memoryService = MemoryService.shared
     private let actionService = ActionService.shared
+    private let codeCoachService = CodeCoachService.shared
     private let identityService = IdentityService.shared
     private let identityProfileService = IdentityProfileService.shared
     private let experienceService = ExperienceService.shared
     private let motivationService = MotivationService.shared
     private let emotionService = EmotionService.shared
     private var lastReflectionHash: Int?
+    private var statusClearTask: Task<Void, Never>?
 
     
     override init() {
@@ -46,7 +48,9 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
         llmService.$status
             .receive(on: DispatchQueue.main)
             .sink { [weak self] value in
-                self?.status = value
+                guard let self = self else { return }
+                self.status = value
+                self.scheduleStatusAutoClearIfNeeded(for: value)
             }
             .store(in: &cancellables)
 
@@ -62,6 +66,24 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
             
             if messages.isEmpty {
                 messages.append(Message(role: .assistant, content: "Hello! I am  V A L I S . I have access to my memories. How can I help you?"))
+            }
+        }
+    }
+
+    private func scheduleStatusAutoClearIfNeeded(for value: String) {
+        let lower = value.lowercased()
+        let isError = lower.contains("error") || lower.contains("denied") || lower.contains("not available")
+
+        guard isError else { return }
+
+        statusClearTask?.cancel()
+
+        statusClearTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 6_000_000_000) // 6 seconds
+            await MainActor.run {
+                if self?.status == value {
+                    self?.status = ""
+                }
             }
         }
     }
@@ -347,9 +369,10 @@ Spontaneous flavor:
             let memoryContext = memoryService.getContextBlock(maxChars: 900)
             let dialogContext = buildRecentDialogContext()
             let detailBlock = "\nResponse Detail: \(detail.rawValue)\n"
+            let codeCoachContext = codeCoachService.contextBlock(for: prompt, detail: detail)
             let spiceBlock = randomSpiceBlock(for: prompt)
             let toolGuidance = actionService.buildToolGuidanceBlock(hasTools: !toolContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            let systemPrompt = identityService.systemPrompt + identityProfileContext + emotionContext + memoryContext + dialogContext + toolGuidance + toolContext + experienceContext + motivationContext + detailBlock + spiceBlock
+            let systemPrompt = identityService.systemPrompt + identityProfileContext + emotionContext + memoryContext + dialogContext + toolGuidance + toolContext + experienceContext + motivationContext + codeCoachContext + detailBlock + spiceBlock
             // 2. Generate response
             let assistantMessageId = UUID()
             messages.append(Message(id: assistantMessageId, role: .assistant, content: "", thinkContent: ""))
@@ -442,7 +465,7 @@ Spontaneous flavor:
 
                     accumulatedToolContext += "\n" + toolContextFromCall
                     let rerunGuidance = self.actionService.buildToolGuidanceBlock(hasTools: !accumulatedToolContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                    let rerunPrompt = identityService.systemPrompt + identityProfileContext + emotionContext + memoryContext + dialogContext + rerunGuidance + accumulatedToolContext + experienceContext + motivationContext + detailBlock + spiceBlock
+                    let rerunPrompt = identityService.systemPrompt + identityProfileContext + emotionContext + memoryContext + dialogContext + rerunGuidance + accumulatedToolContext + experienceContext + motivationContext + codeCoachContext + detailBlock + spiceBlock
                     let rerunOutput = await llmService.generateText(userPrompt: prompt, systemPrompt: rerunPrompt)
 
                     var rerunParser = ThinkStreamParser()
@@ -589,6 +612,7 @@ Spontaneous flavor:
                 case .denied, .restricted, .notDetermined:
                     print("Speech recognition authorization denied.")
                     self.status = "Speech recognition denied."
+                    self.scheduleStatusAutoClearIfNeeded(for: self.status)
                 @unknown default:
                     fatalError("Unknown speech recognition authorization status.")
                 }
@@ -602,12 +626,14 @@ Spontaneous flavor:
         guard let recognizer = SFSpeechRecognizer(locale: locale) else {
             print("Speech recognizer is not available for current locale.")
             self.status = "Speech recognizer not available."
+            self.scheduleStatusAutoClearIfNeeded(for: self.status)
             return
         }
 
         if !recognizer.isAvailable {
             print("Speech recognizer is not currently available.")
             self.status = "Speech recognizer not available."
+            self.scheduleStatusAutoClearIfNeeded(for: self.status)
             return
         }
 
@@ -624,6 +650,7 @@ Spontaneous flavor:
             } else if let error = error {
                 print("Speech recognition error: \(error.localizedDescription)")
                 self.status = "Speech recognition error."
+                self.scheduleStatusAutoClearIfNeeded(for: self.status)
             }
         }
     }

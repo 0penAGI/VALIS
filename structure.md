@@ -42,11 +42,13 @@ These may exist locally for reference/experimentation. In this repo they are typ
     - tool/action context supplied by `ActionService`
     - `ExperienceService` lessons + preferences
     - `MotivationService` guidance
+    - `CodeCoachService` coding-quality guidance (on coding prompts)
     - response detail level / style tuning
   - Streams generation and parses `<think>...</think>` for the “Thinking UI”.
   - Tooling:
     - delegates rule-based tools + model-initiated `TOOL:`/`ACTION:` calls to `ActionService`.
     - re-runs generation with tool/action results (bounded multi-step loop).
+    - injects `CodeCoachService` into both first-pass and tool-rerun prompts when coding intent is detected.
   - Memory + autonomy:
     - stores experiences and updates memory
     - listens to `.memoryTriggered` and can perform a spontaneous “learn” response when idle.
@@ -85,6 +87,10 @@ These may exist locally for reference/experimentation. In this repo they are typ
   - Parses model-initiated `TOOL:` / `ACTION:` lines.
   - Executes rule-based signals (Date / DuckDuckGo / Reddit) and user-visible actions (`open_url`, `calendar` open/create/list).
   - Provides autonomous DDG/Wikipedia enrichment for spontaneous memory-triggered runs.
+- `CodeCoachService.swift`: Coding-quality meta-layer.
+  - Activates on code/debug/refactor/test prompts.
+  - Injects guardrails for correctness, safe input handling, realistic API usage, and testability.
+  - Adapts strictness to selected detail level.
 - `EmotionService.swift`: Internal affect state.
   - Maintains a slow-changing (valence/intensity/stability) state with decay.
   - Provides a self-access context block intended to be referenced sparingly.
@@ -109,7 +115,7 @@ These may exist locally for reference/experimentation. In this repo they are typ
 
 ### Prompt Assembly
 
-`ChatViewModel` composes a system prompt from identity + profile + affect + tools + experiences + motivators + bounded memory context. Memory context size is budgeted to fit within the effective context window.
+`ChatViewModel` composes a system prompt from identity + profile + affect + tools + experiences + motivators + code-coach guidance + bounded memory context. Memory context size is budgeted to fit within the effective context window.
 
 ### Tools
 

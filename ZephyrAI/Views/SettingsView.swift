@@ -111,6 +111,20 @@ struct SettingsView: View {
             .scrollContentBackground(.hidden)
             .listStyle(.insetGrouped)
             .background(.ultraThinMaterial.opacity(0.78))
+
+                SettingsEdgeBlurOverlay(position: .top)
+                    .frame(height: 99)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                    .offset(y: -20)
+                    .ignoresSafeArea(edges: .top)
+                    .allowsHitTesting(false)
+
+                SettingsEdgeBlurOverlay(position: .bottom)
+                    .frame(height: 130)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                    .offset(y: 62)
+                    .ignoresSafeArea(edges: .bottom)
+                    .allowsHitTesting(false)
             }
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
@@ -212,5 +226,55 @@ private struct GlassDistortionLayer: View {
                 .fill(.ultraThinMaterial)
                 .opacity(baseOpacity)
         }
+    }
+}
+
+private struct SettingsEdgeBlurOverlay: View {
+    enum Position {
+        case top
+        case bottom
+    }
+
+    let position: Position
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        ZStack {
+            SettingsBlurEffectView(style: colorScheme == .dark ? .dark : .light)
+                .opacity(colorScheme == .dark ? 0.9 : 0.98)
+            (colorScheme == .dark ? Color.black : Color.white)
+                .opacity(colorScheme == .dark ? 0.14 : 0.05)
+        }
+        .mask(
+            LinearGradient(
+                stops: position == .top
+                ? [
+                    .init(color: .white, location: 0.0),
+                    .init(color: .white, location: 0.22),
+                    .init(color: .clear, location: 0.58),
+                    .init(color: .clear, location: 1.0)
+                ]
+                : [
+                    .init(color: .clear, location: 0.0),
+                    .init(color: .clear, location: 0.22),
+                    .init(color: .white, location: 0.58),
+                    .init(color: .white, location: 1.0)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        )
+    }
+}
+
+private struct SettingsBlurEffectView: UIViewRepresentable {
+    let style: UIBlurEffect.Style
+
+    func makeUIView(context: Context) -> UIVisualEffectView {
+        UIVisualEffectView(effect: UIBlurEffect(style: style))
+    }
+
+    func updateUIView(_ uiView: UIVisualEffectView, context: Context) {
+        uiView.effect = UIBlurEffect(style: style)
     }
 }

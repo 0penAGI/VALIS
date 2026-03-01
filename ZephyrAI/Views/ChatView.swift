@@ -16,50 +16,7 @@ struct ChatView: View {
     @State private var meterTimer: Timer?
     
     var body: some View {
-        VStack(spacing: 0) {
-            // Header / Status
-            ZStack {
-
-                // Tap area (doesn't block buttons)
-                Color.clear
-                    .contentShape(Rectangle())
-                    .allowsHitTesting(false)
-
-                // Title center
-                Text("V A L I S")
-                    .font(.system(size: 16, weight: .medium))
-
-                // Right side (status + sandwich)
-                HStack(spacing: 8) {
-                    Spacer()
-
-                    Text(viewModel.status)
-                        .font(.system(size: 11))
-                        .foregroundColor(.secondary)
-                        .lineLimit(1)
-
-                    Button {
-                        showSettings = true
-                        restartSandwichTimer()
-                    } label: {
-                        Image(systemName: "line.3.horizontal")
-                            .foregroundColor(.primary)
-                            .opacity(showSandwich ? 1 : 0.15)
-                            .allowsHitTesting(showSandwich)
-                            .scaleEffect(showSandwich ? 1 : 0.8)
-                            .animation(.easeInOut(duration: 0.25), value: showSandwich)
-                    }
-                }
-            }
-            .frame(height: 44)
-            .padding(.horizontal)
-            .onTapGesture {
-                showSandwich = true
-                restartSandwichTimer()
-            }
-            .background(Color(UIColor.systemBackground))
-            
-            // Message List
+        ZStack {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 12) {
@@ -73,6 +30,8 @@ struct ChatView: View {
                         }
                     }
                     .padding()
+                    .padding(.top, 56)
+                    .padding(.bottom, 88)
                 }
                 .scrollDismissesKeyboard(.interactively)
                 .onChange(of: viewModel.messages.last?.content) { oldValue, newValue in
@@ -89,123 +48,188 @@ struct ChatView: View {
                         }
                     }
                 }
+                .simultaneousGesture(
+                    TapGesture().onEnded {
+                        showSandwich = true
+                        restartSandwichTimer()
+                        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+                    }
+                )
             }
-            
-            // Input Area
+
+            SoftBarBlurBackground(position: .top)
+                .frame(height: 170)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                .offset(y: -18)
+                .ignoresSafeArea(edges: .top)
+                .allowsHitTesting(false)
+
+            SoftBarBlurBackground(position: .bottom)
+                .frame(height: 220)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                .offset(y: 64)
+                .ignoresSafeArea(edges: .bottom)
+                .allowsHitTesting(false)
+
             VStack(spacing: 0) {
-                HStack(alignment: .bottom) {
-                    TextField("Type a message...", text: $viewModel.inputText, axis: .vertical)
-                        .focused($isInputFocused)
-                        .textFieldStyle(.plain)
-                        .lineLimit(1...5)
-                        .disabled(viewModel.isInteracting || isRecording)
-                    
-                    if viewModel.inputText.isEmpty && !viewModel.isInteracting {
-                        Button(action: {
-                            if isRecording {
-                                stopRecording()
-                            } else {
-                                startRecording()
-                            }
-                        }) {
-                            ZStack {
-                                Circle()
-                                    .stroke(Color.primary.opacity(0.6), lineWidth: 1)
-                                    .frame(width: 34, height: 34)
-                                    .scaleEffect(isRecording ? 1.0 : 0.95)
-                                    .opacity(isRecording ? 0.0 : 1.0)
-                                    .animation(.easeInOut(duration: 1.5).repeatForever(autoreverses: true), value: isRecording)
+                // Header / Status
+                ZStack {
 
-                                Image(systemName: "waveform")
-                                    .font(.system(size: 16, weight: .medium))
-                                    .foregroundColor(.primary)
-                                    .scaleEffect(isRecording ? (0.6 + audioLevel * 1.4) : 1.0)
-                                    .opacity(
-                                        isRecording
-                                        ? (0.4 + audioLevel * 0.8)
-                                        : (sin(Date().timeIntervalSince1970 * 0.8) > 0 ? 0.7 : 0.0)
-                                    )
-                                    .animation(.easeInOut(duration: 0.2), value: audioLevel)
-                                    .animation(.easeInOut(duration: 1.5), value: isRecording)
-                            }
-                            .frame(width: 34, height: 34)
+                    // Tap area (doesn't block buttons)
+                    Color.clear
+                        .contentShape(Rectangle())
+                        .allowsHitTesting(false)
+
+                    // Title center
+                    Text("V A L I S")
+                        .font(.system(size: 16, weight: .medium))
+
+                    // Right side (status + sandwich)
+                    HStack(spacing: 8) {
+                        Spacer()
+
+                        Text(viewModel.status)
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .frame(maxWidth: 120, alignment: .trailing)
+                            .opacity(viewModel.status.isEmpty ? 0 : 0.85)
+                            .animation(.easeOut(duration: 0.2), value: viewModel.status)
+
+                        Button {
+                            showSettings = true
+                            restartSandwichTimer()
+                        } label: {
+                            Image(systemName: "line.3.horizontal")
+                                .foregroundColor(.primary)
+                                .opacity(showSandwich ? 1 : 0.15)
+                                .scaleEffect(showSandwich ? 1 : 0.8)
+                                .animation(.easeInOut(duration: 0.25), value: showSandwich)
+                                .frame(width: 28, height: 28)
+                                .contentShape(Rectangle())
                         }
-                    } else {
-                        Button(action: {
-                            if viewModel.isInteracting {
-                                viewModel.stopGeneration()
-                            } else {
-                                viewModel.sendMessage()
-                            }
-                        }) {
-                            ZStack {
-                                // Animated ring / background (size grows on active)
-                                let isActive = viewModel.isInteracting || !viewModel.inputText.isEmpty
-                                Circle()
-                                    .fill(
-                                        isActive
-                                        ? Color.primary.opacity(viewModel.isInteracting ? 0.15 : 0.08)
-                                        : Color.clear
-                                    )
-                                    .overlay(
-                                        Circle()
-                                            .stroke(
-                                                Color.primary,
-                                                lineWidth: isActive ? 0 : 1.1
-                                            )
-                                    )
-                                    .frame(
-                                        width: isActive ? 34 : 27,
-                                        height: isActive ? 34 : 27
-                                    )
-                                    .rotationEffect(.degrees(viewModel.isInteracting ? 360 : 0))
-                                    .animation(
-                                        .spring(response: 0.25, dampingFraction: 0.75),
-                                        value: isActive
-                                    )
-                                    .animation(
-                                        viewModel.isInteracting
-                                        ? .linear(duration: 1).repeatForever(autoreverses: false)
-                                        : .easeOut(duration: 0.25),
-                                        value: viewModel.isInteracting
-                                    )
-
-                                // Icon background
-                                if viewModel.isInteracting || !viewModel.inputText.isEmpty {
-                                    Circle()
-                                        .fill(Color.primary)
-                                        .frame(width: 22, height: 22)
-                                        .transition(.scale.combined(with: .opacity))
-                                }
-
-                                // Icon
-                                if viewModel.isInteracting {
-                                    Image(systemName: "stop.fill")
-                                        .font(.system(size: 11, weight: .bold))
-                                        .foregroundColor(Color(UIColor.systemBackground))
-                                        .transition(.scale.combined(with: .opacity))
-                                } else if !viewModel.inputText.isEmpty {
-                                    Image(systemName: "arrow.up")
-                                        .font(.system(size: 10, weight: .bold))
-                                        .foregroundColor(Color(UIColor.systemBackground))
-                                        .transition(.scale.combined(with: .opacity))
-                                }
-                            }
-                            .frame(width: 34, height: 34)
-                            .animation(.spring(response: 0.3, dampingFraction: 0.7), value: viewModel.isInteracting)
-                            .animation(.spring(response: 0.3, dampingFraction: 0.7), value: viewModel.inputText)
-                        }
-                        .disabled(!viewModel.isInteracting && viewModel.inputText.isEmpty)
+                        .buttonStyle(.plain)
                     }
                 }
-                .padding()
-                .background(Color(UIColor.systemBackground))
+                .frame(height: 44)
+                .padding(.horizontal)
+                .background(Color.clear)
+
+                Spacer()
+
+                // Input Area
+                VStack(spacing: 0) {
+                    HStack(alignment: .bottom) {
+                        TextField("Type a message...", text: $viewModel.inputText, axis: .vertical)
+                            .focused($isInputFocused)
+                            .textFieldStyle(.plain)
+                            .lineLimit(1...5)
+                            .disabled(viewModel.isInteracting || isRecording)
+                        
+                        if viewModel.inputText.isEmpty && !viewModel.isInteracting {
+                            Button(action: {
+                                if isRecording {
+                                    stopRecording()
+                                } else {
+                                    startRecording()
+                                }
+                            }) {
+                                ZStack {
+                                    Circle()
+                                        .stroke(Color.primary.opacity(0.6), lineWidth: 1)
+                                        .frame(width: 34, height: 34)
+                                        .scaleEffect(isRecording ? 1.0 : 0.95)
+                                        .opacity(isRecording ? 0.0 : 1.0)
+                                        .animation(.easeInOut(duration: 1.5).repeatForever(autoreverses: true), value: isRecording)
+
+                                    Image(systemName: "waveform")
+                                        .font(.system(size: 16, weight: .medium))
+                                        .foregroundColor(.primary)
+                                        .scaleEffect(isRecording ? (0.6 + audioLevel * 1.4) : 1.0)
+                                        .opacity(
+                                            isRecording
+                                            ? (0.4 + audioLevel * 0.8)
+                                            : (sin(Date().timeIntervalSince1970 * 0.8) > 0 ? 0.7 : 0.0)
+                                        )
+                                        .animation(.easeInOut(duration: 0.2), value: audioLevel)
+                                        .animation(.easeInOut(duration: 1.5), value: isRecording)
+                                }
+                                .frame(width: 34, height: 34)
+                            }
+                        } else {
+                            Button(action: {
+                                if viewModel.isInteracting {
+                                    viewModel.stopGeneration()
+                                } else {
+                                    viewModel.sendMessage()
+                                }
+                            }) {
+                                ZStack {
+                                    // Animated ring / background (size grows on active)
+                                    let isActive = viewModel.isInteracting || !viewModel.inputText.isEmpty
+                                    Circle()
+                                        .fill(
+                                            isActive
+                                            ? Color.primary.opacity(viewModel.isInteracting ? 0.15 : 0.08)
+                                            : Color.clear
+                                        )
+                                        .overlay(
+                                            Circle()
+                                                .stroke(
+                                                    Color.primary,
+                                                    lineWidth: isActive ? 0 : 1.1
+                                                )
+                                        )
+                                        .frame(
+                                            width: isActive ? 34 : 27,
+                                            height: isActive ? 34 : 27
+                                        )
+                                        .rotationEffect(.degrees(viewModel.isInteracting ? 360 : 0))
+                                        .animation(
+                                            .spring(response: 0.25, dampingFraction: 0.75),
+                                            value: isActive
+                                        )
+                                        .animation(
+                                            viewModel.isInteracting
+                                            ? .linear(duration: 1).repeatForever(autoreverses: false)
+                                            : .easeOut(duration: 0.25),
+                                            value: viewModel.isInteracting
+                                        )
+
+                                    // Icon background
+                                    if viewModel.isInteracting || !viewModel.inputText.isEmpty {
+                                        Circle()
+                                            .fill(Color.primary)
+                                            .frame(width: 22, height: 22)
+                                            .transition(.scale.combined(with: .opacity))
+                                    }
+
+                                    // Icon
+                                    if viewModel.isInteracting {
+                                        Image(systemName: "stop.fill")
+                                            .font(.system(size: 11, weight: .bold))
+                                            .foregroundColor(Color(UIColor.systemBackground))
+                                            .transition(.scale.combined(with: .opacity))
+                                    } else if !viewModel.inputText.isEmpty {
+                                        Image(systemName: "arrow.up")
+                                            .font(.system(size: 10, weight: .bold))
+                                            .foregroundColor(Color(UIColor.systemBackground))
+                                            .transition(.scale.combined(with: .opacity))
+                                    }
+                                }
+                                .frame(width: 34, height: 34)
+                                .animation(.spring(response: 0.3, dampingFraction: 0.7), value: viewModel.isInteracting)
+                                .animation(.spring(response: 0.3, dampingFraction: 0.7), value: viewModel.inputText)
+                            }
+                            .disabled(!viewModel.isInteracting && viewModel.inputText.isEmpty)
+                        }
+                    }
+                    .padding()
+                    .background(Color.clear)
+                }
             }
-        }
-        .onTapGesture {
-            showSandwich = true
-            restartSandwichTimer()
-            UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
         .onChange(of: viewModel.isInteracting) { _, newValue in
             if newValue {
@@ -518,6 +542,10 @@ struct MessageView: View {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    private var streamingArtifact: Artifact? {
+        parseStreamingArtifact(from: message.content)
+    }
+
     private var hasRenderableText: Bool {
         !renderableContent.isEmpty
     }
@@ -685,10 +713,45 @@ struct MessageView: View {
 
     private func stripArtifacts(from text: String) -> String {
         text.replacingOccurrences(
-            of: "(?is)<artifact\\b[^>]*>.*?</artifact>",
+            of: "(?is)<artifact\\b[^>]*>.*?(</artifact>|$)",
             with: "",
             options: .regularExpression
         )
+    }
+
+    private func countMatches(in text: String, pattern: String) -> Int {
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return 0 }
+        let nsRange = NSRange(text.startIndex..<text.endIndex, in: text)
+        return regex.numberOfMatches(in: text, range: nsRange)
+    }
+
+    private func parseStreamingArtifact(from text: String) -> Artifact? {
+        let openCount = countMatches(in: text, pattern: "(?i)<artifact\\b")
+        let closeCount = countMatches(in: text, pattern: "(?i)</artifact>")
+        guard openCount > closeCount else { return nil }
+
+        let nsText = text as NSString
+        let fullLen = nsText.length
+        let openStart = nsText.range(of: "<artifact", options: [.caseInsensitive, .backwards])
+        guard openStart.location != NSNotFound else { return nil }
+
+        let openEndSearch = NSRange(location: openStart.location, length: fullLen - openStart.location)
+        let openEnd = nsText.range(of: ">", options: [], range: openEndSearch)
+        guard openEnd.location != NSNotFound else { return nil }
+
+        let attrsStart = openStart.location + "<artifact".count
+        let attrsLen = max(0, openEnd.location - attrsStart)
+        let attrsRaw = nsText.substring(with: NSRange(location: attrsStart, length: attrsLen))
+        let attrs = parseArtifactAttributes(attrsRaw)
+        let type = (attrs["type"] ?? "html").lowercased()
+        guard type == "html" else { return nil }
+
+        let bodyStart = openEnd.location + openEnd.length
+        guard bodyStart <= fullLen else { return nil }
+        let payload = nsText.substring(from: bodyStart)
+        let title = attrs["title"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let id = "\(message.id.uuidString)-artifact-streaming"
+        return Artifact(id: id, type: type, title: title, payload: payload)
     }
     
     private struct CodeBlockView: View {
@@ -803,7 +866,7 @@ struct MessageView: View {
                             )
                             .padding(.bottom, 4)
                         }
-                        if hasRenderableText || !artifacts.isEmpty {
+                        if hasRenderableText || !artifacts.isEmpty || streamingArtifact != nil {
                             VStack(alignment: .leading, spacing: 8) {
                                 ForEach(Array(segments.enumerated()), id: \.offset) { _, seg in
                                 switch seg {
@@ -821,6 +884,9 @@ struct MessageView: View {
                                 }
                                 ForEach(artifacts) { artifact in
                                     ArtifactBlockView(artifact: artifact)
+                                }
+                                if let streamingArtifact {
+                                    ArtifactGeneratingCardView(artifact: streamingArtifact)
                                 }
                             }
                                 .padding()
@@ -874,10 +940,84 @@ struct MessageView: View {
     
 }
 
+private struct ArtifactGeneratingCardView: View {
+    let artifact: MessageView.Artifact
+    @State private var animate = false
+    @State private var showFullscreen = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Text("Artifact")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Spacer()
+                ProgressView()
+                    .controlSize(.small)
+                    .tint(.secondary)
+            }
+
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(
+                    LinearGradient(
+                        colors: [
+                            Color(UIColor.tertiarySystemFill).opacity(0.45),
+                            Color(UIColor.secondarySystemFill).opacity(0.7),
+                            Color(UIColor.tertiarySystemFill).opacity(0.45)
+                        ],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                )
+                .frame(minHeight: 180, maxHeight: 320)
+                .overlay(
+                    VStack(spacing: 6) {
+                        Text("Building artifact...")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(.secondary)
+                        Text("Tap to inspect live code")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.tertiary)
+                    }
+                )
+        }
+        .padding(10)
+        .background(Color(UIColor.secondarySystemBackground).opacity(0.55))
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(Color(UIColor.quaternaryLabel), lineWidth: 0.7)
+        )
+        .opacity(animate ? 1.0 : 0.6)
+        .scaleEffect(animate ? 1.0 : 0.985)
+        .onAppear {
+            withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) {
+                animate = true
+            }
+        }
+        .onDisappear {
+            animate = false
+        }
+        .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .onTapGesture {
+            showFullscreen = true
+        }
+        .fullScreenCover(isPresented: $showFullscreen) {
+            ArtifactFullscreenView(
+                artifact: artifact,
+                startInCodeMode: true,
+                isLiveStream: true
+            )
+        }
+    }
+}
+
 private struct ArtifactBlockView: View {
     let artifact: MessageView.Artifact
     @State private var showCode: Bool = false
     @State private var showFullscreen: Bool = false
+    @State private var showFullscreenHint: Bool = false
+    @State private var hideFullscreenHintTask: Task<Void, Never>?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -889,7 +1029,7 @@ private struct ArtifactBlockView: View {
                 Button {
                     showCode.toggle()
                 } label: {
-                    Image(systemName: showCode ? "play.rectangle" : "chevron.left.forwardslash.chevron.right")
+                    Image(systemName: showCode ? "eye" : "chevron.left.forwardslash.chevron.right")
                         .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(.secondary)
                 }
@@ -900,6 +1040,19 @@ private struct ArtifactBlockView: View {
                     Image(systemName: "arrow.up.left.and.arrow.down.right")
                         .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(.secondary)
+                }
+            }
+
+            if showFullscreenHint {
+                HStack {
+                    Spacer()
+                    Text("you can edit the code in fullscreen artifact")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 7)
+                        .background(.ultraThinMaterial, in: Capsule())
+                        .transition(.opacity.combined(with: .move(edge: .top)))
                 }
             }
 
@@ -923,62 +1076,347 @@ private struct ArtifactBlockView: View {
                     .stroke(Color(UIColor.quaternaryLabel), lineWidth: 0.7)
             )
         }
+        .onChange(of: showCode) { _, isCodeMode in
+            if isCodeMode {
+                showFullscreenHintTemporarily()
+            } else {
+                hideFullscreenHintTask?.cancel()
+                withAnimation(.easeOut(duration: 0.2)) {
+                    showFullscreenHint = false
+                }
+            }
+        }
+        .onDisappear {
+            hideFullscreenHintTask?.cancel()
+        }
         .fullScreenCover(isPresented: $showFullscreen) {
-            ArtifactFullscreenView(artifact: artifact)
+            ArtifactFullscreenView(
+                artifact: artifact,
+                startInCodeMode: false,
+                isLiveStream: false
+            )
+        }
+    }
+
+    private func showFullscreenHintTemporarily() {
+        hideFullscreenHintTask?.cancel()
+        withAnimation(.easeOut(duration: 0.2)) {
+            showFullscreenHint = true
+        }
+        hideFullscreenHintTask = Task {
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                withAnimation(.easeOut(duration: 0.2)) {
+                    showFullscreenHint = false
+                }
+            }
         }
     }
 }
 
 private struct ArtifactFullscreenView: View {
     let artifact: MessageView.Artifact
+    let startInCodeMode: Bool
+    let isLiveStream: Bool
     @Environment(\.dismiss) private var dismiss
     @State private var showCode: Bool = false
+    @State private var editableCode: String = ""
+    @State private var renderedCode: String = ""
+    @State private var showEditHint: Bool = false
+    @State private var hideHintTask: Task<Void, Never>?
+    @State private var showCopiedHint: Bool = false
+    @State private var hideCopiedHintTask: Task<Void, Never>?
+    @State private var isFollowingLiveCode: Bool = true
+    @State private var resumeLiveFollowTask: Task<Void, Never>?
+    private let liveCodeBottomID = "LIVE_CODE_BOTTOM"
 
     var body: some View {
         Group {
             if showCode {
-                ScrollView([.vertical, .horizontal], showsIndicators: true) {
-                    Text(artifact.payload)
-                        .font(.system(.body, design: .monospaced))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
-                        .padding(16)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(Color(UIColor.systemBackground))
-            } else {
-                ArtifactView(html: artifact.payload)
+                if isLiveStream {
+                    ScrollViewReader { proxy in
+                        GeometryReader { geo in
+                            ScrollView([.horizontal, .vertical], showsIndicators: true) {
+                                VStack(alignment: .leading, spacing: 0) {
+                                    Text(editableCode)
+                                        .font(.system(.body, design: .monospaced))
+                                        .fixedSize(horizontal: true, vertical: false)
+                                        .textSelection(.enabled)
+                                        .padding(10)
+                                    Color.clear
+                                        .frame(height: 1)
+                                        .id(liveCodeBottomID)
+                                }
+                                .frame(
+                                    minWidth: geo.size.width,
+                                    minHeight: geo.size.height,
+                                    alignment: .topLeading
+                                )
+                            }
+                            .simultaneousGesture(
+                                DragGesture(minimumDistance: 2).onChanged { _ in
+                                    isFollowingLiveCode = false
+                                    resumeLiveFollowTask?.cancel()
+                                }.onEnded { _ in
+                                    scheduleLiveFollowResume()
+                                }
+                            )
+                        }
+                        .onAppear {
+                            isFollowingLiveCode = true
+                            scrollToLiveCodeBottom(proxy, animated: false)
+                        }
+                        .onChange(of: editableCode) { _, _ in
+                            guard isFollowingLiveCode else { return }
+                            scrollToLiveCodeBottom(proxy, animated: true)
+                        }
+                    }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Color(UIColor.systemBackground))
+                    .safeAreaPadding(.bottom, 8)
+                } else {
+                    TextEditor(text: $editableCode)
+                        .font(.system(.body, design: .monospaced))
+                        .padding(10)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(Color(UIColor.systemBackground))
+                        .safeAreaPadding(.bottom, 8)
+                }
+            } else {
+                ArtifactView(html: renderedCode)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .ignoresSafeArea()
             }
         }
-        .ignoresSafeArea()
+        .onAppear {
+            if editableCode.isEmpty && renderedCode.isEmpty {
+                editableCode = artifact.payload
+                renderedCode = artifact.payload
+            }
+            if startInCodeMode {
+                showCode = true
+            }
+            if isLiveStream {
+                isFollowingLiveCode = true
+            }
+        }
+        .onChange(of: editableCode) { _, newValue in
+            renderedCode = newValue
+        }
+        .onChange(of: artifact.payload) { _, newValue in
+            if isLiveStream {
+                editableCode = newValue
+                renderedCode = newValue
+            }
+        }
+        .onChange(of: showCode) { _, isCodeMode in
+            if isCodeMode && !isLiveStream {
+                showEditHintTemporarily()
+            } else {
+                hideHintTask?.cancel()
+                withAnimation(.easeOut(duration: 0.2)) {
+                    showEditHint = false
+                }
+            }
+        }
+        .onDisappear {
+            hideHintTask?.cancel()
+            hideCopiedHintTask?.cancel()
+            resumeLiveFollowTask?.cancel()
+        }
         .safeAreaInset(edge: .top) {
-            HStack {
-                Spacer()
-                HStack(spacing: 12) {
-                    Button {
-                        showCode.toggle()
-                    } label: {
-                        Image(systemName: showCode ? "play.rectangle" : "chevron.left.forwardslash.chevron.right")
-                            .font(.system(size: 13, weight: .medium))
-                            .foregroundStyle(.secondary)
-                    }
+            VStack(alignment: .trailing, spacing: 8) {
+                HStack {
+                    Spacer()
+                    HStack(spacing: 12) {
+                        Button {
+                            showCode.toggle()
+                        } label: {
+                            Image(systemName: showCode ? "eye" : "chevron.left.forwardslash.chevron.right")
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundStyle(.secondary)
+                        }
 
-                    Button {
-                        dismiss()
-                    } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 13, weight: .medium))
+                        Button {
+                            editableCode = artifact.payload
+                            renderedCode = artifact.payload
+                            if isLiveStream {
+                                isFollowingLiveCode = true
+                            }
+                        } label: {
+                            Image(systemName: "arrow.counterclockwise")
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundStyle(.secondary)
+                        }
+                        .opacity(isLiveStream ? 0.45 : 1.0)
+                        .disabled(isLiveStream)
+
+                        Button {
+                            UIPasteboard.general.string = editableCode
+                            showCopiedHintTemporarily()
+                        } label: {
+                            Image(systemName: "doc.on.doc")
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundStyle(.secondary)
+                        }
+
+                        Button {
+                            dismiss()
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 9)
+                    .background(.ultraThinMaterial, in: Capsule())
+                }
+
+                if showEditHint {
+                    HStack {
+                        Spacer()
+                        Text("you can edit the code")
+                            .font(.system(size: 12, weight: .medium))
                             .foregroundStyle(.secondary)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 7)
+                            .background(.ultraThinMaterial, in: Capsule())
+                            .transition(.opacity.combined(with: .move(edge: .top)))
                     }
                 }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 9)
-                .background(.ultraThinMaterial, in: Capsule())
+
+                if showCopiedHint {
+                    HStack {
+                        Spacer()
+                        Text("copied")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 7)
+                            .background(.ultraThinMaterial, in: Capsule())
+                            .transition(.opacity.combined(with: .move(edge: .top)))
+                    }
+                }
             }
             .padding(.horizontal, 10)
             .padding(.top, 4)
         }
+    }
+
+    private func showEditHintTemporarily() {
+        hideHintTask?.cancel()
+        withAnimation(.easeOut(duration: 0.2)) {
+            showEditHint = true
+        }
+        hideHintTask = Task {
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                withAnimation(.easeOut(duration: 0.2)) {
+                    showEditHint = false
+                }
+            }
+        }
+    }
+
+    private func showCopiedHintTemporarily() {
+        hideCopiedHintTask?.cancel()
+        withAnimation(.easeOut(duration: 0.15)) {
+            showCopiedHint = true
+        }
+        hideCopiedHintTask = Task {
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                withAnimation(.easeOut(duration: 0.15)) {
+                    showCopiedHint = false
+                }
+            }
+        }
+    }
+
+    private func scrollToLiveCodeBottom(_ proxy: ScrollViewProxy, animated: Bool) {
+        DispatchQueue.main.async {
+            if animated {
+                withAnimation(.easeOut(duration: 0.12)) {
+                    proxy.scrollTo(liveCodeBottomID, anchor: .bottomLeading)
+                }
+            } else {
+                proxy.scrollTo(liveCodeBottomID, anchor: .bottomLeading)
+            }
+        }
+    }
+
+    private func scheduleLiveFollowResume() {
+        resumeLiveFollowTask?.cancel()
+        resumeLiveFollowTask = Task {
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                isFollowingLiveCode = true
+            }
+        }
+    }
+}
+
+private struct SoftBarBlurBackground: View {
+    enum Position {
+        case top
+        case bottom
+    }
+
+    let position: Position
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        ZStack {
+            if colorScheme == .dark {
+                BlurEffectView(style: .dark)
+                    .colorMultiply(.black)
+                    .opacity(0.92)
+                BlurEffectView(style: .dark)
+                    .colorMultiply(.black)
+                    .opacity(0.5)
+                Color.black.opacity(0.12)
+            } else {
+                BlurEffectView(style: .light)
+                    .opacity(1.0)
+                BlurEffectView(style: .light)
+                    .opacity(0.55)
+                Color.white.opacity(0.09)
+            }
+        }
+        .mask(
+            LinearGradient(
+                stops: position == .top
+                ? [
+                    .init(color: .white, location: 0.0),
+                    .init(color: .white, location: 0.56),
+                    .init(color: .clear, location: 1.0)
+                ]
+                : [
+                    .init(color: .clear, location: 0.0),
+                    .init(color: .white, location: 0.44),
+                    .init(color: .white, location: 1.0)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        )
+    }
+}
+
+private struct BlurEffectView: UIViewRepresentable {
+    let style: UIBlurEffect.Style
+
+    func makeUIView(context: Context) -> UIVisualEffectView {
+        UIVisualEffectView(effect: UIBlurEffect(style: style))
+    }
+
+    func updateUIView(_ uiView: UIVisualEffectView, context: Context) {
+        uiView.effect = UIBlurEffect(style: style)
     }
 }
 
