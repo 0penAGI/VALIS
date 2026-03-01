@@ -10,7 +10,7 @@ VALIS is an on-device AI chat app for iOS built with SwiftUI and `llama.cpp` (GG
 - **Model switching in Settings**: Runtime selection between bundled/downloadable profiles (`LFM 2.5 1.2B` and `Qwen 3 1.7B`) with hot reload.
 - **Plastic Brain**: Memories have emotion tags, importance, embeddings, associative links, and activation/decay.
 - **Thinking UI**: Streams model output and parses `<think>...</think>` to show a separate thinking panel.
-- **Inline Artifacts**: Assistant can return `<artifact type="html">...</artifact>` blocks that render live in chat bubbles via `WKWebView`.
+- **Inline Artifacts**: Assistant can return `<artifact type="html">...</artifact>` blocks that render live in chat bubbles via `WKWebView`. And you can edit code in Artifact with updated preview.
 - **Tools (optional network)**:
   - Rule-based tool injection (Date, DuckDuckGo summaries, Reddit /r/news feed).
   - Model-initiated tools via `TOOL:` lines (app executes tools and re-runs generation with results).
