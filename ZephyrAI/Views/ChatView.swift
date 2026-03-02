@@ -14,6 +14,8 @@ struct ChatView: View {
     @State private var audioLevel: CGFloat = 0.2
     @State private var silenceTimer: TimeInterval = 0
     @State private var meterTimer: Timer?
+    @State private var inputBarHeight: CGFloat = 58
+    private let baselineInputBarHeight: CGFloat = 58
     
     var body: some View {
         ZStack {
@@ -223,9 +225,17 @@ struct ChatView: View {
                 .padding()
                 .background(Color.clear)
             }
+            .onGeometryChange(for: CGFloat.self) { geo in
+                geo.size.height
+            } action: { newHeight in
+                let clamped = max(baselineInputBarHeight, newHeight)
+                withAnimation(.easeOut(duration: 0.18)) {
+                    inputBarHeight = clamped
+                }
+            }
             .background(alignment: .bottom) {
                 SoftBarBlurBackground(position: .bottom)
-                    .frame(height: 153)
+                    .frame(height: 153 + max(0, inputBarHeight - baselineInputBarHeight))
                     .offset(y: 42)
                     .ignoresSafeArea(edges: .bottom)
                     .allowsHitTesting(false)

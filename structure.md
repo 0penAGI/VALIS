@@ -85,6 +85,9 @@ These may exist locally for reference/experimentation. In this repo they are typ
   - Uses temporal U-shape weighting for context relevance (recently revisited + deep older memory revival).
   - Uses power-law echo activation decay (sharp early drop, long-tail plateau).
   - Applies associative-link immunity multiplier for highly connected nodes (>3 links) during decay.
+  - Runs idle rest-phase consolidation: compresses highly similar memories into abstract `[rest-consolidated]` traces.
+  - Applies prediction-feedback learning where prediction mismatch increases retained importance and accumulated prediction error.
+  - Uses a novelty-adaptive context gate to filter low-signal memories before building `getContextBlock()`.
   - Provides pruning, activation/decay, and a context block generator.
 - `ActionService.swift`: Tool/action runtime.
   - Parses model-initiated `TOOL:` / `ACTION:` lines.

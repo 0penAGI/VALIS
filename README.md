@@ -12,6 +12,9 @@ VALIS is an on-device AI chat app for iOS built with SwiftUI and `llama.cpp` (GG
   - Context ranking now uses a temporal U-shape signal (recently revisited memories and deep older memories are both prioritized).
   - Echo activation decay now uses power-law behavior (fast initial drop, long tail plateau).
   - Nodes with strong associative connectivity (>3 links) get a decay immunity multiplier.
+  - Rest-phase consolidation runs during idle windows: highly similar memories are compressed into abstract “rest-consolidated” traces instead of relying only on pruning.
+  - Prediction-error feedback explicitly increases memory salience on mismatch (wrong prediction -> higher retained importance).
+  - Novelty-adaptive context gate now filters memory candidates before prompt injection (not only a display metric).
 - **Thinking UI**: Streams model output and parses `<think>...</think>` to show a separate thinking panel.
 - **Inline Artifacts**: Assistant can return `<artifact type="html">...</artifact>` blocks that render live in chat bubbles via `WKWebView`. And you can edit code in Artifact with updated preview.
 - **Tools (optional network)**:
@@ -60,8 +63,9 @@ SwiftUI + MVVM with a small service layer:
   - ranks recall/context with temporal U-shape weighting (recency + deep-age revival),
   - uses power-law activation decay in the echo graph (instead of plain exponential),
   - applies associative-link immunity to highly connected nodes during decay,
-  - keeps an accumulated prediction-error signal so surprising/corrected memories decay and prune more slowly,
-  - uses a novelty-adaptive context gate (opens on novel turns, narrows on routine turns),
+  - keeps an accumulated prediction-error signal and raises importance on mismatch,
+  - runs idle “rest” consolidation that merges highly similar traces into compact abstractions,
+  - uses a novelty-adaptive context gate to pre-filter low-activation/low-relevance memories before `getContextBlock()`,
   - applies slow identity-node decay with restoration-by-repetition (persistent, not frozen),
   - runs echo/spontaneous loops,
   - produces the `getContextBlock()` injected into the LLM prompt.

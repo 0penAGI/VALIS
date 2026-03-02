@@ -150,6 +150,10 @@ class MemoryService: ObservableObject {
     private let temporalAgeOnset: TimeInterval = 60 * 60 * 24 * 18
     private let temporalAgeSlope: TimeInterval = 60 * 60 * 24 * 6
     private var lastAccessSaveAt: Date?
+    private var lastUserSignalAt: Date = Date()
+    private var lastRestConsolidationAt: Date?
+    private let restIdleThreshold: TimeInterval = 180
+    private let restConsolidationInterval: TimeInterval = 600
     
     init() {
         let detected = MemoryProfile.detect()
@@ -384,6 +388,7 @@ class MemoryService: ObservableObject {
 
     func applyReinforcement(fromUserText text: String) {
         guard !memories.isEmpty else { return }
+        markUserSignal()
         let emotion = detectEmotion(from: text)
         let delta: Double
         switch emotion.label {
@@ -422,13 +427,20 @@ class MemoryService: ObservableObject {
 
     func applyPredictionFeedback(fromUserText text: String) {
         guard !memories.isEmpty else { return }
+        markUserSignal()
         let lastIndex = memories.indices.last!
         let m = memories[lastIndex]
         let userEmbedding = generateEmbedding(from: text)
         let score = cosineSimilarity(a: m.embedding, b: userEmbedding)
         let instantaneousError = max(0.0, 1.0 - score)
-        let accumulatedError = min(2.5, (m.predictionError * 0.88) + instantaneousError)
-        let adjustedImportance = max(0.1, min(2.5, m.importance + (score - 0.5) * 0.1))
+        let accumulatedError = min(2.5, (m.predictionError * 0.9) + (instantaneousError * 1.1))
+        let errorBoost = instantaneousError * 0.22
+        let alignmentBoost = max(0.0, score - 0.75) * 0.04
+        let confidencePenalty = score > 0.92 ? 0.03 : 0.0
+        let adjustedImportance = max(
+            0.1,
+            min(2.5, m.importance + errorBoost + alignmentBoost - confidencePenalty)
+        )
 
         memories[lastIndex] = Memory(
             id: m.id,
@@ -641,6 +653,7 @@ class MemoryService: ObservableObject {
                     await self.autonomousConsolidateIfIdle()
                 }
                 await MainActor.run {
+                    self.runRestConsolidationIfNeeded()
                     self.pruneMemoriesIfNeeded()
                 }
             }
@@ -739,33 +752,48 @@ class MemoryService: ObservableObject {
         let fieldLine = formatFieldVector(field, targetCount: 10)
 
         let activationLevel = echoGraph.averageActivation(excludingPersistent: true)
-        let dynamicThreshold = dynamicContextGateThreshold()
-        let includeText = activationLevel >= dynamicThreshold
+        let novelty = recentNoveltySignal(window: noveltyWindowSize)
+        let dynamicThreshold = dynamicContextGateThreshold(novelty: novelty)
 
         let recent = memories.sorted { $0.timestamp > $1.timestamp }
         let affectSample = Array(recent.prefix(8))
         let avgValence = affectSample.map { $0.emotionValence }.reduce(0.0, +) / Double(max(1, affectSample.count))
         let avgIntensity = affectSample.map { $0.emotionIntensity }.reduce(0.0, +) / Double(max(1, affectSample.count))
 
-        let layerNodes = echoGraph.topNodes(limit: 3, minActivation: 0.8)
+        let layerNodes = memories
+            .compactMap { mem -> (memory: Memory, activation: Double, score: Double)? in
+                let activation = echoGraph.activation(for: mem.id)
+                guard contextGatePass(
+                    memory: mem,
+                    activation: activation,
+                    field: field,
+                    dynamicThreshold: dynamicThreshold,
+                    novelty: novelty
+                ) else {
+                    return nil
+                }
+                let score = relevanceScore(for: mem, field: field, now: now)
+                return (mem, activation, score)
+            }
+            .sorted { $0.score > $1.score }
+            .prefix(3)
         var nodeLines: [String] = []
         var nodeIds: [UUID] = []
 
         for node in layerNodes {
-            guard let mem = memories.first(where: { $0.id == node.id }) else { continue }
-            let timeWeight = timeWeight(for: mem, now: now)
-            let line = "N: a=\(fmt(node.activation)), i=\(fmt(node.importance)), t=\(fmt(timeWeight))"
+            let timeWeight = timeWeight(for: node.memory, now: now)
+            let line = "N: a=\(fmt(node.activation)), i=\(fmt(node.memory.importance)), t=\(fmt(timeWeight))"
             nodeLines.append(line)
-            nodeIds.append(node.id)
+            nodeIds.append(node.memory.id)
         }
 
         recordAccess(for: nodeIds)
 
         let topText: String? = {
+            guard let top = layerNodes.first else { return nil }
+            let includeText = activationLevel >= dynamicThreshold || novelty > 0.7
             guard includeText else { return nil }
-            guard let top = layerNodes.first,
-                  let mem = memories.first(where: { $0.id == top.id }) else { return nil }
-            let compressed = compressMemory(mem.content, maxWords: 18)
+            let compressed = compressMemory(top.memory.content, maxWords: 18)
             return compressed.isEmpty ? nil : "T: \(compressed)"
         }()
 
@@ -776,7 +804,7 @@ class MemoryService: ObservableObject {
         if !fieldLine.isEmpty {
             parts.append("F: \(fieldLine)")
         }
-        parts.append("A: mean=\(fmt(meanActivation)), gate=\(fmt(dynamicThreshold))")
+        parts.append("A: mean=\(fmt(meanActivation)), gate=\(fmt(dynamicThreshold)), nov=\(fmt(novelty))")
         parts.append("E: v=\(fmt(avgValence)), i=\(fmt(avgIntensity))")
 
         if !nodeLines.isEmpty {
@@ -1076,6 +1104,7 @@ class MemoryService: ObservableObject {
 
     func updateConversationSummary(fromUserText text: String) {
         Task { @MainActor in
+            self.markUserSignal()
             let compressed = compressMemory(text, maxWords: 18)
             let next = conversationSummary.isEmpty
                 ? "U: \(compressed)"
@@ -1086,6 +1115,7 @@ class MemoryService: ObservableObject {
 
     func updateUserProfile(fromUserText text: String) {
         Task { @MainActor in
+            self.markUserSignal()
             let tokens = extractConcepts(from: text)
             userProfile.update(with: tokens)
         }
@@ -1230,6 +1260,90 @@ class MemoryService: ObservableObject {
         }
     }
 
+    private func runRestConsolidationIfNeeded() {
+        let now = Date()
+        guard now.timeIntervalSince(lastUserSignalAt) >= restIdleThreshold else { return }
+        if let last = lastRestConsolidationAt,
+           now.timeIntervalSince(last) < restConsolidationInterval {
+            return
+        }
+
+        let candidates = memories
+            .filter { !$0.isIdentity && !$0.isPinned }
+            .filter { !$0.embedding.isEmpty && $0.content.count >= 24 }
+            .sorted { $0.timestamp > $1.timestamp }
+        guard candidates.count >= 4 else { return }
+
+        let window = Array(candidates.prefix(72))
+        var bestPair: (Memory, Memory, Double)?
+
+        for i in 0..<window.count {
+            for j in (i + 1)..<window.count {
+                let lhs = window[i]
+                let rhs = window[j]
+                guard lhs.embedding.count == rhs.embedding.count else { continue }
+
+                let similarity = cosineSimilarity(a: lhs.embedding, b: rhs.embedding)
+                guard similarity >= 0.9 else { continue }
+
+                let lhsConcepts = Set(extractConcepts(from: lhs.content))
+                let rhsConcepts = Set(extractConcepts(from: rhs.content))
+                let overlap = lhsConcepts.intersection(rhsConcepts).count
+                guard overlap >= 2 else { continue }
+
+                if let current = bestPair {
+                    if similarity > current.2 {
+                        bestPair = (lhs, rhs, similarity)
+                    }
+                } else {
+                    bestPair = (lhs, rhs, similarity)
+                }
+            }
+        }
+
+        guard let pair = bestPair else { return }
+        guard let abstraction = buildRestAbstraction(from: pair.0, and: pair.1) else { return }
+        if memories.contains(where: { $0.content == abstraction }) { return }
+
+        let consolidatedImportance = min(2.0, ((pair.0.importance + pair.1.importance) * 0.5) + 0.15)
+        let consolidated = buildCognitiveLayer(
+            for: abstraction,
+            importanceOverride: consolidatedImportance,
+            isReflection: true,
+            perspective: "meta"
+        )
+        memories.append(consolidated)
+
+        for id in [pair.0.id, pair.1.id] {
+            if let idx = memories.firstIndex(where: { $0.id == id }) {
+                let m = memories[idx]
+                let decayedImportance = max(0.4, m.importance * 0.92)
+                memories[idx] = Memory(
+                    id: m.id,
+                    content: m.content,
+                    timestamp: m.timestamp,
+                    emotion: m.emotion,
+                    emotionValence: m.emotionValence,
+                    emotionIntensity: m.emotionIntensity,
+                    embedding: m.embedding,
+                    links: m.links,
+                    importance: decayedImportance,
+                    predictionScore: m.predictionScore,
+                    predictionError: m.predictionError,
+                    isIdentity: m.isIdentity,
+                    isPinned: m.isPinned,
+                    lastAccess: m.lastAccess,
+                    isSelfReflection: m.isSelfReflection,
+                    perspective: m.perspective
+                )
+            }
+        }
+
+        saveMemories()
+        rebuildGraph()
+        lastRestConsolidationAt = now
+    }
+
     func ingestExternalSnippets(_ snippets: [String], source: String, query: String, maxCount: Int = 2) {
         let cleaned = snippets
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -1288,6 +1402,10 @@ class MemoryService: ObservableObject {
 
     private func dynamicContextGateThreshold() -> Double {
         let novelty = recentNoveltySignal(window: noveltyWindowSize)
+        return dynamicContextGateThreshold(novelty: novelty)
+    }
+
+    private func dynamicContextGateThreshold(novelty: Double) -> Double {
         let routineBoost = (1.0 - novelty) * 0.08
         let noveltyDrop = novelty * 0.12
         return max(0.12, min(0.42, contextGateThreshold + routineBoost - noveltyDrop))
@@ -1318,6 +1436,48 @@ class MemoryService: ObservableObject {
     private func applyIdentityRestorationIfNeeded(from memory: Memory) {
         guard isIdentityAdjacent(memory.content), !memory.embedding.isEmpty else { return }
         echoGraph.reinforcePersistentNeighbors(embedding: memory.embedding, strength: 0.2)
+    }
+
+    private func contextGatePass(
+        memory: Memory,
+        activation: Double,
+        field: [Double],
+        dynamicThreshold: Double,
+        novelty: Double
+    ) -> Bool {
+        if memory.isIdentity || memory.isPinned {
+            return true
+        }
+
+        var semanticBoost = 0.0
+        if !field.isEmpty,
+           !memory.embedding.isEmpty,
+           field.count == memory.embedding.count {
+            semanticBoost = max(0.0, cosineSimilarity(a: memory.embedding, b: field)) * 0.2
+        }
+        let surpriseBoost = surpriseRetention(for: memory) * 0.08
+        let noveltyRelief = novelty * 0.05
+        let threshold = max(0.1, dynamicThreshold - noveltyRelief)
+
+        return (activation + semanticBoost + surpriseBoost) >= threshold
+    }
+
+    private func buildRestAbstraction(from lhs: Memory, and rhs: Memory) -> String? {
+        let lhsConcepts = Set(extractConcepts(from: lhs.content))
+        let rhsConcepts = Set(extractConcepts(from: rhs.content))
+        let shared = Array(lhsConcepts.intersection(rhsConcepts)).sorted()
+        guard shared.count >= 2 else { return nil }
+
+        let topicLine = shared.prefix(6).joined(separator: ", ")
+        let lhsCompressed = compressMemory(lhs.content, maxWords: 14)
+        let rhsCompressed = compressMemory(rhs.content, maxWords: 14)
+        guard !lhsCompressed.isEmpty, !rhsCompressed.isEmpty else { return nil }
+
+        return "[rest-consolidated] pattern=\(topicLine)\nA: \(lhsCompressed)\nB: \(rhsCompressed)"
+    }
+
+    private func markUserSignal() {
+        lastUserSignalAt = Date()
     }
 
     private func isIdentityAdjacent(_ text: String) -> Bool {
