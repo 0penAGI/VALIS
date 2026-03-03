@@ -209,7 +209,9 @@ final class LLMService: ObservableObject {
                         maxTokens: maxTokens,
                         kvInjection: kvInjection,
                         sampling: sampling,
-                        shouldStop: { token.isCancelled },
+                        shouldStop: {
+                            token.isCancelled
+                        },
                         onToken: { chunk in
                             if token.isCancelled { return }
                             // High-performance streaming for A17 Pro

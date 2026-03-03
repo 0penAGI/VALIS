@@ -170,13 +170,9 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
     }
     
     func stopGeneration() {
-        generationTask?.cancel()
-        generationTask = nil
         llmService.cancelGeneration()
-        activeGenerationId = nil
-        isInteracting = false
-        currentThink = ""
-        currentThinkingMessageId = nil
+        // Do not clear generation state here: we need the running task to flush parser
+        // buffers and persist the partial answer instead of losing it on manual stop.
     }
     
     private func buildRecentDialogContext(maxTurns: Int = 6, maxCharsPerMessage: Int = 220) -> String {
@@ -805,10 +801,25 @@ private func cleanFinalAnswer(_ text: String) -> String {
 
 private func splitThinkIntoFinal(_ think: String) -> (think: String, final: String) {
     let trimmed = cleanFinalAnswer(think)
-    let sentences = trimmed
+    let rawSentences = trimmed
         .split(whereSeparator: { $0 == "." || $0 == "?" || $0 == "!" })
         .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
         .filter { !$0.isEmpty }
+
+    // If stream stopped mid-sentence, the last fragment is often broken ("Also, t").
+    let endsWithSentencePunctuation = trimmed.last.map { ".!?".contains($0) } ?? false
+    let sentences: [String]
+    if endsWithSentencePunctuation {
+        sentences = rawSentences
+    } else {
+        sentences = Array(rawSentences.dropLast())
+    }
+
+    if sentences.count >= 3 {
+        let finalTwo = Array(sentences.suffix(2)).joined(separator: ". ")
+        let rest = sentences.dropLast(2).joined(separator: ". ")
+        return (rest.trimmingCharacters(in: .whitespacesAndNewlines), cleanFinalAnswer(finalTwo))
+    }
 
     if sentences.count >= 2 {
         let finalSentence = sentences.last ?? ""
@@ -817,7 +828,11 @@ private func splitThinkIntoFinal(_ think: String) -> (think: String, final: Stri
     }
 
 
-    return ("", trimmed)
+    if let only = sentences.first {
+        return ("", cleanFinalAnswer(only))
+    }
+
+    return ("", cleanFinalAnswer(trimmed))
 }
 
 extension Notification.Name {

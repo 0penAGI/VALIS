@@ -7,6 +7,7 @@ struct ChatView: View {
     @State private var showSandwich: Bool = true
     @State private var sandwichHideTask: Task<Void, Never>?
     @FocusState private var isInputFocused: Bool
+    @Environment(\.colorScheme) private var colorScheme
     
     @State private var isRecording: Bool = false
     @State private var audioRecorder: AVAudioRecorder?
@@ -126,6 +127,7 @@ struct ChatView: View {
                         .textFieldStyle(.plain)
                         .lineLimit(1...5)
                         .disabled(viewModel.isInteracting || isRecording)
+                        .tint(colorScheme == .dark ? .white : .black)
 
                     if viewModel.inputText.isEmpty && !viewModel.isInteracting {
                         Button(action: {
