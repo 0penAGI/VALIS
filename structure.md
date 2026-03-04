@@ -51,6 +51,7 @@ These may exist locally for reference/experimentation. In this repo they are typ
     - injects `CodeCoachService` into both first-pass and tool-rerun prompts when coding intent is detected.
   - Memory + autonomy:
     - stores experiences and updates memory
+    - remembers latest HTML artifact and injects it for follow-up “improve/patch artifact” turns
     - listens to `.memoryTriggered` and can perform a spontaneous “learn” response when idle.
   - Speech:
     - speech-to-text transcription pipeline (SFSpeechRecognizer).
@@ -59,6 +60,9 @@ These may exist locally for reference/experimentation. In this repo they are typ
 
 - `ChatView.swift`: Main chat UI (messages + streaming output + input + mic recording).
   - Parses and renders inline `<artifact type="html">...</artifact>` blocks in assistant/user bubbles.
+  - Message context menus include:
+    - `Edit message` for user messages (then regenerate assistant response from that turn),
+    - `Regenerate` for assistant messages.
 - `ArtifactView.swift`: `WKWebView` wrapper used by chat bubbles to render HTML/CSS/JS artifacts.
 - `SettingsView.swift`: Persona prompt editor + navigation to Memories; presented as a translucent sheet over chat.
 - `MemoryListView.swift`: Memory management UI (pin/unpin/delete/edit, clear confirmations).
@@ -91,7 +95,10 @@ These may exist locally for reference/experimentation. In this repo they are typ
   - Provides pruning, activation/decay, and a context block generator.
 - `ActionService.swift`: Tool/action runtime.
   - Parses model-initiated `TOOL:` / `ACTION:` lines.
-  - Executes rule-based signals (Date / DuckDuckGo / Reddit) and user-visible actions (`open_url`, `calendar` open/create/list).
+  - Executes rule-based signals (Date / DuckDuckGo / Reddit / URL analysis) and user-visible actions (`open_url`, `calendar` open/create/list).
+  - Supports URL analysis tool:
+    - `TOOL: analyze_url | url=https://...`
+    - automatic link detection in user prompt with page summary injection.
   - Provides autonomous DDG/Wikipedia enrichment for spontaneous memory-triggered runs.
 - `CodeCoachService.swift`: Coding-quality meta-layer.
   - Activates on code/debug/refactor/test prompts.
@@ -125,7 +132,7 @@ These may exist locally for reference/experimentation. In this repo they are typ
 
 ### Tools
 
-- Rule-based: Date / DuckDuckGo summaries / Reddit news, based on prompt triggers.
+- Rule-based: Date / DuckDuckGo summaries / Reddit news / URL analysis (when links are present), based on prompt triggers.
 - Model-initiated: `TOOL:`/`ACTION:` lines inside `<think>` trigger `ActionService` execution and a bounded re-generation loop.
 - Inline artifacts: assistant may embed `<artifact type="html" title="...">...</artifact>` in final response; chat UI extracts and renders it as a live web artifact.
 

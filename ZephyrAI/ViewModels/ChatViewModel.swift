@@ -13,6 +13,7 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
     @Published var status: String = "Starting Models"
     @Published var currentThink: String = ""
     @Published var currentThinkingMessageId: UUID?
+    @Published var editingUserMessageId: UUID?
     private var hasUserInteracted: Bool = false
     
     private var generationTask: Task<Void, Never>?
@@ -35,10 +36,21 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
     private let emotionService = EmotionService.shared
     private var lastReflectionHash: Int?
     private var statusClearTask: Task<Void, Never>?
+    private let rememberedArtifactDefaultsKey = "chat.rememberedArtifact"
+    private let maxArtifactContextChars = 9_000
+    private var rememberedArtifact: RememberedArtifact?
+
+    private struct RememberedArtifact: Codable {
+        let type: String
+        let title: String?
+        let payload: String
+        let updatedAt: Date
+    }
 
     
     override init() {
         super.init()
+        loadRememberedArtifact()
         setup()
         observeMemoryTriggers()
         observeSiriPromptQueue()
@@ -311,6 +323,7 @@ Spontaneous flavor:
 
                 MarkdownRenderer.prewarmInline(finalText)
                 messages[index].content = finalText
+                rememberArtifactIfPresent(in: finalText)
                 storeInternalReflection(
                     userPrompt: prompt,
                     draft: finalText,
@@ -326,6 +339,32 @@ Spontaneous flavor:
         }
     }
 
+    func beginEditingUserMessage(_ id: UUID) {
+        guard let message = messages.first(where: { $0.id == id && $0.role == .user }) else { return }
+        editingUserMessageId = id
+        inputText = message.content
+    }
+
+    func cancelEditingUserMessage() {
+        editingUserMessageId = nil
+    }
+
+    func regenerateAssistantResponse(for assistantMessageId: UUID) {
+        guard !isInteracting else { return }
+        guard let assistantIndex = messages.firstIndex(where: { $0.id == assistantMessageId && $0.role == .assistant }) else { return }
+        guard let userIndex = messages[..<assistantIndex].lastIndex(where: { $0.role == .user }) else { return }
+
+        let userMessage = messages[userIndex]
+        if assistantIndex < messages.count {
+            messages.removeSubrange(assistantIndex..<messages.count)
+        }
+
+        inputText = ""
+        editingUserMessageId = nil
+        prepareForNewGeneration()
+        startAssistantGeneration(prompt: userMessage.content, userMessageId: userMessage.id)
+    }
+
     func sendMessage() {
         let cleaned = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -336,23 +375,41 @@ Spontaneous flavor:
             emotionService.updateForReaction(valence: valence)
         }
         hasUserInteracted = true
-        
+        prepareForNewGeneration()
+
+        MarkdownRenderer.prewarmInline(cleaned)
+        let prompt = cleaned
+        inputText = ""
+        if let editingId = editingUserMessageId,
+           let userIndex = messages.firstIndex(where: { $0.id == editingId && $0.role == .user }) {
+            messages[userIndex].content = cleaned
+            if userIndex + 1 < messages.count {
+                messages.removeSubrange((userIndex + 1)..<messages.count)
+            }
+            editingUserMessageId = nil
+            startAssistantGeneration(prompt: prompt, userMessageId: editingId)
+            return
+        }
+
+        let userMessage = Message(role: .user, content: cleaned)
+        messages.append(userMessage)
+        startAssistantGeneration(prompt: prompt, userMessageId: userMessage.id)
+    }
+
+    private func prepareForNewGeneration() {
         generationTask?.cancel()
         generationTask = nil
         llmService.cancelGeneration()
         activeGenerationId = nil
-        
-        MarkdownRenderer.prewarmInline(cleaned)
-        let userMessage = Message(role: .user, content: cleaned)
-        messages.append(userMessage)
-        let userMessageId = userMessage.id
-        let prompt = cleaned
-        inputText = ""
-        
+        currentThink = ""
+        currentThinkingMessageId = nil
+    }
+
+    private func startAssistantGeneration(prompt: String, userMessageId: UUID) {
         isInteracting = true
         let generationId = UUID()
         activeGenerationId = generationId
-        
+
         generationTask = Task { [generationId] in
             memoryService.updateConversationSummary(fromUserText: prompt)
             memoryService.updateUserProfile(fromUserText: prompt)
@@ -371,14 +428,15 @@ Spontaneous flavor:
             let detailBlock = "\nResponse Detail: \(detail.rawValue)\n"
             let codeCoachContext = codeCoachService.contextBlock(for: prompt, detail: detail)
             let spiceBlock = randomSpiceBlock(for: prompt)
+            let artifactContinuationBlock = buildArtifactContinuationBlock(for: prompt)
             let toolGuidance = actionService.buildToolGuidanceBlock(hasTools: !toolContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            let systemPrompt = identityService.systemPrompt + identityProfileContext + emotionContext + memoryContext + dialogContext + toolGuidance + toolContext + experienceContext + motivationContext + codeCoachContext + detailBlock + spiceBlock
-            // 2. Generate response
+            let systemPrompt = identityService.systemPrompt + identityProfileContext + emotionContext + memoryContext + dialogContext + toolGuidance + toolContext + experienceContext + motivationContext + codeCoachContext + artifactContinuationBlock + detailBlock + spiceBlock
+
             let assistantMessageId = UUID()
             messages.append(Message(id: assistantMessageId, role: .assistant, content: "", thinkContent: ""))
             currentThinkingMessageId = assistantMessageId
             currentThink = ""
-            
+
             var parser = ThinkStreamParser()
             var visibleBuffer = ""
             let stream = await llmService.generate(userPrompt: prompt, systemPrompt: systemPrompt)
@@ -406,10 +464,7 @@ Spontaneous flavor:
                     }
                 }
             }
-            
-            // 3. Update memory (optional - auto-save conversation?)
-            // memoryService.addMemory("Conversation: \(prompt) -> Response")
-            
+
             guard activeGenerationId == generationId else { return }
 
             if let index = messages.firstIndex(where: { $0.id == assistantMessageId }) {
@@ -457,7 +512,6 @@ Spontaneous flavor:
                     let toolContextFromCall = await self.actionService.context(for: toolCall)
                     if toolContextFromCall.isEmpty { break }
 
-                    // Side-effect actions should return immediately to avoid long re-generation loops.
                     if immediateActionTools.contains(toolCall.name) {
                         currentFinalText = extractToolUserMessage(from: toolContextFromCall, fallback: currentFinalText)
                         break
@@ -465,7 +519,7 @@ Spontaneous flavor:
 
                     accumulatedToolContext += "\n" + toolContextFromCall
                     let rerunGuidance = self.actionService.buildToolGuidanceBlock(hasTools: !accumulatedToolContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                    let rerunPrompt = identityService.systemPrompt + identityProfileContext + emotionContext + memoryContext + dialogContext + rerunGuidance + accumulatedToolContext + experienceContext + motivationContext + codeCoachContext + detailBlock + spiceBlock
+                    let rerunPrompt = identityService.systemPrompt + identityProfileContext + emotionContext + memoryContext + dialogContext + rerunGuidance + accumulatedToolContext + experienceContext + motivationContext + codeCoachContext + artifactContinuationBlock + detailBlock + spiceBlock
                     let rerunOutput = await llmService.generateText(userPrompt: prompt, systemPrompt: rerunPrompt)
 
                     var rerunParser = ThinkStreamParser()
@@ -493,6 +547,7 @@ Spontaneous flavor:
 
                 MarkdownRenderer.prewarmInline(finalText)
                 messages[index].content = finalText
+                rememberArtifactIfPresent(in: finalText)
                 emotionService.updateForAssistantResponse(finalText)
                 storeInternalReflection(
                     userPrompt: prompt,
@@ -592,6 +647,128 @@ Spontaneous flavor:
         if longEnough { return true }
 
         return false
+    }
+
+    private func loadRememberedArtifact() {
+        guard let data = UserDefaults.standard.data(forKey: rememberedArtifactDefaultsKey) else { return }
+        guard let decoded = try? JSONDecoder().decode(RememberedArtifact.self, from: data) else { return }
+        rememberedArtifact = decoded
+    }
+
+    private func persistRememberedArtifact() {
+        if let rememberedArtifact,
+           let data = try? JSONEncoder().encode(rememberedArtifact) {
+            UserDefaults.standard.set(data, forKey: rememberedArtifactDefaultsKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: rememberedArtifactDefaultsKey)
+        }
+    }
+
+    private func rememberArtifactIfPresent(in text: String) {
+        guard let artifact = extractLastHTMLArtifact(from: text) else { return }
+        rememberedArtifact = artifact
+        persistRememberedArtifact()
+    }
+
+    private func buildArtifactContinuationBlock(for prompt: String) -> String {
+        guard shouldUseArtifactContinuation(for: prompt),
+              let artifact = rememberedArtifact else { return "" }
+
+        var payload = artifact.payload
+        if payload.count > maxArtifactContextChars {
+            payload = String(payload.prefix(maxArtifactContextChars))
+        }
+
+        let title = artifact.title?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let safeTitle = (title?.isEmpty == false) ? title! : "Untitled"
+
+        return """
+
+Artifact continuation memory:
+The user might be asking to improve an existing artifact.
+If so, patch and evolve this existing artifact instead of starting from scratch.
+Preserve what already works and change only what the user asked.
+Return one complete artifact block:
+<artifact type="html" title="...">
+...
+</artifact>
+
+Previous artifact title: \(safeTitle)
+Previous artifact code:
+```html
+\(payload)
+```
+
+"""
+    }
+
+    private func shouldUseArtifactContinuation(for prompt: String) -> Bool {
+        guard rememberedArtifact != nil else { return false }
+
+        let lower = prompt.lowercased()
+        let artifactSignals = [
+            "artifact", "артефакт", "html", "css", "javascript", "js",
+            "веб", "web", "сайт", "страниц", "лендинг", "ui", "интерфейс"
+        ]
+        let revisionSignals = [
+            "improve", "enhance", "refine", "update", "modify", "edit", "iterate", "revise", "patch", "fix",
+            "улучш", "доработ", "исправ", "обнов", "передел", "подправ", "измени", "добав", "оптимиз", "адаптив"
+        ]
+        let referenceSignals = ["it", "this", "that", "его", "её", "ее", "эту", "этот", "это", "тот", "ту"]
+
+        let hasArtifactSignal = artifactSignals.contains { lower.contains($0) }
+        let hasRevisionSignal = revisionSignals.contains { lower.contains($0) }
+        let hasReferenceSignal = referenceSignals.contains { lower.contains($0) }
+
+        if hasArtifactSignal || hasRevisionSignal { return true }
+        if hasReferenceSignal && prompt.count <= 140 { return true }
+        return false
+    }
+
+    private func extractLastHTMLArtifact(from text: String) -> RememberedArtifact? {
+        let pattern = "(?is)<artifact\\b([^>]*)>(.*?)</artifact>"
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let nsRange = NSRange(text.startIndex..<text.endIndex, in: text)
+        let matches = regex.matches(in: text, range: nsRange)
+        guard let match = matches.last,
+              let attrsRange = Range(match.range(at: 1), in: text),
+              let payloadRange = Range(match.range(at: 2), in: text) else { return nil }
+
+        let attrs = parseArtifactAttributes(String(text[attrsRange]))
+        let type = (attrs["type"] ?? "html").lowercased()
+        guard type == "html" else { return nil }
+
+        let payload = String(text[payloadRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !payload.isEmpty else { return nil }
+
+        let title = attrs["title"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return RememberedArtifact(type: type, title: title, payload: payload, updatedAt: Date())
+    }
+
+    private func parseArtifactAttributes(_ raw: String) -> [String: String] {
+        let pattern = #"([A-Za-z0-9_\-]+)\s*=\s*("([^"]*)"|'([^']*)')"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [:] }
+        let nsRange = NSRange(raw.startIndex..<raw.endIndex, in: raw)
+        let matches = regex.matches(in: raw, range: nsRange)
+        var out: [String: String] = [:]
+
+        for match in matches {
+            guard let keyRange = Range(match.range(at: 1), in: raw) else { continue }
+            let key = String(raw[keyRange]).lowercased()
+            let value: String
+            if let quoted = Range(match.range(at: 3), in: raw) {
+                value = String(raw[quoted])
+            } else if let singleQuoted = Range(match.range(at: 4), in: raw) {
+                value = String(raw[singleQuoted])
+            } else {
+                value = ""
+            }
+            if !key.isEmpty {
+                out[key] = value
+            }
+        }
+
+        return out
     }
 
     // MARK: - Audio Recording Delegate

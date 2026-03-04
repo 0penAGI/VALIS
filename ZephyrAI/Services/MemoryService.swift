@@ -661,32 +661,40 @@ class MemoryService: ObservableObject {
     }
     
     private func rebuildGraph() {
-        graph = MemoryGraph()
-        echoGraph = CognitiveEchoGraph()
+        var rebuiltGraph = MemoryGraph()
+        let rebuiltEchoGraph = CognitiveEchoGraph()
+
         for m in memories {
-            updateGraph(for: m)
-            echoGraph.register(memoryId: m.id, embedding: m.embedding, importance: m.importance, isPersistent: m.isIdentity)
+            updateGraph(&rebuiltGraph, for: m)
+            rebuiltEchoGraph.register(memoryId: m.id, embedding: m.embedding, importance: m.importance, isPersistent: m.isIdentity)
         }
+
+        graph = rebuiltGraph
+        echoGraph = rebuiltEchoGraph
         saveGraph()
         saveEchoGraph()
     }
     
     private func updateGraph(for memory: Memory) {
+        updateGraph(&graph, for: memory)
+    }
+
+    private func updateGraph(_ targetGraph: inout MemoryGraph, for memory: Memory) {
         let memId = "mem:\(memory.id.uuidString)"
-        graph.ensureNode(id: memId, type: .memory, label: String(memory.content.prefix(120)))
+        targetGraph.ensureNode(id: memId, type: .memory, label: String(memory.content.prefix(120)))
         let concepts = extractConcepts(from: memory.content)
         for c in concepts {
             let cid = "concept:\(c)"
-            graph.ensureNode(id: cid, type: .concept, label: c)
-            graph.link(from: memId, to: cid, weight: 1.0)
+            targetGraph.ensureNode(id: cid, type: .concept, label: c)
+            targetGraph.link(from: memId, to: cid, weight: 1.0)
         }
         let emoId = "emotion:\(memory.emotion)"
-        graph.ensureNode(id: emoId, type: .emotion, label: memory.emotion)
-        graph.link(from: memId, to: emoId, weight: 1.0)
+        targetGraph.ensureNode(id: emoId, type: .emotion, label: memory.emotion)
+        targetGraph.link(from: memId, to: emoId, weight: 1.0)
         for linked in memory.links {
             let lid = "mem:\(linked.uuidString)"
-            graph.ensureNode(id: lid, type: .memory, label: lid)
-            graph.link(from: memId, to: lid, weight: 0.9)
+            targetGraph.ensureNode(id: lid, type: .memory, label: lid)
+            targetGraph.link(from: memId, to: lid, weight: 0.9)
         }
     }
     
@@ -708,10 +716,11 @@ class MemoryService: ObservableObject {
     private func seedEchoGraphIfNeeded() {
         let hasAnyMemoryNodes = memories.contains { echoGraph.hasNode($0.id) }
         if echoGraph.isEmpty || !hasAnyMemoryNodes {
-            echoGraph = CognitiveEchoGraph()
+            let rebuiltEchoGraph = CognitiveEchoGraph()
             for m in memories {
-                echoGraph.register(memoryId: m.id, embedding: m.embedding, importance: m.importance, isPersistent: m.isIdentity)
+                rebuiltEchoGraph.register(memoryId: m.id, embedding: m.embedding, importance: m.importance, isPersistent: m.isIdentity)
             }
+            echoGraph = rebuiltEchoGraph
             saveEchoGraph()
         }
     }

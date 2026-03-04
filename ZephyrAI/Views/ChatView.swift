@@ -27,13 +27,20 @@ struct ChatView: View {
                             MessageView(
                                 message: message,
                                 isThinkingForMessage: viewModel.isInteracting && viewModel.currentThinkingMessageId == message.id,
-                                currentThink: viewModel.currentThink
+                                currentThink: viewModel.currentThink,
+                                onEditUserMessage: { id in
+                                    viewModel.beginEditingUserMessage(id)
+                                    isInputFocused = true
+                                },
+                                onRegenerateAssistantMessage: { id in
+                                    viewModel.regenerateAssistantResponse(for: id)
+                                }
                             )
                                 .id(message.id)
                         }
                     }
                     .padding()
-                    .padding(.top, 56)
+                    .padding(.top, 58)
                 }
                 .scrollDismissesKeyboard(.interactively)
                 .onChange(of: viewModel.messages.last?.content) { _, _ in
@@ -66,7 +73,7 @@ struct ChatView: View {
             }
 
             SoftBarBlurBackground(position: .top)
-                .frame(height: 170)
+                .frame(height: 188)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                 .offset(y: -18)
                 .ignoresSafeArea(edges: .top)
@@ -83,14 +90,14 @@ struct ChatView: View {
 
                     // Title center
                     Text("V A L I S")
-                        .font(.system(size: 16, weight: .medium))
+                        .font(.system(size: 17, weight: .medium))
 
                     // Right side (status + sandwich)
-                    HStack(spacing: 8) {
+                    HStack(spacing: 9) {
                         Spacer()
 
                         Text(viewModel.status)
-                            .font(.system(size: 9, weight: .medium))
+                            .font(.system(size: 8, weight: .medium))
                             .foregroundColor(.secondary)
                             .lineLimit(1)
                             .truncationMode(.tail)
@@ -121,12 +128,38 @@ struct ChatView: View {
         }
         .safeAreaInset(edge: .bottom) {
             VStack(spacing: 0) {
+                if let editingId = viewModel.editingUserMessageId,
+                   let message = viewModel.messages.first(where: { $0.id == editingId && $0.role == .user }) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "pencil")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                        Text("Editing message: \(message.content)")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                        Spacer()
+                        Button {
+                            viewModel.cancelEditingUserMessage()
+                            viewModel.inputText = ""
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 11, weight: .bold))
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.bottom, 6)
+                }
+
                 HStack(alignment: .bottom) {
-                    TextField("Type a message...", text: $viewModel.inputText, axis: .vertical)
+                    TextField(viewModel.editingUserMessageId == nil ? "Type a message..." : "Edit message...", text: $viewModel.inputText, axis: .vertical)
                         .focused($isInputFocused)
                         .textFieldStyle(.plain)
                         .lineLimit(1...5)
-                        .disabled(viewModel.isInteracting || isRecording)
+                        .disabled(isRecording)
                         .tint(colorScheme == .dark ? .white : .black)
 
                     if viewModel.inputText.isEmpty && !viewModel.isInteracting {
@@ -164,6 +197,7 @@ struct ChatView: View {
                             if viewModel.isInteracting {
                                 viewModel.stopGeneration()
                             } else {
+                                isInputFocused = false
                                 viewModel.sendMessage()
                             }
                         }) {
@@ -237,7 +271,7 @@ struct ChatView: View {
             }
             .background(alignment: .bottom) {
                 SoftBarBlurBackground(position: .bottom)
-                    .frame(height: 153 + max(0, inputBarHeight - baselineInputBarHeight))
+                    .frame(height: 160 + max(0, inputBarHeight - baselineInputBarHeight))
                     .offset(y: 42)
                     .ignoresSafeArea(edges: .bottom)
                     .allowsHitTesting(false)
@@ -245,13 +279,8 @@ struct ChatView: View {
         }
         // .ignoresSafeArea(.keyboard, edges: .bottom)
         .onChange(of: viewModel.isInteracting) { _, newValue in
-            if newValue {
-                isInputFocused = false
-                restartSandwichTimer()
-            } else {
-                isInputFocused = false
-                restartSandwichTimer()
-            }
+            _ = newValue
+            restartSandwichTimer()
         }
         .navigationBarHidden(true)
         .sheet(isPresented: $showSettings) {
@@ -505,7 +534,7 @@ struct TypingIndicatorView: View {
         .onDisappear {
             animate = false
         }
-        .accessibilityLabel("Generating response")
+        .accessibilityLabel("Generating respo nse")
     }
 
     private func dot(delay: Double) -> some View {
@@ -527,6 +556,8 @@ struct MessageView: View {
     let message: Message
     let isThinkingForMessage: Bool
     let currentThink: String
+    let onEditUserMessage: (UUID) -> Void
+    let onRegenerateAssistantMessage: (UUID) -> Void
     
     private let speech = SpeechService.shared
     private let experienceService = ExperienceService.shared
@@ -567,7 +598,18 @@ struct MessageView: View {
     
     private func md(_ s: String) -> some View {
         let base: Text
-        if let a = MarkdownRenderer.renderInline(s) {
+
+        if var a = MarkdownRenderer.renderInline(s) {
+
+            // Rewrite link styling to avoid default blue tint
+            for run in a.runs {
+                if run.link != nil {
+                    a[run.range].foregroundColor = .primary
+                    a[run.range].underlineStyle = .single
+                    a[run.range].underlineColor = UIColor.label.withAlphaComponent(0.6)
+                }
+            }
+
             base = Text(a)
         } else {
             base = Text(s)
@@ -828,6 +870,12 @@ struct MessageView: View {
                     .foregroundColor(.primary)
                     .contextMenu {
                         Button(action: {
+                            onEditUserMessage(message.id)
+                        }) {
+                            Text("Edit message")
+                            Image(systemName: "pencil")
+                        }
+                        Button(action: {
                             UIPasteboard.general.string = message.content
                         }) {
                             Text("Copy")
@@ -902,6 +950,12 @@ struct MessageView: View {
                                 .opacity(message.content.isEmpty ? 0.01 : 1.0)
                                 .animation(.easeOut(duration: 0.2), value: message.content)
                                 .contextMenu {
+                                    Button(action: {
+                                        onRegenerateAssistantMessage(message.id)
+                                    }) {
+                                        Text("Regenerate")
+                                        Image(systemName: "arrow.clockwise")
+                                    }
                                     Button(action: {
                                         UIPasteboard.general.string = message.content
                                     }) {

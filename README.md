@@ -17,9 +17,13 @@ VALIS is an on-device AI chat app for iOS built with SwiftUI and `llama.cpp` (GG
   - Novelty-adaptive context gate now filters memory candidates before prompt injection (not only a display metric).
 - **Thinking UI**: Streams model output and parses `<think>...</think>` to show a separate thinking panel.
 - **Inline Artifacts**: Assistant can return `<artifact type="html">...</artifact>` blocks that render live in chat bubbles via `WKWebView`. And you can edit code in Artifact with updated preview.
+- **Artifact continuity**: Latest generated HTML artifact is remembered and reused as a base when user asks to improve/patch it.
 - **Tools (optional network)**:
-  - Rule-based tool injection (Date, DuckDuckGo summaries, Reddit /r/news feed).
+  - Rule-based tool injection (Date, DuckDuckGo summaries, Reddit /r/news feed, URL content analysis for pasted links).
   - Model-initiated tools via `TOOL:` lines (app executes tools and re-runs generation with results).
+- **Chat iteration controls**:
+  - Edit already-sent user message from context menu, then regenerate assistant response from that turn.
+  - Regenerate assistant response from message context menu (`arrow.clockwise`).
 - **Autonomous memory consolidation** (optional network): when a memory becomes “charged”, background logic can fetch short Wikipedia/DuckDuckGo snippets and store them as memories.
 - **Experience & preferences**: Records experiences and learns preference signals from like/dislike or reaction text.
 - **Motivators**: Maintains a small dynamic state (curiosity/helpfulness/caution) used to guide tone.
@@ -45,8 +49,9 @@ SwiftUI + MVVM with a small service layer:
   - records experiences and updates memory.
 
 - `ActionService` handles external actions/signals:
-  - rule-based tool context injection (Date / Web / News),
+  - rule-based tool context injection (Date / Web / News / URL analysis),
   - model-initiated `TOOL:`/`ACTION:` parsing,
+  - tool execution (`web_search`, `analyze_url`, `reddit_news`, `date`),
   - action execution (`open_url`, `calendar` open/create/list),
   - autonomous web/wiki enrichment used by spontaneous memory triggers.
 
@@ -100,11 +105,13 @@ The app automatically injects tool context when the user prompt matches simple t
 - **Date**: for “today's date / какая сегодня дата”
 - **Web search**: DuckDuckGo Instant Answer summaries for “search / найди / кто такой / что такое”
 - **News**: Reddit `/r/news` JSON feed for “news / новости / что нового”
+- **URL analysis**: If prompt contains `http(s)` links, app fetches page content and injects a compact summary.
 
 ### Model-initiated tools (`TOOL:`)
 The model can request tools inside `<think>` like:
 - `TOOL: date`
 - `TOOL: web_search | query=...`
+- `TOOL: analyze_url | url=https://example.com/article`
 - `TOOL: reddit_news`
 - `ACTION: open_url | url=https://...`
 - `ACTION: calendar | op=open; date=2026-03-01T10:00:00Z`

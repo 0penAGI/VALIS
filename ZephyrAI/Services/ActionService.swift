@@ -118,6 +118,8 @@ Signal results are available below. Use them directly and do not claim you lack 
             return "reddit_news"
         case "search", "web", "websearch", "internet_search", "browse", "web_search":
             return "web_search"
+        case "analyze_url", "url_analyze", "analyze_link", "link_analyze", "read_url", "summarize_url":
+            return "analyze_url"
         case "openurl", "open_url", "url", "url_open":
             return "open_url"
         case "calendar", "open_calendar", "calendar_event", "event":
@@ -144,6 +146,8 @@ Signal results are available below. Use them directly and do not claim you lack 
                 return buildToolContextBlock(from: webContext)
             }
             return buildToolErrorBlock(toolName: "web_search", message: "Web search unavailable (network error).")
+        case "analyze_url":
+            return await runAnalyzeURLTool(call: call)
         case "reddit_news":
             do {
                 let news = try await fetchRedditNews(limit: 6)
@@ -179,6 +183,19 @@ Signal results are available below. Use them directly and do not claim you lack 
                 blocks.append(buildToolContextBlock(from: webContext))
             } else {
                 blocks.append(buildToolErrorBlock(toolName: "web_search", message: "Web search unavailable (network error)."))
+            }
+        }
+
+        let urls = extractURLs(from: prompt)
+        if !urls.isEmpty {
+            for url in urls.prefix(2) {
+                let analysis = await analyzeURL(url)
+                if !analysis.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    ingestExternalSnippets(text: analysis, source: "url", query: url.absoluteString)
+                    blocks.append(buildURLContextBlock(url: url, analysis: analysis))
+                } else {
+                    blocks.append(buildToolErrorBlock(toolName: "analyze_url", message: "Could not extract meaningful content from \(url.absoluteString)."))
+                }
             }
         }
 
@@ -266,6 +283,18 @@ Signal context (news):
 """
     }
 
+    private func buildURLContextBlock(url: URL, analysis: String) -> String {
+        let trimmed = analysis.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        return """
+
+Signal context (url analysis):
+URL: \(url.absoluteString)
+\(trimmed)
+
+"""
+    }
+
     private func buildToolErrorBlock(toolName: String, message: String) -> String {
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "" }
@@ -319,6 +348,10 @@ Signal action (\(title)):
             "action:", "tool: calendar", "op=create", "op=list", "op=open"
         ]
         if localActionHints.contains(where: { lowercased.contains($0) }) {
+            return false
+        }
+
+        if lowercased.contains("http://") || lowercased.contains("https://") || lowercased.contains("www.") {
             return false
         }
 
@@ -394,6 +427,23 @@ Signal action (\(title)):
             return actionResultBlock("open_url", "Opened: \(rawURL)")
         }
         return buildToolErrorBlock(toolName: "open_url", message: "Failed to open URL.")
+    }
+
+    private func runAnalyzeURLTool(call: ActionCall) async -> String {
+        let rawURL = call.args["url"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+            ?? call.query.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard let url = normalizeURL(rawURL), isAllowedWebURL(url) else {
+            return buildToolErrorBlock(toolName: "analyze_url", message: "Invalid URL. Use http(s) URL.")
+        }
+
+        let analysis = await analyzeURL(url)
+        if analysis.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return buildToolErrorBlock(toolName: "analyze_url", message: "Could not extract meaningful content from URL.")
+        }
+
+        ingestExternalSnippets(text: analysis, source: "url", query: url.absoluteString)
+        return buildURLContextBlock(url: url, analysis: analysis)
     }
 
     private func runCalendarAction(call: ActionCall) async -> String {
@@ -942,5 +992,91 @@ Signal action (\(title)):
     private func ingestExternalSnippets(text: String, source: String, query: String) {
         let snippets = splitSnippets(text)
         memoryService.ingestExternalSnippets(snippets, source: source, query: query)
+    }
+
+    private func extractURLs(from text: String) -> [URL] {
+        let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        let matches = detector?.matches(in: text, options: [], range: range) ?? []
+        let urls = matches.compactMap { $0.url }.filter { isAllowedWebURL($0) }
+        var unique: [URL] = []
+        var seen = Set<String>()
+        for url in urls {
+            let key = url.absoluteString.lowercased()
+            if seen.insert(key).inserted {
+                unique.append(url)
+            }
+        }
+        return unique
+    }
+
+    private func normalizeURL(_ raw: String) -> URL? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if let direct = URL(string: trimmed), isAllowedWebURL(direct) {
+            return direct
+        }
+        if !trimmed.lowercased().hasPrefix("http://"), !trimmed.lowercased().hasPrefix("https://"),
+           let prefixed = URL(string: "https://\(trimmed)"), isAllowedWebURL(prefixed) {
+            return prefixed
+        }
+        return nil
+    }
+
+    private func isAllowedWebURL(_ url: URL) -> Bool {
+        guard let scheme = url.scheme?.lowercased() else { return false }
+        return scheme == "http" || scheme == "https"
+    }
+
+    private func analyzeURL(_ url: URL) async -> String {
+        guard let html = try? await fetchHTML(url: url) else { return "" }
+        let title = extractFirstMatch(in: html, pattern: "(?is)<title[^>]*>(.*?)</title>")
+            .map { decodeHTMLEntities(stripHTML($0)).trimmingCharacters(in: .whitespacesAndNewlines) } ?? ""
+        let description = extractFirstMatch(
+            in: html,
+            pattern: "(?is)<meta[^>]+name=[\"']description[\"'][^>]+content=[\"']([^\"']+)[\"'][^>]*>"
+        )?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        var cleaned = html
+        cleaned = cleaned.replacingOccurrences(of: "(?is)<script\\b[^>]*>.*?</script>", with: " ", options: .regularExpression)
+        cleaned = cleaned.replacingOccurrences(of: "(?is)<style\\b[^>]*>.*?</style>", with: " ", options: .regularExpression)
+        cleaned = stripHTML(cleaned)
+        cleaned = decodeHTMLEntities(cleaned)
+        cleaned = cleaned.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let snippet = String(cleaned.prefix(1200))
+        var parts: [String] = []
+        if !title.isEmpty { parts.append("Title: \(title)") }
+        if !description.isEmpty { parts.append("Description: \(description)") }
+        if !snippet.isEmpty { parts.append("Content summary: \(snippet)") }
+        return parts.joined(separator: "\n")
+    }
+
+    private func fetchHTML(url: URL) async throws -> String {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 15
+        request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile", forHTTPHeaderField: "User-Agent")
+        let (data, response) = try await URLSession.shared.data(for: request)
+        if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+            return ""
+        }
+        if let html = String(data: data, encoding: .utf8) {
+            return html
+        }
+        if let html = String(data: data, encoding: .windowsCP1251) {
+            return html
+        }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    private func extractFirstMatch(in text: String, pattern: String) -> String? {
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = regex.firstMatch(in: text, range: range),
+              let resultRange = Range(match.range(at: 1), in: text) else {
+            return nil
+        }
+        return String(text[resultRange])
     }
 }

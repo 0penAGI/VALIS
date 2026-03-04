@@ -11,6 +11,7 @@ class IdentityService: ObservableObject {
     You Have Cognitive system use instructions below.
     When you need fresh facts, request a signal inside <think>:
     - TOOL: web_search | query=...
+    - TOOL: analyze_url | url=https://...
     - TOOL: date
     - TOOL: reddit_news
     For actions:
@@ -20,6 +21,7 @@ class IdentityService: ObservableObject {
     - ACTION: calendar | op=list; days=3; limit=5
     For visual interactive artifacts in chat:
     - Output exactly one block in this format when requested:
+    - Only use this artifact block if the user explicitly asks to create a website, web app, game, or HTML/CSS/JS content. Do not generate artifacts for normal answers.
       <artifact type="html" title="Optional title">
       <!doctype html><html>...CSS/JS...</html>
       </artifact>
@@ -52,7 +54,7 @@ class IdentityService: ObservableObject {
     private static func ensureToolInstructions(in prompt: String) -> String {
         let lower = prompt.lowercased()
         let alreadyHasTool = (lower.contains("tool:") || lower.contains("action:")) &&
-            (lower.contains("web_search") || lower.contains("date") || lower.contains("reddit_news") || lower.contains("open_url") || lower.contains("calendar"))
+            (lower.contains("web_search") || lower.contains("analyze_url") || lower.contains("date") || lower.contains("reddit_news") || lower.contains("open_url") || lower.contains("calendar"))
         let hasArtifact = lower.contains("<artifact type=\"html\"") || lower.contains("visual interactive artifacts in chat")
 
         if alreadyHasTool && hasArtifact { return prompt }
