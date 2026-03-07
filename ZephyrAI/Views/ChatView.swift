@@ -17,6 +17,9 @@ struct ChatView: View {
     @State private var meterTimer: Timer?
     @State private var inputBarHeight: CGFloat = 58
     private let baselineInputBarHeight: CGFloat = 58
+    @State private var isUserControllingScroll = false
+    @State private var autoScrollResumeTask: Task<Void, Never>?
+    private let autoScrollResumeDelayNs: UInt64 = 3_000_000_000
     
     var body: some View {
         ZStack {
@@ -44,12 +47,14 @@ struct ChatView: View {
                 }
                 .scrollDismissesKeyboard(.interactively)
                 .onChange(of: viewModel.messages.last?.content) { _, _ in
+                    guard !isUserControllingScroll else { return }
                     guard let lastId = viewModel.messages.last?.id else { return }
                     DispatchQueue.main.async {
                         proxy.scrollTo(lastId, anchor: .bottom)
                     }
                 }
                 .onChange(of: viewModel.currentThink) { _, _ in
+                    guard !isUserControllingScroll else { return }
                     guard let lastId = viewModel.messages.last?.id else { return }
                     DispatchQueue.main.async {
                         proxy.scrollTo(lastId, anchor: .bottom)
@@ -63,12 +68,31 @@ struct ChatView: View {
                         }
                     }
                 }
+                .onChange(of: isUserControllingScroll) { _, isControlling in
+                    guard !isControlling else { return }
+                    guard viewModel.isInteracting else { return }
+                    guard let lastId = viewModel.messages.last?.id else { return }
+                    DispatchQueue.main.async {
+                        withAnimation(.easeOut(duration: 0.25)) {
+                            proxy.scrollTo(lastId, anchor: .bottom)
+                        }
+                    }
+                }
                 .simultaneousGesture(
                     TapGesture().onEnded {
                         showSandwich = true
                         restartSandwichTimer()
                         UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
                     }
+                )
+                .simultaneousGesture(
+                    DragGesture(minimumDistance: 2)
+                        .onChanged { _ in
+                            registerUserScrollControl()
+                        }
+                        .onEnded { _ in
+                            registerUserScrollControl()
+                        }
                 )
             }
 
@@ -271,7 +295,7 @@ struct ChatView: View {
             }
             .background(alignment: .bottom) {
                 SoftBarBlurBackground(position: .bottom)
-                    .frame(height: 160 + max(0, inputBarHeight - baselineInputBarHeight))
+                    .frame(height: 145 + max(0, inputBarHeight - baselineInputBarHeight))
                     .offset(y: 42)
                     .ignoresSafeArea(edges: .bottom)
                     .allowsHitTesting(false)
@@ -289,6 +313,10 @@ struct ChatView: View {
         }
         .onAppear {
             restartSandwichTimer()
+        }
+        .onDisappear {
+            autoScrollResumeTask?.cancel()
+            autoScrollResumeTask = nil
         }
     }
     
@@ -404,6 +432,18 @@ struct ChatView: View {
         }
     }
 
+    private func registerUserScrollControl() {
+        isUserControllingScroll = true
+        autoScrollResumeTask?.cancel()
+        autoScrollResumeTask = Task {
+            try? await Task.sleep(nanoseconds: autoScrollResumeDelayNs)
+            if Task.isCancelled { return }
+            await MainActor.run {
+                isUserControllingScroll = false
+            }
+        }
+    }
+
 }
 
 struct ThinkingPanel: View {
@@ -411,12 +451,67 @@ struct ThinkingPanel: View {
     let isThinking: Bool
     @State private var isExpanded: Bool = false
     @State private var pulse = false
+    @State private var didEmitThoughtReadyHaptic = false
+    @State private var isUserControllingThoughtScroll = false
+    @State private var thoughtAutoScrollResumeTask: Task<Void, Never>?
+    private let thoughtAutoScrollResumeDelayNs: UInt64 = 3_000_000_000
+
+    private var hasThoughtText: Bool {
+        !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var statusLabel: String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = trimmed.lowercased()
+
+        if let toolName = detectedToolName(in: trimmed) {
+            return "Using tool: \(toolName)"
+        }
+        if lower.contains("code") || lower.contains("function") || lower.contains("bug") || lower.contains("refactor") {
+            return "Analyzing code"
+        }
+        if lower.contains("plan") || lower.contains("step") || lower.contains("approach") {
+            return "Planning steps"
+        }
+        if lower.contains("search") || lower.contains("lookup") || lower.contains("look up") || lower.contains("web") || lower.contains("research") {
+            return "Searching context"
+        }
+        if isThinking {
+            return trimmed.isEmpty ? "Thinking..." : "Reasoning..."
+        }
+        return "Thoughts"
+    }
+
+    private func detectedToolName(in source: String) -> String? {
+        guard !source.isEmpty else { return nil }
+        let pattern = #"(?i)(?:tool|action)\s*:\s*([^\n|,()]+)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let nsRange = NSRange(source.startIndex..<source.endIndex, in: source)
+        guard let match = regex.firstMatch(in: source, options: [], range: nsRange),
+              let rawRange = Range(match.range(at: 1), in: source) else {
+            return nil
+        }
+
+        let raw = source[rawRange].trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else { return nil }
+        let token = raw
+            .components(separatedBy: .whitespacesAndNewlines)
+            .first?
+            .replacingOccurrences(of: " ", with: "_")
+            .lowercased()
+        guard let token, !token.isEmpty else { return nil }
+        return token
+    }
     
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Button(action: { isExpanded.toggle() }) {
+            Button(action: {
+                guard hasThoughtText else { return }
+                playTapHaptic()
+                isExpanded.toggle()
+            }) {
                 HStack {
-                    Text("Through")
+                    Text(statusLabel)
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .scaleEffect(pulse ? 1.05 : 1.0)
@@ -428,13 +523,16 @@ struct ThinkingPanel: View {
                             value: pulse
                         )
                     Spacer()
-                    Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
-                        .font(.caption2)
-                        .foregroundColor(.secondary)
+                    if hasThoughtText {
+                        Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
                 }
             }
+            .buttonStyle(.plain)
             
-            if isExpanded {
+            if isExpanded && hasThoughtText {
                 ScrollViewReader { proxy in
                     ScrollView {
                         VStack(alignment: .leading, spacing: 0) {
@@ -447,8 +545,19 @@ struct ThinkingPanel: View {
                     }
                     .frame(maxHeight: 140)
                     .onChange(of: text) { _, _ in
+                        guard !isUserControllingThoughtScroll else { return }
                         DispatchQueue.main.async {
                             withAnimation(.easeOut(duration: 0.15)) {
+                                proxy.scrollTo("BOTTOM", anchor: .bottom)
+                            }
+                        }
+                    }
+                    .onChange(of: isUserControllingThoughtScroll) { _, isControlling in
+                        guard !isControlling else { return }
+                        guard isExpanded else { return }
+                        guard hasThoughtText else { return }
+                        DispatchQueue.main.async {
+                            withAnimation(.easeOut(duration: 0.2)) {
                                 proxy.scrollTo("BOTTOM", anchor: .bottom)
                             }
                         }
@@ -458,20 +567,74 @@ struct ThinkingPanel: View {
                             proxy.scrollTo("BOTTOM", anchor: .bottom)
                         }
                     }
+                    .simultaneousGesture(
+                        DragGesture(minimumDistance: 2)
+                            .onChanged { _ in
+                                registerThoughtScrollControl()
+                            }
+                            .onEnded { _ in
+                                registerThoughtScrollControl()
+                            }
+                    )
                 }
             }
         }
         .onAppear {
             pulse = isThinking
+            if !hasThoughtText {
+                isExpanded = false
+            }
         }
         .onDisappear {
             pulse = false
+            thoughtAutoScrollResumeTask?.cancel()
+            thoughtAutoScrollResumeTask = nil
         }
         .onChange(of: isThinking) { _, newValue in
             pulse = newValue
         }
+        .onChange(of: text) { _, newValue in
+            let hasTextNow = !newValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            if !hasTextNow {
+                isExpanded = false
+                didEmitThoughtReadyHaptic = false
+                return
+            }
+            if !didEmitThoughtReadyHaptic {
+                playThoughtReadyHaptic()
+                didEmitThoughtReadyHaptic = true
+            }
+        }
         .padding(8)
         .background(Color.clear)
+    }
+
+    private func playTapHaptic() {
+#if os(iOS)
+        let generator = UIImpactFeedbackGenerator(style: .soft)
+        generator.prepare()
+        generator.impactOccurred(intensity: 0.8)
+#endif
+    }
+
+    private func playThoughtReadyHaptic() {
+#if os(iOS)
+        let generator = UIImpactFeedbackGenerator(style: .rigid)
+        generator.prepare()
+        generator.impactOccurred(intensity: 0.9)
+#endif
+    }
+
+    private func registerThoughtScrollControl() {
+        isUserControllingThoughtScroll = true
+        thoughtAutoScrollResumeTask?.cancel()
+        thoughtAutoScrollResumeTask = Task {
+            try? await Task.sleep(nanoseconds: thoughtAutoScrollResumeDelayNs)
+            if Task.isCancelled { return }
+            await MainActor.run {
+                isUserControllingThoughtScroll = false
+            }
+        }
     }
 }
 

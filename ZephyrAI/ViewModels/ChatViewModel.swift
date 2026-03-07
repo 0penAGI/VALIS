@@ -36,6 +36,9 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
     private let emotionService = EmotionService.shared
     private var lastReflectionHash: Int?
     private var statusClearTask: Task<Void, Never>?
+    private var pendingUserFeedbackValence: Double?
+    private var turnsSinceSelfReflection: Int = 0
+    private let selfReflectionIntervalTurns: Int = 8
     private let rememberedArtifactDefaultsKey = "chat.rememberedArtifact"
     private let maxArtifactContextChars = 9_000
     private var rememberedArtifact: RememberedArtifact?
@@ -77,7 +80,7 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
             await llmService.loadModel()
             
             if messages.isEmpty {
-                let greeting = "Hello! I am  V A L I S . I have access to my memories. How can I help you?"
+                let greeting = "Hello! How can I help you?"
                 MarkdownRenderer.prewarmInline(greeting)
                 messages.append(Message(role: .assistant, content: greeting))
             }
@@ -183,6 +186,7 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
     
     func stopGeneration() {
         llmService.cancelGeneration()
+        playStopHaptic()
         // Do not clear generation state here: we need the running task to flush parser
         // buffers and persist the partial answer instead of losing it on manual stop.
     }
@@ -334,6 +338,7 @@ Spontaneous flavor:
             currentThink = ""
             currentThinkingMessageId = nil
             isInteracting = false
+            playGenerationFinishedHaptic()
             generationTask = nil
             activeGenerationId = nil
         }
@@ -369,10 +374,13 @@ Spontaneous flavor:
         let cleaned = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
 
         guard !cleaned.isEmpty else { return }
+        playSendHaptic()
 
+        pendingUserFeedbackValence = nil
         if let valence = experienceService.applyUserReaction(from: inputText) {
             motivationService.updateForReaction(valence: valence)
             emotionService.updateForReaction(valence: valence)
+            pendingUserFeedbackValence = valence
         }
         hasUserInteracted = true
         prepareForNewGeneration()
@@ -411,6 +419,11 @@ Spontaneous flavor:
         activeGenerationId = generationId
 
         generationTask = Task { [generationId] in
+            let assistantMessageId = UUID()
+            messages.append(Message(id: assistantMessageId, role: .assistant, content: "", thinkContent: ""))
+            currentThinkingMessageId = assistantMessageId
+            currentThink = ""
+
             memoryService.updateConversationSummary(fromUserText: prompt)
             memoryService.updateUserProfile(fromUserText: prompt)
             let detail = memoryService.preferredDetailLevel(forUserText: prompt)
@@ -431,11 +444,6 @@ Spontaneous flavor:
             let artifactContinuationBlock = buildArtifactContinuationBlock(for: prompt)
             let toolGuidance = actionService.buildToolGuidanceBlock(hasTools: !toolContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             let systemPrompt = identityService.systemPrompt + identityProfileContext + emotionContext + memoryContext + dialogContext + toolGuidance + toolContext + experienceContext + motivationContext + codeCoachContext + artifactContinuationBlock + detailBlock + spiceBlock
-
-            let assistantMessageId = UUID()
-            messages.append(Message(id: assistantMessageId, role: .assistant, content: "", thinkContent: ""))
-            currentThinkingMessageId = assistantMessageId
-            currentThink = ""
 
             var parser = ThinkStreamParser()
             var visibleBuffer = ""
@@ -554,6 +562,14 @@ Spontaneous flavor:
                     draft: finalText,
                     detail: detail
                 )
+                let novelty = estimateTurnNovelty(for: prompt)
+                motivationService.updateForTurnReward(
+                    userPrompt: prompt,
+                    assistantText: finalText,
+                    userFeedback: pendingUserFeedbackValence,
+                    novelty: novelty
+                )
+                pendingUserFeedbackValence = nil
 
                 let finalAnswer = messages[index].content
                 experienceService.recordExperience(
@@ -562,14 +578,40 @@ Spontaneous flavor:
                     userText: prompt,
                     assistantText: finalAnswer
                 )
+                performSelfReflectionIfNeeded(userPrompt: prompt, assistantText: finalAnswer)
             }
 
             currentThink = ""
             currentThinkingMessageId = nil
             isInteracting = false
+            playGenerationFinishedHaptic()
             generationTask = nil
             activeGenerationId = nil
         }
+    }
+
+    private func playSendHaptic() {
+#if os(iOS)
+        let generator = UIImpactFeedbackGenerator(style: .light)
+        generator.prepare()
+        generator.impactOccurred(intensity: 0.85)
+#endif
+    }
+
+    private func playStopHaptic() {
+#if os(iOS)
+        let generator = UINotificationFeedbackGenerator()
+        generator.prepare()
+        generator.notificationOccurred(.warning)
+#endif
+    }
+
+    private func playGenerationFinishedHaptic() {
+#if os(iOS)
+        let generator = UINotificationFeedbackGenerator()
+        generator.prepare()
+        generator.notificationOccurred(.success)
+#endif
     }
 
     private func extractToolUserMessage(from toolContext: String, fallback: String) -> String {
@@ -623,6 +665,49 @@ Spontaneous flavor:
         let payload = "[self-reflection] \(trimmedReflection)"
         memoryService.addExperienceMemory(payload, importanceOverride: importance)
         lastReflectionHash = reflectionHash
+    }
+
+    private func estimateTurnNovelty(for prompt: String) -> Double {
+        let preferenceScore = experienceService.preferenceScore(for: prompt)
+        let familiarity = abs(preferenceScore)
+        return max(0.0, min(1.0, 1.0 - familiarity))
+    }
+
+    private func performSelfReflectionIfNeeded(userPrompt: String, assistantText: String) {
+        turnsSinceSelfReflection += 1
+        guard turnsSinceSelfReflection >= selfReflectionIntervalTurns else { return }
+        turnsSinceSelfReflection = 0
+
+        let recent = experienceService.experiences.suffix(6)
+        let topOutcomes = recent
+            .map { $0.outcome }
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .suffix(3)
+        let topReflections = recent
+            .map { $0.reflection }
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .suffix(3)
+
+        let goalsLine = motivationService.goals
+            .sorted { $0.weight > $1.weight }
+            .prefix(3)
+            .map { "\($0.id)=\(String(format: "%.2f", $0.weight))" }
+            .joined(separator: ", ")
+
+        let reward = motivationService.recentReward
+        var lines: [String] = []
+        lines.append("[self-reflection-loop]")
+        lines.append("what_i_learned: \(topOutcomes.isEmpty ? "No stable pattern yet." : topOutcomes.joined(separator: " | "))")
+        lines.append("patterns: \(topReflections.isEmpty ? "No explicit lesson yet." : topReflections.joined(separator: " | "))")
+        lines.append("current_goals: \(goalsLine)")
+        lines.append("last_prompt: \(String(userPrompt.prefix(180)))")
+        lines.append("last_response_shape: chars=\(assistantText.count)")
+        lines.append("reward: \(String(format: "%.2f", reward))")
+        lines.append("what_to_change: prioritize clarity if reward < 0.50; otherwise preserve current strategy.")
+
+        let reflection = lines.joined(separator: "\n")
+        let importance = max(0.75, min(1.25, 0.8 + reward * 0.35))
+        memoryService.addExperienceMemory(reflection, importanceOverride: importance)
     }
 
     private func shouldStoreReflection(_ reflection: String, motivators: MotivatorState) -> Bool {

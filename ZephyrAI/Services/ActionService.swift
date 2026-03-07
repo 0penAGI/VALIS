@@ -22,6 +22,10 @@ final class ActionService {
 
     private let eventStore = EKEventStore()
     private let memoryService = MemoryService.shared
+    private var webSummaryCache: [String: (text: String, timestamp: Date)] = [:]
+    private var urlAnalysisCache: [String: (text: String, timestamp: Date)] = [:]
+    private let webCacheTTL: TimeInterval = 600
+    private let urlCacheTTL: TimeInterval = 900
 
     private init() {}
 
@@ -850,6 +854,9 @@ Signal action (\(title)):
     private func fetchWebSummaryWithFallback(query: String) async -> String {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "" }
+        if let cached = cachedWebSummary(for: trimmed) {
+            return cached
+        }
 
         let candidates = searchQueryCandidates(from: trimmed)
 
@@ -858,6 +865,7 @@ Signal action (\(title)):
             for _ in 0..<2 {
                 if let ddg = try? await fetchDuckDuckGoSummary(query: candidate),
                    !ddg.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    storeWebSummaryCache(ddg, query: trimmed)
                     return ddg
                 }
             }
@@ -865,12 +873,14 @@ Signal action (\(title)):
             // Fallback: parse lightweight DDG HTML search results.
             if let lite = try? await fetchDuckDuckGoLiteResults(query: candidate),
                !lite.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                storeWebSummaryCache(lite, query: trimmed)
                 return lite
             }
 
             // Fallback: concise Wikipedia summary.
             let wiki = await fetchWikipediaSummary(topic: candidate)
             if !wiki.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                storeWebSummaryCache(wiki, query: trimmed)
                 return wiki
             }
         }
@@ -1029,6 +1039,10 @@ Signal action (\(title)):
     }
 
     private func analyzeURL(_ url: URL) async -> String {
+        let key = url.absoluteString.lowercased()
+        if let cached = cachedURLAnalysis(for: key) {
+            return cached
+        }
         guard let html = try? await fetchHTML(url: url) else { return "" }
         let title = extractFirstMatch(in: html, pattern: "(?is)<title[^>]*>(.*?)</title>")
             .map { decodeHTMLEntities(stripHTML($0)).trimmingCharacters(in: .whitespacesAndNewlines) } ?? ""
@@ -1050,7 +1064,11 @@ Signal action (\(title)):
         if !title.isEmpty { parts.append("Title: \(title)") }
         if !description.isEmpty { parts.append("Description: \(description)") }
         if !snippet.isEmpty { parts.append("Content summary: \(snippet)") }
-        return parts.joined(separator: "\n")
+        let output = parts.joined(separator: "\n")
+        if !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            storeURLAnalysisCache(output, key: key)
+        }
+        return output
     }
 
     private func fetchHTML(url: URL) async throws -> String {
@@ -1078,5 +1096,33 @@ Signal action (\(title)):
             return nil
         }
         return String(text[resultRange])
+    }
+
+    private func cachedWebSummary(for query: String) -> String? {
+        let key = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard let cached = webSummaryCache[key] else { return nil }
+        if Date().timeIntervalSince(cached.timestamp) > webCacheTTL {
+            webSummaryCache.removeValue(forKey: key)
+            return nil
+        }
+        return cached.text
+    }
+
+    private func storeWebSummaryCache(_ text: String, query: String) {
+        let key = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        webSummaryCache[key] = (text, Date())
+    }
+
+    private func cachedURLAnalysis(for key: String) -> String? {
+        guard let cached = urlAnalysisCache[key] else { return nil }
+        if Date().timeIntervalSince(cached.timestamp) > urlCacheTTL {
+            urlAnalysisCache.removeValue(forKey: key)
+            return nil
+        }
+        return cached.text
+    }
+
+    private func storeURLAnalysisCache(_ text: String, key: String) {
+        urlAnalysisCache[key] = (text, Date())
     }
 }

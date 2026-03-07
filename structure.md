@@ -52,6 +52,8 @@ These may exist locally for reference/experimentation. In this repo they are typ
   - Memory + autonomy:
     - stores experiences and updates memory
     - remembers latest HTML artifact and injects it for follow-up “improve/patch artifact” turns
+    - runs periodic self-reflection (`selfReflectionIntervalTurns`) and stores reflection traces in memory
+    - applies reflection storage gating to reduce noisy self-referential memory writes
     - listens to `.memoryTriggered` and can perform a spontaneous “learn” response when idle.
   - Speech:
     - speech-to-text transcription pipeline (SFSpeechRecognizer).
@@ -90,6 +92,7 @@ These may exist locally for reference/experimentation. In this repo they are typ
   - Uses power-law echo activation decay (sharp early drop, long-tail plateau).
   - Applies associative-link immunity multiplier for highly connected nodes (>3 links) during decay.
   - Runs idle rest-phase consolidation: compresses highly similar memories into abstract `[rest-consolidated]` traces.
+  - Deduplicates external memory ingestion (normalized exact match + embedding near-duplicate check over recent window).
   - Applies prediction-feedback learning where prediction mismatch increases retained importance and accumulated prediction error.
   - Uses a novelty-adaptive context gate to filter low-signal memories before building `getContextBlock()`.
   - Provides pruning, activation/decay, and a context block generator.
@@ -99,6 +102,9 @@ These may exist locally for reference/experimentation. In this repo they are typ
   - Supports URL analysis tool:
     - `TOOL: analyze_url | url=https://...`
     - automatic link detection in user prompt with page summary injection.
+  - Caches repeated web signals:
+    - web summary cache (TTL 10 min)
+    - URL analysis cache (TTL 15 min)
   - Provides autonomous DDG/Wikipedia enrichment for spontaneous memory-triggered runs.
 - `CodeCoachService.swift`: Coding-quality meta-layer.
   - Activates on code/debug/refactor/test prompts.
@@ -113,6 +119,8 @@ These may exist locally for reference/experimentation. In this repo they are typ
 - `IdentityProfileService.swift`: Versioned “living identity” profile (persists `identity_profile.json`).
 - `ExperienceService.swift`: Experience + preference learning (lessons block, reaction tracking).
 - `MotivationService.swift`: Dynamic motivator state (guidance block).
+  - Maintains compact goal set (`understand`, `uncertainty`, `evolution`) and per-turn reward.
+  - Runs safe personality mutation cycle (small jitter + reward-window accept/revert).
 - `SpeechService.swift`: Text-to-speech helpers (AVAudioSession + voice selection).
 - `Notifications.swift`: NotificationCenter keys (e.g. `.memoryTriggered`).
 
@@ -134,6 +142,7 @@ These may exist locally for reference/experimentation. In this repo they are typ
 
 - Rule-based: Date / DuckDuckGo summaries / Reddit news / URL analysis (when links are present), based on prompt triggers.
 - Model-initiated: `TOOL:`/`ACTION:` lines inside `<think>` trigger `ActionService` execution and a bounded re-generation loop.
+- Duplicate suppression: repeated web snippets are filtered before being persisted as memories.
 - Inline artifacts: assistant may embed `<artifact type="html" title="...">...</artifact>` in final response; chat UI extracts and renders it as a live web artifact.
 
 ### Model Storage / Download

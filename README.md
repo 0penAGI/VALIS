@@ -15,18 +15,22 @@ VALIS is an on-device AI chat app for iOS built with SwiftUI and `llama.cpp` (GG
   - Rest-phase consolidation runs during idle windows: highly similar memories are compressed into abstract “rest-consolidated” traces instead of relying only on pruning.
   - Prediction-error feedback explicitly increases memory salience on mismatch (wrong prediction -> higher retained importance).
   - Novelty-adaptive context gate now filters memory candidates before prompt injection (not only a display metric).
+  - External memory ingestion now has duplicate protection (exact normalized match + near-duplicate embedding threshold) to prevent memory spam from repeated web snippets.
 - **Thinking UI**: Streams model output and parses `<think>...</think>` to show a separate thinking panel.
 - **Inline Artifacts**: Assistant can return `<artifact type="html">...</artifact>` blocks that render live in chat bubbles via `WKWebView`. And you can edit code in Artifact with updated preview.
 - **Artifact continuity**: Latest generated HTML artifact is remembered and reused as a base when user asks to improve/patch it.
 - **Tools (optional network)**:
   - Rule-based tool injection (Date, DuckDuckGo summaries, Reddit /r/news feed, URL content analysis for pasted links).
   - Model-initiated tools via `TOOL:` lines (app executes tools and re-runs generation with results).
+  - In-memory TTL cache for repeated web and URL-analysis requests to avoid re-fetching the same signal each turn.
 - **Chat iteration controls**:
   - Edit already-sent user message from context menu, then regenerate assistant response from that turn.
   - Regenerate assistant response from message context menu (`arrow.clockwise`).
 - **Autonomous memory consolidation** (optional network): when a memory becomes “charged”, background logic can fetch short Wikipedia/DuckDuckGo snippets and store them as memories.
 - **Experience & preferences**: Records experiences and learns preference signals from like/dislike or reaction text.
 - **Motivators**: Maintains a small dynamic state (curiosity/helpfulness/caution) used to guide tone.
+- **Goal/reward adaptation**: Tracks lightweight goals + reward and runs safe periodic personality mutation (small jitter + accept/revert window).
+- **Self-reflection loop**: Every N turns stores compact reflection memory about outcomes/patterns to improve future responses.
 - **Affect state (self-access)**: `EmotionService` keeps a slow-changing internal affect state injected into the system prompt (meant to be mentioned sparingly, only when relevant).
 - **Speech**: Speech-to-text for input and TTS for reading assistant messages.
 - **Siri Shortcut**: You can say “Ask VALIS …” and the prompt is sent directly into chat.
@@ -46,6 +50,7 @@ SwiftUI + MVVM with a small service layer:
   - builds system prompt blocks (identity + identity profile + affect + tools + experience lessons + motivators + detail level + optional “spice”),
   - streams generation and parses `<think>` tags,
   - delegates tool/action parsing and execution to `ActionService` and re-runs generation with results (bounded multi-step loop),
+  - runs periodic self-reflection and stores internal reflection memories with safeguards,
   - records experiences and updates memory.
 
 - `ActionService` handles external actions/signals:
@@ -53,6 +58,7 @@ SwiftUI + MVVM with a small service layer:
   - model-initiated `TOOL:`/`ACTION:` parsing,
   - tool execution (`web_search`, `analyze_url`, `reddit_news`, `date`),
   - action execution (`open_url`, `calendar` open/create/list),
+  - short-term TTL caches for web summary and URL-analysis outputs,
   - autonomous web/wiki enrichment used by spontaneous memory triggers.
 
 - `LLMService` wraps `LlamaRuntime` and handles:
@@ -70,10 +76,16 @@ SwiftUI + MVVM with a small service layer:
   - applies associative-link immunity to highly connected nodes during decay,
   - keeps an accumulated prediction-error signal and raises importance on mismatch,
   - runs idle “rest” consolidation that merges highly similar traces into compact abstractions,
+  - suppresses duplicate external memories via normalized-text + embedding similarity checks,
   - uses a novelty-adaptive context gate to pre-filter low-activation/low-relevance memories before `getContextBlock()`,
   - applies slow identity-node decay with restoration-by-repetition (persistent, not frozen),
   - runs echo/spontaneous loops,
   - produces the `getContextBlock()` injected into the LLM prompt.
+
+- `MotivationService` maintains adaptive agent dynamics:
+  - state vector (curiosity/helpfulness/caution/mood/trust/energy),
+  - weighted goals (`understand`, `uncertainty`, `evolution`),
+  - turn reward estimate and safe mutation cycle (trial + accept/revert by reward window).
 
 ```mermaid
 flowchart LR
@@ -125,7 +137,7 @@ The app executes the tool, injects results (or a tool error block), and re-runs 
 
 ## Requirements
 
-- Xcode 15+ (iOS 17+ target)
+- Xcode 16+ (iOS 18.5 deployment target in project settings)
 - `Frameworks/llama.xcframework`
 - A GGUF model available either:
   - bundled in the app (`ZephyrAI/Resources/Models/`), or

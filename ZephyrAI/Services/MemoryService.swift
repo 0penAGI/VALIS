@@ -154,6 +154,7 @@ class MemoryService: ObservableObject {
     private var lastRestConsolidationAt: Date?
     private let restIdleThreshold: TimeInterval = 180
     private let restConsolidationInterval: TimeInterval = 600
+    private let duplicateEmbeddingThreshold: Double = 0.965
     
     init() {
         let detected = MemoryProfile.detect()
@@ -871,7 +872,7 @@ class MemoryService: ObservableObject {
         preferences: UserPreferenceProfile
     ) -> String {
         var text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        _ = userPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prompt = userPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
 
 
         text = normalizeWhitespace(text)
@@ -881,11 +882,23 @@ class MemoryService: ObservableObject {
             text = ensureReadableParagraphs(text)
         }
 
-        if motivators.caution > 0.7 && !containsCautionHint(in: text) {
+        let playfulContext = isPlayfulContext(prompt: prompt, draft: text)
+        if motivators.caution > 0.7 && !playfulContext && !containsCautionHint(in: text) {
             text += "\n\nЕсли тема чувствительная (медицина, финансы, право), уточни контекст и ограничения."
         }
 
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func isPlayfulContext(prompt: String, draft: String) -> Bool {
+        let promptLower = prompt.lowercased()
+        let draftLower = draft.lowercased()
+        let markers = [
+            "шутк", "юмор", "ирони", "сарказ", "мем", "подколи", "пошути",
+            "joke", "humor", "funny", "sarcas", "banter", "tease", "roast",
+            "lol", "lmao", "haha", "hehe"
+        ]
+        return markers.contains { promptLower.contains($0) || draftLower.contains($0) }
     }
 
     private func needsClarification(text: String, prompt: String, preferences: UserPreferenceProfile) -> Bool {
@@ -1359,6 +1372,7 @@ class MemoryService: ObservableObject {
             .filter { !$0.isEmpty }
 
         guard !cleaned.isEmpty else { return }
+        var seenNormalized = Set<String>()
 
         let scored = cleaned.map { snippet -> (snippet: String, confidence: Double, relevance: Double, quality: Double) in
             let rating = rateExternalSnippet(snippet: snippet, query: query)
@@ -1369,6 +1383,11 @@ class MemoryService: ObservableObject {
 
         for item in scored.prefix(maxCount) {
             if item.quality < 0.25 { continue }
+            let normalized = normalizeForDedup(item.snippet)
+            if normalized.isEmpty { continue }
+            if seenNormalized.contains(normalized) { continue }
+            if hasNearDuplicateMemory(for: item.snippet) { continue }
+            seenNormalized.insert(normalized)
             let importanceOverride = min(1.6, max(0.5, 0.7 + (item.quality * 0.9)))
             addExternalMemory("[external:\(source)] \(item.snippet)", importanceOverride: importanceOverride)
         }
@@ -1389,6 +1408,7 @@ class MemoryService: ObservableObject {
     }
 
     private func addExternalMemory(_ content: String, importanceOverride: Double) {
+        guard !hasNearDuplicateMemory(for: content) else { return }
         let enriched = buildCognitiveLayer(for: content, importanceOverride: importanceOverride)
         memories.append(enriched)
         saveMemories()
@@ -1403,6 +1423,39 @@ class MemoryService: ObservableObject {
         applyIdentityRestorationIfNeeded(from: enriched)
         saveGraph()
         saveEchoGraph()
+    }
+
+    private func normalizeForDedup(_ text: String) -> String {
+        var value = text.lowercased()
+        value = value.replacingOccurrences(of: "\\[external:[^\\]]+\\]", with: "", options: .regularExpression)
+        value = value.replacingOccurrences(of: "\\[autonomous:[^\\]]+\\]", with: "", options: .regularExpression)
+        value = value.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+        value = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.count > 280 {
+            value = String(value.prefix(280))
+        }
+        return value
+    }
+
+    private func hasNearDuplicateMemory(for text: String, lookback: Int = 180) -> Bool {
+        let normalized = normalizeForDedup(text)
+        guard !normalized.isEmpty else { return true }
+        let recent = memories.suffix(lookback)
+
+        if recent.contains(where: { normalizeForDedup($0.content) == normalized }) {
+            return true
+        }
+
+        let embedding = generateEmbedding(from: normalized)
+        guard !embedding.isEmpty else { return false }
+        for memory in recent {
+            guard memory.embedding.count == embedding.count else { continue }
+            let sim = cosineSimilarity(a: embedding, b: memory.embedding)
+            if sim >= duplicateEmbeddingThreshold {
+                return true
+            }
+        }
+        return false
     }
 
     private func surpriseRetention(for memory: Memory) -> Double {

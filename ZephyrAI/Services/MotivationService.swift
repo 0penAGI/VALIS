@@ -9,6 +9,12 @@ struct MotivatorState: Codable {
     var energy: Double
 }
 
+struct AgentGoal: Codable, Identifiable {
+    let id: String
+    let title: String
+    var weight: Double
+}
+
 final class MotivationService: ObservableObject {
     static let shared = MotivationService()
 
@@ -20,6 +26,28 @@ final class MotivationService: ObservableObject {
         trust: 0.5,
         energy: 0.7
     )
+    @Published private(set) var goals: [AgentGoal] = [
+        AgentGoal(id: "understand", title: "Improve understanding", weight: 0.36),
+        AgentGoal(id: "uncertainty", title: "Reduce uncertainty", weight: 0.33),
+        AgentGoal(id: "evolution", title: "Self evolution", weight: 0.31)
+    ]
+    @Published private(set) var recentReward: Double = 0.5
+    @Published private(set) var mutationStatus: String = "stable"
+
+    private struct MutationCandidate {
+        let baseState: MotivatorState
+        let baseReward: Double
+        let startedAtTurn: Int
+    }
+
+    private var activeMutation: MutationCandidate?
+    private var totalReward: Double = 0.0
+    private var rewardSamples: Int = 0
+    private var turnCounter: Int = 0
+    private let mutationIntervalTurns: Int = 12
+    private let mutationEvaluationWindowTurns: Int = 6
+    private let mutationMaxDelta: Double = 0.03
+    private let mutationAcceptThreshold: Double = 0.015
 
     private init() {}
 
@@ -91,9 +119,37 @@ final class MotivationService: ObservableObject {
         }
     }
 
+    func updateForTurnReward(
+        userPrompt: String,
+        assistantText: String,
+        userFeedback: Double?,
+        novelty: Double
+    ) {
+        let curiositySatisfied = estimateCuriositySatisfied(userPrompt: userPrompt, assistantText: assistantText)
+        let feedback = userFeedback.map { ($0 + 1.0) / 2.0 } ?? 0.5
+        let safeNovelty = clamp(novelty)
+
+        let reward = clamp((curiositySatisfied * 0.4) + (feedback * 0.35) + (safeNovelty * 0.25))
+        recentReward = reward
+
+        adjustGoals(curiositySatisfied: curiositySatisfied, feedback: feedback, novelty: safeNovelty)
+
+        let delta = (reward - 0.5) * 0.14
+        state.curiosity = clamp(state.curiosity + (safeNovelty - 0.5) * 0.08 + delta * 0.3)
+        state.helpfulness = clamp(state.helpfulness + (feedback - 0.5) * 0.10 + delta * 0.4)
+        state.caution = clamp(state.caution + ((1.0 - curiositySatisfied) - 0.5) * 0.08 - delta * 0.2)
+        state.mood = clamp(state.mood + delta * 0.5)
+        state.trust = clamp(state.trust + (feedback - 0.5) * 0.12)
+        state.energy = clamp(state.energy + delta * 0.35)
+
+        applyMutationCycle(withReward: reward)
+    }
+
     func contextBlock(maxChars: Int = 280) -> String {
         // Compact state vector: C,H,Z,M,T,E
-        let block = String(
+        var lines: [String] = []
+
+        let stateLine = String(
             format: "M:%.2f,%.2f,%.2f,%.2f,%.2f,%.2f",
             state.curiosity,
             state.helpfulness,
@@ -102,7 +158,22 @@ final class MotivationService: ObservableObject {
             state.trust,
             state.energy
         )
-        return "\n\n" + block
+        lines.append(stateLine)
+
+        let goalLine = goals
+            .sorted { $0.weight > $1.weight }
+            .map { "\($0.id)=\(String(format: "%.2f", $0.weight))" }
+            .joined(separator: "|")
+        if !goalLine.isEmpty {
+            lines.append("G:\(goalLine)")
+        }
+        lines.append("R:\(String(format: "%.2f", recentReward))")
+
+        let block = lines.joined(separator: "\n")
+        if block.count <= maxChars {
+            return "\n\n" + block
+        }
+        return "\n\n" + String(block.prefix(maxChars))
     }
 
     private func blend(current: MotivatorState, target: MotivatorState, factor: Double) -> MotivatorState {
@@ -119,5 +190,97 @@ final class MotivationService: ObservableObject {
 
     private func clamp(_ value: Double) -> Double {
         max(0.0, min(1.0, value))
+    }
+
+    private func estimateCuriositySatisfied(userPrompt: String, assistantText: String) -> Double {
+        let lowerPrompt = userPrompt.lowercased()
+        let asksWhyHow = lowerPrompt.contains("why") || lowerPrompt.contains("how") || lowerPrompt.contains("почему") || lowerPrompt.contains("как")
+        let hasStructuredAnswer = assistantText.contains("\n") || assistantText.count > 240
+        let notUncertain = !assistantText.lowercased().contains("не знаю") && !assistantText.lowercased().contains("i don't know")
+
+        var score = 0.45
+        if asksWhyHow { score += hasStructuredAnswer ? 0.28 : 0.10 }
+        if notUncertain { score += 0.18 } else { score -= 0.18 }
+        if assistantText.count > 420 { score += 0.08 }
+        return clamp(score)
+    }
+
+    private func adjustGoals(curiositySatisfied: Double, feedback: Double, novelty: Double) {
+        let targets: [String: Double] = [
+            "understand": curiositySatisfied,
+            "uncertainty": max(0.0, 1.0 - curiositySatisfied),
+            "evolution": novelty
+        ]
+        let step = 0.12
+        goals = goals.map { goal in
+            let target = targets[goal.id] ?? 0.5
+            var next = goal
+            next.weight = clamp(goal.weight + (target - goal.weight) * step + (feedback - 0.5) * 0.04)
+            return next
+        }
+        normalizeGoals()
+    }
+
+    private func normalizeGoals() {
+        let sum = goals.reduce(0.0) { $0 + $1.weight }
+        guard sum > 0 else { return }
+        goals = goals.map { goal in
+            var next = goal
+            next.weight = max(0.05, goal.weight / sum)
+            return next
+        }
+        let normalizedSum = goals.reduce(0.0) { $0 + $1.weight }
+        guard normalizedSum > 0 else { return }
+        goals = goals.map { goal in
+            var next = goal
+            next.weight = goal.weight / normalizedSum
+            return next
+        }
+    }
+
+    private func applyMutationCycle(withReward reward: Double) {
+        turnCounter += 1
+        totalReward += reward
+        rewardSamples += 1
+
+        if let mutation = activeMutation {
+            let elapsed = turnCounter - mutation.startedAtTurn
+            if elapsed >= mutationEvaluationWindowTurns {
+                let postMean = meanReward()
+                let improved = (postMean - mutation.baseReward) >= mutationAcceptThreshold
+                if improved {
+                    mutationStatus = "mutation accepted (+\(String(format: "%.2f", postMean - mutation.baseReward)))"
+                } else {
+                    state = mutation.baseState
+                    mutationStatus = "mutation reverted (\(String(format: "%.2f", postMean - mutation.baseReward)))"
+                }
+                activeMutation = nil
+            }
+            return
+        }
+
+        guard turnCounter % mutationIntervalTurns == 0 else { return }
+        let base = state
+        let baseReward = meanReward()
+
+        state.curiosity = clamp(state.curiosity + randomDelta())
+        state.helpfulness = clamp(state.helpfulness + randomDelta())
+        state.caution = clamp(state.caution + randomDelta())
+
+        activeMutation = MutationCandidate(
+            baseState: base,
+            baseReward: baseReward,
+            startedAtTurn: turnCounter
+        )
+        mutationStatus = "mutation trial"
+    }
+
+    private func meanReward() -> Double {
+        guard rewardSamples > 0 else { return 0.5 }
+        return totalReward / Double(rewardSamples)
+    }
+
+    private func randomDelta() -> Double {
+        Double.random(in: -mutationMaxDelta...mutationMaxDelta)
     }
 }
