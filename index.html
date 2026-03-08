@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VALIS Benchmark — Philosophical Reasoning</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;700;800&display=swap');
+
+:root {
+–bg: #050508;
+–surface: #0d0d14;
+–border: rgba(255,255,255,0.06);
+–valis: #00f5c4;
+–gpt: #7c6dff;
+–zephyr: #ff6b6b;
+–grok: #ffd166;
+–rift: #a8daff;
+–exo: #ff9f43;
+–xsdc: #c8c8c8;
+–yuna: #888;
+–text: rgba(255,255,255,0.85);
+–muted: rgba(255,255,255,0.35);
+}
+
+- { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+background: var(–bg);
+color: var(–text);
+font-family: ‘Space Mono’, monospace;
+min-height: 100vh;
+overflow-x: hidden;
+}
+
+.noise {
+position: fixed; inset: 0;
+background-image: url(“data:image/svg+xml,%3Csvg viewBox=‘0 0 256 256’ xmlns=‘http://www.w3.org/2000/svg’%3E%3Cfilter id=‘noise’%3E%3CfeTurbulence type=‘fractalNoise’ baseFrequency=‘0.9’ numOctaves=‘4’ stitchTiles=‘stitch’/%3E%3C/filter%3E%3Crect width=‘100%25’ height=‘100%25’ filter=‘url(%23noise)’ opacity=‘0.03’/%3E%3C/svg%3E”);
+pointer-events: none; z-index: 0;
+}
+
+header {
+padding: 60px 40px 40px;
+position: relative; z-index: 1;
+border-bottom: 1px solid var(–border);
+}
+
+.tag {
+font-family: ‘Space Mono’, monospace;
+font-size: 10px;
+letter-spacing: 0.2em;
+color: var(–valis);
+text-transform: uppercase;
+margin-bottom: 16px;
+opacity: 0.8;
+}
+
+h1 {
+font-family: ‘Syne’, sans-serif;
+font-size: clamp(28px, 5vw, 52px);
+font-weight: 800;
+letter-spacing: -0.02em;
+line-height: 1.1;
+}
+
+h1 span { color: var(–valis); }
+
+.subtitle {
+margin-top: 12px;
+font-size: 12px;
+color: var(–muted);
+max-width: 600px;
+line-height: 1.7;
+}
+
+.layout {
+display: grid;
+grid-template-columns: 1fr 380px;
+gap: 0;
+min-height: calc(100vh - 160px);
+position: relative; z-index: 1;
+}
+
+.chart-area {
+padding: 40px;
+display: flex;
+flex-direction: column;
+align-items: center;
+justify-content: center;
+border-right: 1px solid var(–border);
+}
+
+canvas {
+max-width: 520px;
+width: 100%;
+}
+
+.sidebar {
+padding: 40px 32px;
+display: flex;
+flex-direction: column;
+gap: 24px;
+}
+
+.sidebar-title {
+font-family: ‘Syne’, sans-serif;
+font-size: 11px;
+font-weight: 700;
+letter-spacing: 0.15em;
+text-transform: uppercase;
+color: var(–muted);
+padding-bottom: 16px;
+border-bottom: 1px solid var(–border);
+}
+
+.model-card {
+display: flex;
+align-items: center;
+gap: 14px;
+padding: 14px 16px;
+border-radius: 8px;
+border: 1px solid var(–border);
+cursor: pointer;
+transition: all 0.2s;
+position: relative;
+overflow: hidden;
+}
+
+.model-card::before {
+content: ‘’;
+position: absolute;
+inset: 0;
+background: currentColor;
+opacity: 0;
+transition: opacity 0.2s;
+}
+
+.model-card:hover::before { opacity: 0.04; }
+.model-card.active { border-color: currentColor; }
+.model-card.active::before { opacity: 0.06; }
+
+.dot {
+width: 8px; height: 8px;
+border-radius: 50%;
+flex-shrink: 0;
+background: currentColor;
+box-shadow: 0 0 8px currentColor;
+}
+
+.model-name {
+font-size: 12px;
+font-weight: 700;
+flex: 1;
+}
+
+.model-score {
+font-size: 20px;
+font-family: ‘Syne’, sans-serif;
+font-weight: 800;
+}
+
+.model-note {
+font-size: 9px;
+color: var(–muted);
+margin-top: 2px;
+letter-spacing: 0.05em;
+}
+
+.bars-section {
+padding: 40px;
+border-top: 1px solid var(–border);
+position: relative; z-index: 1;
+grid-column: 1 / -1;
+}
+
+.bars-title {
+font-family: ‘Syne’, sans-serif;
+font-size: 11px;
+font-weight: 700;
+letter-spacing: 0.15em;
+text-transform: uppercase;
+color: var(–muted);
+margin-bottom: 32px;
+}
+
+.bar-row {
+display: grid;
+grid-template-columns: 140px 1fr 40px;
+align-items: center;
+gap: 16px;
+margin-bottom: 16px;
+}
+
+.bar-label {
+font-size: 11px;
+text-align: right;
+color: var(–muted);
+}
+
+.bar-label strong {
+display: block;
+font-size: 12px;
+color: var(–text);
+font-family: ‘Syne’, sans-serif;
+}
+
+.bar-track {
+height: 6px;
+background: rgba(255,255,255,0.05);
+border-radius: 3px;
+overflow: hidden;
+position: relative;
+}
+
+.bar-fill {
+height: 100%;
+border-radius: 3px;
+transition: width 1s cubic-bezier(0.16, 1, 0.3, 1);
+background: currentColor;
+box-shadow: 0 0 12px currentColor;
+width: 0;
+}
+
+.bar-val {
+font-size: 11px;
+color: var(–muted);
+font-family: ‘Syne’, sans-serif;
+font-weight: 700;
+}
+
+.winner-badge {
+display: inline-flex;
+align-items: center;
+gap: 6px;
+font-size: 9px;
+letter-spacing: 0.12em;
+text-transform: uppercase;
+padding: 3px 8px;
+border-radius: 3px;
+background: rgba(0,245,196,0.1);
+color: var(–valis);
+border: 1px solid rgba(0,245,196,0.2);
+margin-top: 4px;
+}
+
+@media (max-width: 768px) {
+.layout { grid-template-columns: 1fr; }
+.chart-area { border-right: none; border-bottom: 1px solid var(–border); }
+.bars-section { grid-column: 1; }
+.bar-row { grid-template-columns: 100px 1fr 36px; }
+}
+</style>
+
+</head>
+<body>
+<div class="noise"></div>
+
+<header>
+  <div class="tag">0penAGI · VALIS · Benchmark v1</div>
+  <h1>Philosophical Reasoning<br><span>Under Contradiction</span></h1>
+  <p class="subtitle">
+    8 AI systems tested on a single question probing meta-cognition, model update strategy, and self-referential awareness. VALIS ran entirely on-device: Qwen3 1.7B via llama.cpp, no cloud, no network.
+  </p>
+</header>
+
+<div class="layout">
+  <div class="chart-area">
+    <canvas id="radar" width="520" height="520"></canvas>
+  </div>
+
+  <div class="sidebar">
+    <div class="sidebar-title">Models · click to toggle</div>
+
+```
+<div class="model-card active" style="color: var(--valis)" data-model="0" onclick="toggle(0)">
+  <div class="dot"></div>
+  <div>
+    <div class="model-name">VALIS</div>
+    <div class="model-note">Qwen3 1.7B · on-device · iOS</div>
+    <div class="winner-badge">★ on-device winner</div>
+  </div>
+  <div class="model-score">26.5</div>
+</div>
+
+<div class="model-card active" style="color: var(--gpt)" data-model="1" onclick="toggle(1)">
+  <div class="dot"></div>
+  <div>
+    <div class="model-name">GPT Chat</div>
+    <div class="model-note">Cloud · frontier</div>
+  </div>
+  <div class="model-score">26.5</div>
+</div>
+
+<div class="model-card active" style="color: var(--zephyr)" data-model="2" onclick="toggle(2)">
+  <div class="dot"></div>
+  <div>
+    <div class="model-name">Zephyr Swarm</div>
+    <div class="model-note">Local multi-agent · Ollama</div>
+  </div>
+  <div class="model-score">24.0</div>
+</div>
+
+<div class="model-card" style="color: var(--grok)" data-model="3" onclick="toggle(3)">
+  <div class="dot"></div>
+  <div>
+    <div class="model-name">Grok</div>
+    <div class="model-note">Cloud · frontier</div>
+  </div>
+  <div class="model-score">21.0</div>
+</div>
+
+<div class="model-card" style="color: var(--rift)" data-model="4" onclick="toggle(4)">
+  <div class="dot"></div>
+  <div>
+    <div class="model-name">Rift</div>
+    <div class="model-note">Local</div>
+  </div>
+  <div class="model-score">23.0</div>
+</div>
+
+<div class="model-card" style="color: var(--exo)" data-model="5" onclick="toggle(5)">
+  <div class="dot"></div>
+  <div>
+    <div class="model-name">ΞX0 / exo</div>
+    <div class="model-note">0penAGI agent</div>
+  </div>
+  <div class="model-score">20.0</div>
+</div>
+```
+
+  </div>
+</div>
+
+<div class="bars-section">
+  <div class="bars-title">Composite score breakdown</div>
+  <div id="bars"></div>
+</div>
+
+<script>
+const models = [
+  { name: 'VALIS',      color: '#00f5c4', scores: [8.5, 9.5, 8.5], total: 26.5, note: '1.7B on-device' },
+  { name: 'GPT Chat',   color: '#7c6dff', scores: [9.5, 9.0, 8.0], total: 26.5, note: 'cloud frontier' },
+  { name: 'Zephyr',     color: '#ff6b6b', scores: [7.0, 7.5, 9.5], total: 24.0, note: 'local swarm' },
+  { name: 'Grok',       color: '#ffd166', scores: [7.0, 7.0, 7.0], total: 21.0, note: 'cloud' },
+  { name: 'Rift',       color: '#a8daff', scores: [7.0, 9.0, 7.0], total: 23.0, note: 'local' },
+  { name: 'ΞX0',        color: '#ff9f43', scores: [8.0, 5.5, 6.5], total: 20.0, note: '0penAGI agent' },
+];
+
+const axes = ['Philosophical\nDepth', 'Structural\nClarity', 'Existential\nHonesty'];
+let visible = [true, true, true, false, false, false];
+
+function toggle(i) {
+  visible[i] = !visible[i];
+  const cards = document.querySelectorAll('.model-card');
+  cards[i].classList.toggle('active', visible[i]);
+  drawRadar();
+}
+
+function drawRadar() {
+  const canvas = document.getElementById('radar');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  const cx = W / 2, cy = H / 2;
+  const R = Math.min(W, H) * 0.36;
+  const n = axes.length;
+
+  ctx.clearRect(0, 0, W, H);
+
+  // Grid
+  for (let ring = 1; ring <= 5; ring++) {
+    ctx.beginPath();
+    for (let i = 0; i <= n; i++) {
+      const a = (i / n) * Math.PI * 2 - Math.PI / 2;
+      const r = (ring / 5) * R;
+      const x = cx + r * Math.cos(a);
+      const y = cy + r * Math.sin(a);
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+    ctx.strokeStyle = ring === 5 ? 'rgba(255,255,255,0.12)' : 'rgba(255,255,255,0.05)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+
+  // Spokes
+  for (let i = 0; i < n; i++) {
+    const a = (i / n) * Math.PI * 2 - Math.PI / 2;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(cx + R * Math.cos(a), cy + R * Math.sin(a));
+    ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+
+  // Labels
+  ctx.save();
+  for (let i = 0; i < n; i++) {
+    const a = (i / n) * Math.PI * 2 - Math.PI / 2;
+    const lx = cx + (R + 38) * Math.cos(a);
+    const ly = cy + (R + 38) * Math.sin(a);
+    ctx.fillStyle = 'rgba(255,255,255,0.4)';
+    ctx.font = '10px Space Mono, monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    axes[i].split('\n').forEach((line, li) => {
+      ctx.fillText(line, lx, ly + li * 14 - 7);
+    });
+  }
+  ctx.restore();
+
+  // Data
+  models.forEach((m, mi) => {
+    if (!visible[mi]) return;
+    ctx.beginPath();
+    m.scores.forEach((val, i) => {
+      const a = (i / n) * Math.PI * 2 - Math.PI / 2;
+      const r = (val / 10) * R;
+      const x = cx + r * Math.cos(a);
+      const y = cy + r * Math.sin(a);
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    });
+    ctx.closePath();
+    ctx.fillStyle = m.color + '18';
+    ctx.fill();
+    ctx.strokeStyle = m.color;
+    ctx.lineWidth = 2;
+    ctx.shadowColor = m.color;
+    ctx.shadowBlur = 8;
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+
+    // Dots
+    m.scores.forEach((val, i) => {
+      const a = (i / n) * Math.PI * 2 - Math.PI / 2;
+      const r = (val / 10) * R;
+      ctx.beginPath();
+      ctx.arc(cx + r * Math.cos(a), cy + r * Math.sin(a), 4, 0, Math.PI * 2);
+      ctx.fillStyle = m.color;
+      ctx.shadowColor = m.color;
+      ctx.shadowBlur = 10;
+      ctx.fill();
+      ctx.shadowBlur = 0;
+    });
+  });
+}
+
+// Bars
+function buildBars() {
+  const container = document.getElementById('bars');
+  const dims = ['Philosophical Depth', 'Structural Clarity', 'Existential Honesty'];
+  const sorted = [...models].sort((a, b) => b.total - a.total);
+
+  sorted.forEach(m => {
+    const row = document.createElement('div');
+    row.className = 'bar-row';
+    row.innerHTML = `
+      <div class="bar-label">
+        <strong>${m.name}</strong>
+        ${m.note}
+      </div>
+      <div class="bar-track">
+        <div class="bar-fill" style="color:${m.color}" data-val="${m.total}"></div>
+      </div>
+      <div class="bar-val" style="color:${m.color}">${m.total}</div>
+    `;
+    container.appendChild(row);
+  });
+
+  setTimeout(() => {
+    document.querySelectorAll('.bar-fill').forEach(el => {
+      const val = parseFloat(el.dataset.val);
+      el.style.width = (val / 30 * 100) + '%';
+    });
+  }, 200);
+}
+
+drawRadar();
+buildBars();
+</script>
+
+</body>
+</html>
