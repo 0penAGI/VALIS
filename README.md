@@ -36,7 +36,7 @@ PHILOSOPHICAL DEPTH
 |---|---|---|---|---|
 | GPT Chat (cloud) | 9.5 | 9.0 | 8.0 | **26.5** |
 | **VALIS / Qwen3 1.7B** | 8.5 | 9.5 | 8.5 | **26.5** |
-| Zephyr (local swarm) | 7.0 | 7.5 | 9.5 | **24.0** |
+| Zephyr AI | 7.0 | 7.5 | 9.5 | **24.0** |
 | Rift | 7.0 | 9.0 | 7.0 | **23.0** |
 | ΞX0 / exo 0penAGI | 8.0 | 5.5 | 6.5 | **20.0** |
 | Grok (cloud) | 7.0 | 7.0 | 7.0 | **21.0** |
@@ -44,7 +44,7 @@ PHILOSOPHICAL DEPTH
 | Yuna | 4.0 | 2.0 | 9.0 | **15.0** |
 
 > **VALIS tied GPT Chat** on composite score — running entirely on-device with a 1.7B parameter model.  
-> Zephyr (local multi-agent swarm) ranked 3rd, notable for naming a specific decision agent (Δ8907) and confronting the self-referential trap directly.
+> Zephyr (local multi-agent swarm) github.com/0penAGI/oss ranked 3rd, notable for naming a specific decision agent (Δ8907) and confronting the self-referential trap directly.
 
 **Key finding:** The Plastic Brain memory architecture compensates for model size. Kuramoto-resonance synchronization and CognitiveEchoGraph context ranking gave VALIS coherence and philosophical consistency that cloud models achieve only with orders-of-magnitude more parameters.
 
