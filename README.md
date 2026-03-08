@@ -4,7 +4,7 @@ VALIS is an on-device AI chat app for iOS built with SwiftUI and `llama.cpp` (GG
 
 ![chat](https://github.com/0penAGI/VALIS/blob/main/IMG_8565.png)
 
-
+![FULL TEST] (https://0penagi.github.io/VALIS/)
 ## Benchmark: Philosophical Reasoning Test
 
 VALIS (Qwen3 1.7B on-device) was evaluated against frontier and cloud models on a structured philosophical reasoning task — a contradiction test probing model update strategy, meta-cognition, and self-referential awareness.
