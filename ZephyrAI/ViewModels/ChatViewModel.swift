@@ -430,24 +430,62 @@ Spontaneous flavor:
             memoryService.applyPredictionFeedback(fromUserText: prompt)
             memoryService.applyReinforcement(fromUserText: prompt)
             emotionService.updateForPrompt(prompt)
+            let isArtifactRequest = shouldPreferCleanArtifactContext(for: prompt)
             let toolContext = await actionService.aggregateRuleBasedContext(for: prompt)
             motivationService.updateForPrompt(prompt)
-            let motivationContext = motivationService.contextBlock()
-            let identityProfileContext = identityProfileService.contextBlock()
-            let experienceContext = experienceService.contextBlock(for: prompt)
-            let emotionContext = emotionService.contextBlock()
-            let memoryContext = memoryService.getContextBlock(maxChars: 900)
-            let dialogContext = buildRecentDialogContext()
-            let detailBlock = "\nResponse Detail: \(detail.rawValue)\n"
-            let codeCoachContext = codeCoachService.contextBlock(for: prompt, detail: detail)
-            let spiceBlock = randomSpiceBlock(for: prompt)
+            let motivationContext = isArtifactRequest ? "" : motivationService.contextBlock()
+            let identityProfileContext = isArtifactRequest ? "" : identityProfileService.contextBlock()
+            let experienceContext = isArtifactRequest ? "" : experienceService.contextBlock(for: prompt)
+            let emotionContext = isArtifactRequest ? "" : emotionService.contextBlock()
+            let memoryContext = isArtifactRequest ? "" : memoryService.getContextBlock(maxChars: 900)
+            let dialogContext = isArtifactRequest ? "" : buildRecentDialogContext()
+            let detailBlock = isArtifactRequest ? "" : "\nResponse Detail: \(detail.rawValue)\n"
+            let codeCoachContext = isArtifactRequest ? "" : codeCoachService.contextBlock(for: prompt, detail: detail)
+            let spiceBlock = isArtifactRequest ? "" : randomSpiceBlock(for: prompt)
             let artifactContinuationBlock = buildArtifactContinuationBlock(for: prompt)
             let toolGuidance = actionService.buildToolGuidanceBlock(hasTools: !toolContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            let systemPrompt = identityService.systemPrompt + identityProfileContext + emotionContext + memoryContext + dialogContext + toolGuidance + toolContext + experienceContext + motivationContext + codeCoachContext + artifactContinuationBlock + detailBlock + spiceBlock
+            let artifactSpec = isArtifactRequest ? """
+
+Artifact spec:
+- Return exactly one complete <artifact type="html" title="...">...</artifact> block.
+- The HTML must be a full document (<!doctype html>), self-contained unless explicitly requested.
+- If it's a game, include clear controls/instructions inside the page UI.
+""" : ""
+            let systemPrompt = identityService.systemPrompt
+                + identityProfileContext
+                + emotionContext
+                + memoryContext
+                + dialogContext
+                + toolGuidance
+                + toolContext
+                + experienceContext
+                + motivationContext
+                + codeCoachContext
+                + artifactContinuationBlock
+                + artifactSpec
+                + detailBlock
+                + spiceBlock
 
             var parser = ThinkStreamParser()
             var visibleBuffer = ""
-            let stream = await llmService.generate(userPrompt: prompt, systemPrompt: systemPrompt)
+            let genOptions: LLMService.GenerationOptions = isArtifactRequest
+                ? LLMService.GenerationOptions(
+                    maxTokensOverride: 16_000,
+                    includeMemoryContext: false,
+                    includeHiddenPrefix: false,
+                    useCache: false,
+                    useKVInjection: false,
+                    storeResponseToMemory: false,
+                    samplingOverride: SamplingConfig(
+                        temperature: 0.7,
+                        topK: 40,
+                        repetitionPenalty: 1.08,
+                        repeatLastN: 64
+                    )
+                )
+                : LLMService.GenerationOptions()
+
+            let stream = await llmService.generate(userPrompt: prompt, systemPrompt: systemPrompt, options: genOptions)
             for await chunk in stream {
                 if Task.isCancelled || activeGenerationId != generationId {
                     break
@@ -553,6 +591,76 @@ Spontaneous flavor:
                 }
                 finalText = currentFinalText
 
+                if isArtifactRequest, let draftArtifact = extractLastHTMLArtifact(from: finalText) {
+                    let title = (draftArtifact.title?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false) ? draftArtifact.title! : "Artifact"
+                    let draftPayload = draftArtifact.payload
+
+                    let progressLine = "\n\n[artifact] self-check: patching current artifact (no rewrite)..."
+                    currentThink += progressLine
+                    messages[index].thinkContent = (messages[index].thinkContent ?? "") + progressLine
+
+                    let reviewPrompt = """
+You are improving an existing HTML artifact. DO NOT rewrite from scratch.
+Work directly on the provided code as the base and apply the smallest possible changes to:
+- fix bugs, missing closing tags, broken JS, and layout issues
+- improve robustness on mobile Safari
+- keep behavior and structure the same unless a change is required to fix a bug
+
+Hard rules:
+- Preserve existing IDs, class names, and function names.
+- Do not redesign UI, do not rename things, do not reorganize sections.
+- Keep it self-contained.
+- Return exactly one complete <artifact type="html" title="...">...</artifact> block and nothing else.
+
+User request:
+\(prompt)
+
+Draft title: \(title)
+Draft code:
+```html
+\(draftPayload)
+```
+"""
+
+                    let reviewOptions = LLMService.GenerationOptions(
+                        maxTokensOverride: 12_000,
+                        includeMemoryContext: false,
+                        includeHiddenPrefix: false,
+                        useCache: false,
+                        useKVInjection: false,
+                        storeResponseToMemory: false,
+                        samplingOverride: SamplingConfig(
+                            temperature: 0.3,
+                            topK: 40,
+                            repetitionPenalty: 1.06,
+                            repeatLastN: 96
+                        )
+                    )
+
+                    let reviewOutput = await llmService.generateText(
+                        userPrompt: reviewPrompt,
+                        systemPrompt: identityService.systemPrompt,
+                        options: reviewOptions
+                    )
+
+                    if Task.isCancelled || activeGenerationId != generationId { return }
+
+                    if let improved = extractLastHTMLArtifact(from: reviewOutput) {
+                        if isLikelyArtifactRewrite(draft: draftPayload, candidate: improved.payload) {
+                            let note = "\n[artifact] self-check tried to rewrite; keeping draft."
+                            currentThink += note
+                            messages[index].thinkContent = (messages[index].thinkContent ?? "") + note
+                        } else {
+                            let improvedTitle = (improved.title?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false) ? improved.title! : title
+                            finalText = """
+<artifact type="html" title="\(improvedTitle)">
+\(improved.payload)
+</artifact>
+"""
+                        }
+                    }
+                }
+
                 MarkdownRenderer.prewarmInline(finalText)
                 messages[index].content = finalText
                 rememberArtifactIfPresent(in: finalText)
@@ -588,6 +696,68 @@ Spontaneous flavor:
             generationTask = nil
             activeGenerationId = nil
         }
+    }
+
+    private func shouldPreferCleanArtifactContext(for prompt: String) -> Bool {
+        let lower = prompt.lowercased()
+        let artifactSignals = [
+            "artifact", "артефакт", "html", "css", "javascript", "js",
+            "веб", "web", "сайт", "страниц", "лендинг", "ui",
+            "игр", "game", "canvas"
+        ]
+        let intentSignals = [
+            "make", "build", "create", "generate", "write",
+            "сделай", "создай", "сгенерируй", "напиши"
+        ]
+        let hasArtifact = artifactSignals.contains(where: { lower.contains($0) })
+        let hasIntent = intentSignals.contains(where: { lower.contains($0) })
+        return hasArtifact && hasIntent
+    }
+
+    private func isLikelyArtifactRewrite(draft: String, candidate: String) -> Bool {
+        let a = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let b = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !a.isEmpty, !b.isEmpty else { return true }
+
+        let ratio = Double(b.count) / Double(max(1, a.count))
+        if ratio > 2.5 || ratio < 0.4 {
+            return true
+        }
+
+        let markers = artifactIdentityMarkers(from: a)
+        if markers.isEmpty { return false }
+
+        let bLower = b.lowercased()
+        let kept = markers.filter { bLower.contains($0) }.count
+        return kept < max(1, markers.count / 3)
+    }
+
+    private func artifactIdentityMarkers(from html: String, limit: Int = 12) -> [String] {
+        let lower = html.lowercased()
+        var out: [String] = []
+        out.reserveCapacity(limit)
+
+        func appendMatches(pattern: String) {
+            guard out.count < limit else { return }
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else { return }
+            let ns = lower as NSString
+            let range = NSRange(location: 0, length: ns.length)
+            for m in regex.matches(in: lower, options: [], range: range) {
+                guard out.count < limit else { break }
+                guard m.numberOfRanges >= 2 else { continue }
+                let r = m.range(at: 1)
+                guard r.location != NSNotFound, r.length > 0 else { continue }
+                let value = ns.substring(with: r).trimmingCharacters(in: .whitespacesAndNewlines)
+                guard value.count >= 3, value.count <= 48 else { continue }
+                if !out.contains(value) {
+                    out.append(value)
+                }
+            }
+        }
+
+        appendMatches(pattern: #"id\s*=\s*["']([^"']+)["']"#)
+        appendMatches(pattern: #"function\s+([a-z0-9_]{3,48})\s*\("#)
+        return out
     }
 
     private func playSendHaptic() {

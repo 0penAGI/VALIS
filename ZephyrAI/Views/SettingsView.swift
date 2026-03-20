@@ -16,6 +16,8 @@ struct SettingsView: View {
     @State private var isGlassActive = false
     @Environment(\.colorScheme) private var colorScheme
     @AppStorage(LLMModelStorage.key) private var selectedModelRaw: String = LLMModelStorage.defaultValue.rawValue
+    @AppStorage(UserIdentityService.nameKey) private var userName: String = ""
+    @AppStorage(UserIdentityService.genderKey) private var userGender: String = ""
 
     private var glassBackground: some View {
         let baseOpacity = colorScheme == .dark ? glassOpacityDark : glassOpacityLight
@@ -49,8 +51,32 @@ struct SettingsView: View {
                 List {
                 Section {
                     VStack(alignment: .leading, spacing: 8) {
+                        VStack(alignment: .leading, spacing: 10) {
+                            TextField("User Name", text: $userName)
+                                .textInputAutocapitalization(.words)
+                                .autocorrectionDisabled()
+                                .padding(10)
+                                .background(Color(UIColor.secondarySystemBackground).opacity(colorScheme == .dark ? 0.7 : 1.0))
+                                .clipShape(RoundedRectangle(cornerRadius: 8))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 8)
+                                        .stroke(colorScheme == .dark ? Color.white.opacity(0.08) : Color.black.opacity(0.08), lineWidth: 1)
+                                )
+
+                            TextField("Gender", text: $userGender)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                                .padding(10)
+                                .background(Color(UIColor.secondarySystemBackground).opacity(colorScheme == .dark ? 0.7 : 1.0))
+                                .clipShape(RoundedRectangle(cornerRadius: 8))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 8)
+                                        .stroke(colorScheme == .dark ? Color.white.opacity(0.08) : Color.black.opacity(0.08), lineWidth: 1)
+                                )
+                        }
+
                         HStack {
-                            Text("Personality")
+                            Text("AI Personality")
                                 .font(.headline)
                                 .foregroundColor(colorScheme == .dark ? .white : .primary)
                             Spacer()
@@ -107,6 +133,7 @@ struct SettingsView: View {
                     .buttonStyle(.plain)
                 }
                 .listRowBackground(Color.clear)
+
             }
             .scrollContentBackground(.hidden)
             .listStyle(.insetGrouped)

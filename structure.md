@@ -11,6 +11,7 @@ This document describes the repository layout and the main runtime components as
   - `llama.xcframework`: Prebuilt `llama.cpp` framework.
 - `README.md`: Project overview.
 - `structure.md`: This file.
+- `index.html`: Standalone benchmark page (Philosophical Reasoning Under Contradiction) used for the README benchmark section.
 - `IMG_8565.png`, `IMG_9344.png`, `IMG_8567.png`: Screenshot assets currently referenced by `README.md`.
 - `IMG_8566.png`: Additional local screenshot asset.
 
@@ -31,6 +32,7 @@ These may exist locally for reference/experimentation. In this repo they are typ
 ### Models (`ZephyrAI/Models/`)
 - `Message.swift`: Chat message model.
 - `LLMModel.swift`: Model profile registry + persistence (`LFM 2.5`/`Qwen 3`) and model-change notification.
+- `QuantumFeatures.swift`: Feature flags (UserDefaults keys) for quantum memory search + snippet parser toggles.
 
 ### ViewModels (`ZephyrAI/ViewModels/`)
 
@@ -52,6 +54,7 @@ These may exist locally for reference/experimentation. In this repo they are typ
   - Memory + autonomy:
     - stores experiences and updates memory
     - remembers latest HTML artifact and injects it for follow-up “improve/patch artifact” turns
+    - for artifact-generation prompts: uses a cleaner prompt context + higher output budget, then runs a self-check pass that patches the current artifact (and keeps the draft if the self-check tries to rewrite from scratch)
     - runs periodic self-reflection (`selfReflectionIntervalTurns`) and stores reflection traces in memory
     - applies reflection storage gating to reduce noisy self-referential memory writes
     - listens to `.memoryTriggered` and can perform a spontaneous “learn” response when idle.
@@ -67,6 +70,7 @@ These may exist locally for reference/experimentation. In this repo they are typ
     - `Regenerate` for assistant messages.
 - `ArtifactView.swift`: `WKWebView` wrapper used by chat bubbles to render HTML/CSS/JS artifacts.
 - `SettingsView.swift`: Persona prompt editor + navigation to Memories; presented as a translucent sheet over chat.
+  - Stores optional user identity fields (name/gender) via `UserIdentityService` keys.
 - `MemoryListView.swift`: Memory management UI (pin/unpin/delete/edit, clear confirmations).
 
 ### Services (`ZephyrAI/Services/`)
@@ -80,11 +84,20 @@ These may exist locally for reference/experimentation. In this repo they are typ
   - If the model is missing and a download URL is configured, downloads it (with progress) and then loads it.
   - Streams output and supports cancellation.
   - Uses `MemoryService.getContextBlock(maxChars:)` to inject a bounded memory context.
+  - Uses a larger default `n_ctx` (clamped to the model's `n_ctx_train` by `LlamaRuntime`).
+  - Supports per-request generation options used by artifact generation:
+    - disable memory/hidden-prefix/KV-injection and caching to keep prompt context clean,
+    - raise output budget (`maxTokensOverride`) for long HTML/code artifacts,
+    - optionally skip storing responses back into memory for code-heavy outputs.
   - Stores one “cognitively relevant” sentence back into memory.
+- `UserIdentityService.swift`: Small user identity context helper (name/gender) injected into the system prompt with guardrails.
+- `LanguageRoutingService.swift`: NaturalLanguage-based language detection; emits a language anchor for short/noisy prompts and caches last confident language.
 - `LlamaRuntime.swift`: `llama.cpp` wrapper.
   - Loads the model, clamps `n_ctx` to the model’s `n_ctx_train`, and provides streaming generation.
   - Includes resilience for decode failures by trimming/splitting decode batches.
 - `KVCacheInjector.swift`: Helpers for prompt/context shaping for llama runtime (KV-cache/prompt hygiene utilities).
+- `MarkovMemoryLayer.swift`: Lightweight Markov transition model over turns used to predict likely next “states” for memory/context selection.
+- `QuantumMemoryService.swift`: Optional diversity-biased “collapse” selector for memory candidates (motivator-modulated).
 - `MemoryService.swift`: “Plastic Brain” memory system.
   - Stores/persists `Memory` objects (emotion, importance, embeddings, associative links, activation/decay).
   - Maintains a graph (`MemoryGraph`) and echo/trigger logic (`CognitiveEchoGraph`).
@@ -95,6 +108,7 @@ These may exist locally for reference/experimentation. In this repo they are typ
   - Deduplicates external memory ingestion (normalized exact match + embedding near-duplicate check over recent window).
   - Applies prediction-feedback learning where prediction mismatch increases retained importance and accumulated prediction error.
   - Uses a novelty-adaptive context gate to filter low-signal memories before building `getContextBlock()`.
+  - Uses Markov next-state prediction and optional quantum collapse to pick a diverse, high-signal context set.
   - Provides pruning, activation/decay, and a context block generator.
 - `ActionService.swift`: Tool/action runtime.
   - Parses model-initiated `TOOL:` / `ACTION:` lines.

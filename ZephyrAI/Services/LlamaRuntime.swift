@@ -27,15 +27,31 @@ enum LlamaRuntimeError: LocalizedError {
     }
 }
 
-struct SamplingConfig {
+struct SamplingConfig: Sendable {
     let temperature: Float
     let topK: Int
+    let topP: Float
     let repetitionPenalty: Float
     let repeatLastN: Int
+    
+    init(
+        temperature: Float,
+        topK: Int,
+        topP: Float = 0.95,
+        repetitionPenalty: Float,
+        repeatLastN: Int
+    ) {
+        self.temperature = temperature
+        self.topK = topK
+        self.topP = topP
+        self.repetitionPenalty = repetitionPenalty
+        self.repeatLastN = repeatLastN
+    }
 
     static let `default` = SamplingConfig(
         temperature: 0.7,
         topK: 40,
+        topP: 0.95,
         repetitionPenalty: 1.1,
         repeatLastN: 64
     )
@@ -49,6 +65,7 @@ final class LlamaRuntime {
     private var samplingTopIndices: [Int] = []
     private var samplingTopLogits: [Float] = []
     private var samplingProbs: [Float] = []
+    private var samplingOrder: [Int] = []
 
     var contextSize: Int32
     private let batchSize: Int32
@@ -503,17 +520,53 @@ private extension LlamaRuntime {
             return llama_token(samplingTopIndices[0])
         }
 
-        let r = Float.random(in: 0..<1)
-        var acc: Float = 0
+        // Normalize probabilities for sampling.
         let invSum: Float = 1 / sum
         for i in 0..<selected {
-            acc += samplingProbs[i] * invSum
-            if r <= acc {
-                return llama_token(samplingTopIndices[i])
-            }
+            samplingProbs[i] *= invSum
         }
 
-        return llama_token(samplingTopIndices[0])
+        let topP = max(0.05, min(1.0, sampling.topP))
+        if topP < 0.999, selected > 1 {
+            if samplingOrder.count < selected {
+                samplingOrder = Array(0..<selected)
+            } else {
+                for i in 0..<selected { samplingOrder[i] = i }
+            }
+            samplingOrder[0..<selected].sort { samplingProbs[$0] > samplingProbs[$1] }
+
+            var cutoffCount = 0
+            var cum: Float = 0
+            for i in 0..<selected {
+                cum += samplingProbs[samplingOrder[i]]
+                cutoffCount += 1
+                if cum >= topP { break }
+            }
+            cutoffCount = max(1, min(selected, cutoffCount))
+
+            let r = Float.random(in: 0..<1)
+            var acc: Float = 0
+            let renorm = max(1e-9, samplingOrder.prefix(cutoffCount).reduce(0 as Float) { $0 + samplingProbs[$1] })
+            let invRenorm: Float = 1 / renorm
+            for i in 0..<cutoffCount {
+                let j = samplingOrder[i]
+                acc += samplingProbs[j] * invRenorm
+                if r <= acc {
+                    return llama_token(samplingTopIndices[j])
+                }
+            }
+            return llama_token(samplingTopIndices[samplingOrder[0]])
+        } else {
+            let r = Float.random(in: 0..<1)
+            var acc: Float = 0
+            for i in 0..<selected {
+                acc += samplingProbs[i]
+                if r <= acc {
+                    return llama_token(samplingTopIndices[i])
+                }
+            }
+            return llama_token(samplingTopIndices[0])
+        }
     }
 }
 

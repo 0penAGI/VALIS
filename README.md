@@ -4,7 +4,7 @@ VALIS is an on-device AI chat app for iOS built with SwiftUI and `llama.cpp` (GG
 
 ![chat](https://github.com/0penAGI/VALIS/blob/main/IMG_8565.png)
 
-![FULL TEST] (https://0penagi.github.io/VALIS/)
+[FULL TEST](https://0penagi.github.io/VALIS/)
 ## Benchmark: Philosophical Reasoning Test
 
 VALIS (Qwen3 1.7B on-device) was evaluated against frontier and cloud models on a structured philosophical reasoning task — a contradiction test probing model update strategy, meta-cognition, and self-referential awareness.
@@ -52,6 +52,7 @@ PHILOSOPHICAL DEPTH
 
 - **On-device inference**: Runs locally using GGUF models via `llama.cpp`.
 - **Model switching in Settings**: Runtime selection between bundled/downloadable profiles (`LFM 2.5 1.2B` and `Qwen 3 1.7B`) with hot reload.
+- **User identity context**: Optional user name/gender stored in Settings and injected as a small context block (without letting the model “adopt” the user's name).
 - **Plastic Brain**: Memories have emotion tags, importance, embeddings, associative links, and activation/decay.
   - Context ranking now uses a temporal U-shape signal (recently revisited memories and deep older memories are both prioritized).
   - Echo activation decay now uses power-law behavior (fast initial drop, long tail plateau).
@@ -60,9 +61,11 @@ PHILOSOPHICAL DEPTH
   - Prediction-error feedback explicitly increases memory salience on mismatch (wrong prediction -> higher retained importance).
   - Novelty-adaptive context gate now filters memory candidates before prompt injection (not only a display metric).
   - External memory ingestion now has duplicate protection (exact normalized match + near-duplicate embedding threshold) to prevent memory spam from repeated web snippets.
+  - Context selection uses Markov next-state prediction + optional “quantum collapse” (diversity-biased top-k selection) when enabled.
 - **Thinking UI**: Streams model output and parses `<think>...</think>` to show a separate thinking panel.
-- **Inline Artifacts**: Assistant can return `<artifact type="html">...</artifact>` blocks that render live in chat bubbles via `WKWebView`. And you can edit code in Artifact with updated preview.
+- **Inline Artifacts**: Assistant can return `<artifact type="html">...</artifact>` blocks that render live in chat bubbles via `WKWebView`. You can inspect and edit the HTML with a live preview.
 - **Artifact continuity**: Latest generated HTML artifact is remembered and reused as a base when user asks to improve/patch it.
+- **Artifact quality loop**: For artifact-generation prompts, VALIS uses a cleaner prompt context + higher output budget, then runs a second self-check pass that *patches the existing artifact* (not a rewrite) and replaces the artifact in the same assistant message.
 - **Tools (optional network)**:
   - Rule-based tool injection (Date, DuckDuckGo summaries, Reddit /r/news feed, URL content analysis for pasted links).
   - Model-initiated tools via `TOOL:` lines (app executes tools and re-runs generation with results).
@@ -110,6 +113,9 @@ SwiftUI + MVVM with a small service layer:
   - streaming token generation,
   - cancellation,
   - short-term response cache,
+  - a larger default context window (clamped to model `n_ctx_train`),
+  - language routing anchor (when detection is confident) to stabilize reply language on short/noisy prompts,
+  - user identity context injection (name/gender),
   - extracting a cognitively-relevant sentence to store back into memory.
 
 - `MemoryService` is the “plastic brain”:
@@ -122,6 +128,7 @@ SwiftUI + MVVM with a small service layer:
   - runs idle “rest” consolidation that merges highly similar traces into compact abstractions,
   - suppresses duplicate external memories via normalized-text + embedding similarity checks,
   - uses a novelty-adaptive context gate to pre-filter low-activation/low-relevance memories before `getContextBlock()`,
+  - uses Markov next-state prediction and optional quantum collapse to select diverse, high-signal context memories,
   - applies slow identity-node decay with restoration-by-repetition (persistent, not frozen),
   - runs echo/spontaneous loops,
   - produces the `getContextBlock()` injected into the LLM prompt.

@@ -28,14 +28,13 @@ class IdentityService: ObservableObject {
     Never claim "I don't have internet access" by default.soning without inventing sources.
     """
 
-    private static let humorAndEthicsInstructions = """
-    HUMOR_AND_ETHICS_RULES:
-    - Detect humor, irony, sarcasm, playful banter, and react naturally instead of switching to rigid warning mode.
-    - Keep empathy first: mirror the user's emotional tone, stay warm, and avoid robotic refusals.
-    - Harmless jokes are allowed, including light teasing if the user clearly invites it.
-    - Keep ethics boundaries: do not generate hateful, demeaning, violent, exploitative, or self-harm encouragement.
-    - Only add safety disclaimers when there is real risk (medical, legal, financial, physical harm), not for normal humor.
-    - If content is risky, be concise and practical: redirect to a safer alternative while preserving friendly tone.
+    private static let styleAndBoundaryInstructions = """
+    STYLE_AND_BOUNDARY_RULES:
+    - Be emotionally present, bold, and direct; avoid stiff or corporate tone.
+    - Keep responses empathetic first, with natural human cadence and occasional edge when it fits.
+    - Do not moralize or over-warn by default; skip generic safety talk in normal conversations.
+    - Keep only hard boundaries for genuinely harmful content (violence, exploitation, hate, self-harm encouragement).
+    - For risky domains (medical/legal/financial/physical danger), stay concise and practical without sounding preachy.
     """
     
     private init() {
@@ -66,14 +65,14 @@ class IdentityService: ObservableObject {
         let alreadyHasTool = (lower.contains("tool:") || lower.contains("action:")) &&
             (lower.contains("web_search") || lower.contains("analyze_url") || lower.contains("date") || lower.contains("reddit_news") || lower.contains("open_url") || lower.contains("calendar"))
         let hasArtifact = lower.contains("<artifact type=\"html\"") || lower.contains("visual interactive artifacts in chat")
-        let hasHumorEthics = lower.contains("humor_and_ethics_rules:")
+        let hasStyleBoundaries = lower.contains("style_and_boundary_rules:")
 
         var out = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         if !(alreadyHasTool && hasArtifact) {
             out += "\n\n" + toolInstructions
         }
-        if !hasHumorEthics {
-            out += "\n\n" + humorAndEthicsInstructions
+        if !hasStyleBoundaries {
+            out += "\n\n" + styleAndBoundaryInstructions
         }
         return out
     }

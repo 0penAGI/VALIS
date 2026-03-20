@@ -753,6 +753,92 @@ class MemoryService: ObservableObject {
         getContextBlock(maxChars: Int.max)
     }
 
+    /// LLM-facing memory block. This intentionally avoids the full "field snapshot" framing
+    /// to reduce templating/stamp effects in answers.
+    func getLLMContextBlock(maxChars: Int) -> String {
+        getLLMContextBlock(maxChars: maxChars, forUserText: "")
+    }
+
+    func getLLMContextBlock(maxChars: Int, forUserText userText: String) -> String {
+        if memories.isEmpty { return "" }
+        if maxChars <= 0 { return "" }
+
+        let now = Date()
+        let field = echoGraph.fieldVector()
+        let novelty = recentNoveltySignal(window: noveltyWindowSize)
+        let dynamicThreshold = dynamicContextGateThreshold(novelty: novelty)
+
+        let predicted = MarkovMemoryLayer.shared.predictNextStates(from: userText, topK: 6)
+        let predictedSet = Set(predicted)
+
+        let candidates = memories
+            .compactMap { mem -> QuantumMemoryService.Candidate? in
+                let activation = echoGraph.activation(for: mem.id)
+                guard contextGatePass(
+                    memory: mem,
+                    activation: activation,
+                    field: field,
+                    dynamicThreshold: dynamicThreshold,
+                    novelty: novelty
+                ) else {
+                    return nil
+                }
+                var score = relevanceScore(for: mem, field: field, now: now)
+                if !predictedSet.isEmpty {
+                    let concepts = Set(extractConcepts(from: mem.content))
+                    if !concepts.isDisjoint(with: predictedSet) {
+                        score += 0.14
+                    }
+                }
+                return QuantumMemoryService.Candidate(memory: mem, activation: activation, score: score)
+            }
+
+        let sorted = candidates.sorted { $0.score > $1.score }
+        guard !sorted.isEmpty else { return "" }
+
+        let selected: [QuantumMemoryService.Candidate] = {
+            guard QuantumFeatures.isMemorySearchEnabled(),
+                  QuantumMemoryService.shared.isEnabled(),
+                  sorted.count > 1 else {
+                return Array(sorted.prefix(3))
+            }
+            let motivators = MotivationService.shared.state
+            return QuantumMemoryService.shared.collapse(candidates: sorted, k: 3, motivators: motivators).selected
+        }()
+
+        var lines: [String] = []
+        var referencedIds: [UUID] = []
+        for node in selected {
+            let prefix: String = {
+                if node.memory.isIdentity { return "[identity] " }
+                if node.memory.isPinned { return "[pinned] " }
+                return ""
+            }()
+            let compressed = compressMemory(node.memory.content, maxWords: 24)
+            let text = (prefix + compressed).trimmingCharacters(in: .whitespacesAndNewlines)
+            if text.isEmpty { continue }
+            lines.append("- \(text)")
+            referencedIds.append(node.memory.id)
+        }
+
+        recordAccess(for: referencedIds)
+
+        if lines.isEmpty { return "" }
+
+        var block = "\n\n" + lines.joined(separator: "\n")
+        if block.count > maxChars {
+            // Drop items from the end until we fit.
+            while block.count > maxChars, lines.count > 1 {
+                lines.removeLast()
+                block = "\n\n" + lines.joined(separator: "\n")
+            }
+        }
+        if block.count > maxChars {
+            block = String(block.prefix(maxChars))
+        }
+        return block
+    }
+
     func getContextBlock(maxChars: Int) -> String {
         if memories.isEmpty { return "" }
         if maxChars <= 0 { return "" }
@@ -770,8 +856,8 @@ class MemoryService: ObservableObject {
         let avgValence = affectSample.map { $0.emotionValence }.reduce(0.0, +) / Double(max(1, affectSample.count))
         let avgIntensity = affectSample.map { $0.emotionIntensity }.reduce(0.0, +) / Double(max(1, affectSample.count))
 
-        let layerNodes = memories
-            .compactMap { mem -> (memory: Memory, activation: Double, score: Double)? in
+        let candidates = memories
+            .compactMap { mem -> QuantumMemoryService.Candidate? in
                 let activation = echoGraph.activation(for: mem.id)
                 guard contextGatePass(
                     memory: mem,
@@ -783,14 +869,33 @@ class MemoryService: ObservableObject {
                     return nil
                 }
                 let score = relevanceScore(for: mem, field: field, now: now)
-                return (mem, activation, score)
+                return QuantumMemoryService.Candidate(memory: mem, activation: activation, score: score)
             }
-            .sorted { $0.score > $1.score }
-            .prefix(3)
+
+        let selectedNodes: [QuantumMemoryService.Candidate] = {
+            let sorted = candidates.sorted { $0.score > $1.score }
+            guard QuantumFeatures.isMemorySearchEnabled(),
+                  QuantumMemoryService.shared.isEnabled(),
+                  sorted.count > 1 else {
+                return Array(sorted.prefix(3))
+            }
+            let motivators = MotivationService.shared.state
+            let enableTrace = QuantumMemoryService.shared.isTraceEnabled()
+            let result = QuantumMemoryService.shared.collapse(
+                candidates: sorted,
+                k: 3,
+                motivators: motivators,
+                enableTrace: enableTrace
+            )
+            if enableTrace, let trace = result.trace {
+                print("[QuantumCollapse] candidates=\(trace.candidateIds.count) collapsed=\(trace.collapsedIds.count) beta=\(String(format: "%.2f", trace.beta)) mark=\(trace.markCount) div=\(String(format: "%.2f", trace.diversityStrength)) caution=\(String(format: "%.2f", trace.cautionBias))")
+            }
+            return result.selected
+        }()
         var nodeLines: [String] = []
         var nodeIds: [UUID] = []
 
-        for node in layerNodes {
+        for node in selectedNodes {
             let timeWeight = timeWeight(for: node.memory, now: now)
             let line = "N: a=\(fmt(node.activation)), i=\(fmt(node.memory.importance)), t=\(fmt(timeWeight))"
             nodeLines.append(line)
@@ -800,7 +905,7 @@ class MemoryService: ObservableObject {
         recordAccess(for: nodeIds)
 
         let topText: String? = {
-            guard let top = layerNodes.first else { return nil }
+            guard let top = selectedNodes.first else { return nil }
             let includeText = activationLevel >= dynamicThreshold || novelty > 0.7
             guard includeText else { return nil }
             let compressed = compressMemory(top.memory.content, maxWords: 18)
@@ -882,23 +987,29 @@ class MemoryService: ObservableObject {
             text = ensureReadableParagraphs(text)
         }
 
-        let playfulContext = isPlayfulContext(prompt: prompt, draft: text)
-        if motivators.caution > 0.7 && !playfulContext && !containsCautionHint(in: text) {
+        if motivators.caution > 0.9 &&
+            isSensitiveHighRiskPrompt(prompt) &&
+            !containsCautionHint(in: text) {
             text += "\n\nЕсли тема чувствительная (медицина, финансы, право), уточни контекст и ограничения."
         }
 
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private func isPlayfulContext(prompt: String, draft: String) -> Bool {
-        let promptLower = prompt.lowercased()
-        let draftLower = draft.lowercased()
+    private func isSensitiveHighRiskPrompt(_ prompt: String) -> Bool {
+        let lower = prompt.lowercased()
         let markers = [
-            "шутк", "юмор", "ирони", "сарказ", "мем", "подколи", "пошути",
-            "joke", "humor", "funny", "sarcas", "banter", "tease", "roast",
-            "lol", "lmao", "haha", "hehe"
+            "medical", "medicine", "diagnos", "symptom", "dosage", "drug", "suicide", "self-harm",
+            "legal", "law", "lawsuit", "court", "contract", "criminal",
+            "finance", "financial", "investment", "tax", "debt", "loan",
+            "danger", "weapon", "attack",
+            "медицин", "диагноз", "симптом", "дозиров", "лекар",
+            "суицид", "самоповреж",
+            "юрид", "закон", "суд", "договор", "уголов",
+            "финанс", "инвест", "налог", "долг", "кредит",
+            "опасн", "оруж"
         ]
-        return markers.contains { promptLower.contains($0) || draftLower.contains($0) }
+        return markers.contains(where: { lower.contains($0) })
     }
 
     private func needsClarification(text: String, prompt: String, preferences: UserPreferenceProfile) -> Bool {
@@ -1138,6 +1249,7 @@ class MemoryService: ObservableObject {
     func updateUserProfile(fromUserText text: String) {
         Task { @MainActor in
             self.markUserSignal()
+            MarkovMemoryLayer.shared.observeTurn(userText: text)
             let tokens = extractConcepts(from: text)
             userProfile.update(with: tokens)
         }
@@ -1374,7 +1486,11 @@ class MemoryService: ObservableObject {
         guard !cleaned.isEmpty else { return }
         var seenNormalized = Set<String>()
 
-        let scored = cleaned.map { snippet -> (snippet: String, confidence: Double, relevance: Double, quality: Double) in
+        let parsed = QuantumFeatures.isSnippetParserEnabled()
+            ? cleaned.map { quantumBestParse(for: $0, query: query) }
+            : cleaned
+
+        let scored = parsed.map { snippet -> (snippet: String, confidence: Double, relevance: Double, quality: Double) in
             let rating = rateExternalSnippet(snippet: snippet, query: query)
             let quality = rating.confidence * rating.relevance
             return (snippet, rating.confidence, rating.relevance, quality)
@@ -1391,6 +1507,54 @@ class MemoryService: ObservableObject {
             let importanceOverride = min(1.6, max(0.5, 0.7 + (item.quality * 0.9)))
             addExternalMemory("[external:\(source)] \(item.snippet)", importanceOverride: importanceOverride)
         }
+    }
+
+    private func quantumBestParse(for snippet: String, query: String) -> String {
+        let candidates = quantumParseCandidates(snippet: snippet)
+        guard candidates.count > 1 else { return snippet }
+
+        var best = snippet
+        var bestQuality = -Double.greatestFiniteMagnitude
+        for c in candidates {
+            let rating = rateExternalSnippet(snippet: c, query: query)
+            let q = (rating.confidence * 0.55) + (rating.relevance * 0.45)
+            if q > bestQuality {
+                bestQuality = q
+                best = c
+            }
+        }
+        return best
+    }
+
+    private func quantumParseCandidates(snippet: String) -> [String] {
+        let trimmed = snippet.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+
+        let keywords = compressMemory(trimmed, maxWords: 28)
+        let concepts = extractConcepts(from: trimmed)
+        let conceptLine = concepts.isEmpty ? "" : concepts.prefix(14).joined(separator: " ")
+
+        var out: [String] = []
+        out.append(trimmed)
+        if !keywords.isEmpty, keywords != trimmed.lowercased() {
+            out.append("[qparse] \(keywords)")
+        }
+        if !conceptLine.isEmpty {
+            out.append("[qparse] \(conceptLine)")
+        }
+        if !keywords.isEmpty, !conceptLine.isEmpty {
+            out.append("[qparse] \(keywords) | \(conceptLine)")
+        }
+
+        var uniq: [String] = []
+        var seen = Set<String>()
+        for s in out {
+            let key = normalizeForDedup(s)
+            if !key.isEmpty, seen.insert(key).inserted {
+                uniq.append(s)
+            }
+        }
+        return uniq
     }
 
     func rateExternalSnippet(snippet: String, query: String) -> (confidence: Double, relevance: Double) {
