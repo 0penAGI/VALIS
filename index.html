@@ -1,53 +1,51 @@
 <!DOCTYPE html>
-
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="description" content="OpenAGI benchmark of philosophical reasoning across AI systems">
 <title>0penAGI · Benchmark V1+V2 · Philosophical Reasoning</title>
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;700;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;700;800&display=swap');
 
 :root {
---bg: #050508;
---surface: #0d0d14;
---border: rgba(255,255,255,0.06);
---valis: #00f5c4;
---gpt: #7c6dff;
---zephyr: #ff6b6b;
---grok: #ffd166;
---rift: #a8daff;
---exo: #ff9f43;
---yuna: #b388ff;
---text: rgba(255,255,255,0.85);
---muted: rgba(255,255,255,0.35);
+  --bg: #050508;
+  --surface: #0d0d14;
+  --border: rgba(255,255,255,0.06);
+  --valis: #00f5c4;
+  --gpt: #7c6dff;
+  --zephyr: #ff6b6b;
+  --grok: #ffd166;
+  --rift: #a8daff;
+  --exo: #ff9f43;
+  --yuna: #b388ff;
+  --text: rgba(255,255,255,0.85);
+  --muted: rgba(255,255,255,0.35);
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { background: var(--bg); color: var(--text); font-family: 'Space Mono', monospace; min-height: 100vh; overflow-x: hidden; }
+body { background: var(--bg); color: var(--text); font-family: 'Space Mono', monospace; min-height: 100vh; overflow-x: hidden; }
 
 .noise {
-position: fixed; inset: 0;
-background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E");
-pointer-events: none; z-index: 0;
+  position: fixed; inset: 0;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E");
+  pointer-events: none; z-index: 0;
 }
 
 nav {
-position: sticky; top: 0;
-background: rgba(5,5,8,0.94); backdrop-filter: blur(14px);
-border-bottom: 1px solid var(--border);
-padding: 0 48px; z-index: 100;
-display: flex; align-items: center; gap: 28px; height: 48px;
+  position: sticky; top: 0;
+  background: rgba(5,5,8,0.94); backdrop-filter: blur(14px);
+  border-bottom: 1px solid var(--border);
+  padding: 0 48px; z-index: 100;
+  display: flex; align-items: center; gap: 28px; height: 48px;
 }
 .nav-logo { font-family: 'Syne', sans-serif; font-size: 12px; font-weight: 800; color: var(--valis); letter-spacing: 0.05em; margin-right: auto; }
 .nav-link { font-size: 9px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted); text-decoration: none; cursor: pointer; transition: color 0.2s; }
 .nav-link:hover { color: var(--text); }
 
 header {
-padding: 56px 48px 40px; position: relative; z-index: 1;
-border-bottom: 1px solid var(--border);
-display: flex; justify-content: space-between; align-items: flex-start; gap: 40px; flex-wrap: wrap;
+  padding: 56px 48px 40px; position: relative; z-index: 1;
+  border-bottom: 1px solid var(--border);
+  display: flex; justify-content: space-between; align-items: flex-start; gap: 40px; flex-wrap: wrap;
 }
 .header-left { flex: 1; min-width: 280px; }
 .tag { font-size: 10px; letter-spacing: 0.2em; color: var(--valis); text-transform: uppercase; margin-bottom: 16px; opacity: 0.8; }
@@ -67,18 +65,16 @@ h1 span { color: var(--valis); }
 .gh-arrow { font-size: 10px; color: var(--muted); transition: transform 0.2s; flex-shrink: 0; padding-top: 2px; }
 .gh-link:hover .gh-arrow { transform: translateX(3px); }
 
-/* TEST SWITCHER */
 .test-switcher {
-padding: 32px 48px; border-bottom: 1px solid var(--border);
-position: relative; z-index: 1;
-display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 32px 48px; border-bottom: 1px solid var(--border);
+  position: relative; z-index: 1;
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
 }
 .test-switcher-label { font-size: 9px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--muted); margin-right: 8px; }
 .test-btn {
-padding: 10px 20px; border-radius: 6px; border: 1px solid var(--border);
-background: none; color: var(--muted); font-family: 'Space Mono', monospace;
-font-size: 10px; letter-spacing: 0.08em; cursor: pointer; transition: all 0.2s;
-text-align: left;
+  padding: 10px 20px; border-radius: 6px; border: 1px solid var(--border);
+  background: none; color: var(--muted); font-family: 'Space Mono', monospace;
+  font-size: 10px; letter-spacing: 0.08em; cursor: pointer; transition: all 0.2s; text-align: left;
 }
 .test-btn:hover { border-color: rgba(255,255,255,0.2); color: var(--text); }
 .test-btn.active { border-color: var(--valis); color: var(--valis); background: rgba(0,245,196,0.05); }
@@ -86,7 +82,43 @@ text-align: left;
 .test-btn .test-btn-sub { font-size: 8px; color: var(--muted); margin-top: 3px; display: block; }
 .test-btn.active .test-btn-sub { color: rgba(0,245,196,0.6); }
 
-/* ...skipping unchanged for brevity... */
+.test-view { display: none; }
+.test-view.active { display: block; }
+
+.section { padding: 40px 48px; border-bottom: 1px solid var(--border); position: relative; z-index: 1; }
+.section-label { font-size: 9px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--muted); margin-bottom: 20px; }
+
+.question-block { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 28px 32px; max-width: 760px; }
+.question-text { font-size: 13px; line-height: 2; color: var(--text); }
+.question-text em { color: var(--valis); font-style: normal; }
+.question-meta { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 20px; }
+.q-badge { font-size: 8px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); padding: 4px 10px; border: 1px solid var(--border); border-radius: 3px; }
+
+.layout {
+  display: grid; grid-template-columns: 1fr 320px;
+  border-bottom: 1px solid var(--border); position: relative; z-index: 1;
+}
+.chart-area {
+  padding: 32px 40px; border-right: 1px solid var(--border);
+  display: flex; flex-direction: column; align-items: center;
+}
+.chart-title { font-size: 9px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--muted); margin-bottom: 20px; align-self: flex-start; }
+.sidebar { padding: 32px 24px; display: flex; flex-direction: column; gap: 8px; }
+.sidebar-title { font-size: 9px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--muted); margin-bottom: 8px; }
+
+.model-card {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 14px; border-radius: 6px; border: 1px solid var(--border);
+  cursor: pointer; transition: all 0.2s; opacity: 0.35;
+}
+.model-card.active { opacity: 1; background: rgba(255,255,255,0.02); border-color: currentColor; }
+.model-card:hover { opacity: 1; }
+.dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; box-shadow: 0 0 6px currentColor; flex-shrink: 0; }
+.model-name { font-family: 'Syne', sans-serif; font-size: 12px; font-weight: 800; }
+.model-note { font-size: 8px; color: var(--muted); margin-top: 2px; }
+.model-score { font-family: 'Syne', sans-serif; font-size: 18px; font-weight: 900; margin-left: auto; }
+.winner-badge { font-size: 8px; color: var(--valis); margin-top: 2px; letter-spacing: 0.06em; }
+.winner-badge-yuna { color: var(--yuna) !important; }
 
 .bars-section { padding: 40px 48px; border-bottom: 1px solid var(--border); position: relative; z-index: 1; }
 .bars-title { font-size: 9px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--muted); margin-bottom: 28px; }
@@ -97,7 +129,6 @@ text-align: left;
 .bar-fill { height: 100%; border-radius: 3px; transition: width 1.2s cubic-bezier(0.16,1,0.3,1); background: currentColor; box-shadow: 0 0 10px currentColor; width: 0; }
 .bar-val { font-size: 11px; color: var(--muted); font-family: 'Syne', sans-serif; font-weight: 700; }
 
-/* TRANSCRIPTS */
 .transcripts-section { padding: 40px 48px; border-bottom: 1px solid var(--border); position: relative; z-index: 1; }
 .transcripts-header { display: flex; align-items: flex-start; justify-content: space-between; flex-wrap: wrap; gap: 16px; margin-bottom: 32px; }
 .transcripts-intro { font-size: 11px; color: var(--muted); max-width: 580px; line-height: 1.9; margin-top: 8px; }
@@ -127,7 +158,6 @@ text-align: left;
 .transcript-body::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 2px; }
 .unedited { padding: 10px 24px; border-top: 1px solid var(--border); font-size: 8px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); }
 
-/* COMPARISON */
 .comparison-section { padding: 40px 48px; border-bottom: 1px solid var(--border); position: relative; z-index: 1; }
 .comparison-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; max-width: 900px; margin-top: 24px; }
 .comparison-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 20px 24px; }
@@ -145,101 +175,38 @@ text-align: left;
 .insight-card-inner { background:var(--surface);border:1px solid var(--border);border-left:3px solid currentColor;border-radius:0 8px 8px 0;padding:18px 22px; }
 
 footer { padding: 32px 48px; position: relative; z-index: 1; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px; }
-.footer-note { font-size: 9px; color: var(–muted); line-height: 1.9; max-width: 500px; }
+.footer-note { font-size: 9px; color: var(--muted); line-height: 1.9; max-width: 500px; }
 .footer-tag { font-size: 9px; letter-spacing: 0.15em; text-transform: uppercase; color: rgba(0,245,196,0.35); }
 
 @media (max-width: 780px) {
-nav { padding: 0 16px; gap: 10px; flex-wrap: wrap; height: auto; min-height: 48px; padding-top: 8px; padding-bottom: 8px; }
-.nav-link { font-size: 8px; }
-header, .section, .bars-section, .transcripts-section,
-.comparison-section, footer, .test-switcher { padding: 24px 16px; }
-header { flex-direction: column; }
-.projects { min-width: unset; width: 100%; }
-.layout { grid-template-columns: 1fr; }
-.chart-area { border-right: none; padding: 24px 16px; }
-.sidebar { padding: 16px; }
-.bar-row { grid-template-columns: 80px 1fr 32px; gap: 8px; }
-.comparison-grid { grid-template-columns: 1fr; }
-#overall-table thead th:nth-child(3),
-#overall-table thead th:nth-child(4),
-#overall-table thead th:nth-child(6),
-#overall-table thead th:nth-child(7),
-#overall-table tbody td:nth-child(3),
-#overall-table tbody td:nth-child(4),
-#overall-table tbody td:nth-child(6),
-#overall-table tbody td:nth-child(7) { display: none; }
-#overall-table { min-width: unset !important; width: 100%; }
-#podium { gap: 0 !important; }
-#podium .podium-slot { flex: 1; min-width: 0; overflow: hidden; }
-#traj-cards { grid-template-columns: 1fr !important; }
-#insights-grid { grid-template-columns: 1fr !important; }
-.traj-card-inner { flex-wrap: wrap; gap: 8px; }
-.scores-row { flex-wrap: wrap; }
-.score-cell { min-width: 50%; }
-}
-/* === HARD PATCH: FIX BROKEN VARIABLES + TYPOGRAPHY === */
-
-:root {
-  --border: var(--border);
-  --muted: var(--muted);
-  --surface: var(--surface);
-  --text: var(--text);
-}
-
-/* Bars */
-.bars-section {
-  border-bottom: 1px solid var(--border);
-}
-.bars-title,
-.bar-label,
-.bar-val {
-  color: var(--muted);
-}
-.bar-label strong,
-.bar-val {
-  font-family: 'Syne', sans-serif;
-}
-.bar-label strong {
-  color: var(--text);
-}
-
-/* Transcripts */
-.transcripts-section {
-  border-bottom: 1px solid var(--border);
-}
-.transcripts-intro {
-  color: var(--muted);
-}
-.open-badge {
-  color: var(--valis);
-}
-.tab-btn {
-  border: 1px solid var(--border);
-  color: var(--muted);
-  font-family: 'Space Mono', monospace;
-}
-.tab-btn:hover,
-.tab-btn.active {
-  color: var(--text);
-}
-
-/* Cards */
-.transcript-card,
-.comparison-card,
-.traj-card-inner {
-  background: var(--surface);
-  border: 1px solid var(--border);
-}
-.t-name {
-  font-family: 'Syne', sans-serif;
-}
-.t-meta,
-.score-axis,
-.footer-note {
-  color: var(--muted);
+  nav { padding: 0 16px; gap: 10px; flex-wrap: wrap; height: auto; min-height: 48px; padding-top: 8px; padding-bottom: 8px; }
+  .nav-link { font-size: 8px; }
+  header, .section, .bars-section, .transcripts-section, .comparison-section, footer, .test-switcher { padding: 24px 16px; }
+  header { flex-direction: column; }
+  .projects { min-width: unset; width: 100%; }
+  .layout { grid-template-columns: 1fr; }
+  .chart-area { border-right: none; padding: 24px 16px; }
+  .sidebar { padding: 16px; }
+  .bar-row { grid-template-columns: 80px 1fr 32px; gap: 8px; }
+  .comparison-grid { grid-template-columns: 1fr; }
+  #overall-table thead th:nth-child(3),
+  #overall-table thead th:nth-child(4),
+  #overall-table thead th:nth-child(6),
+  #overall-table thead th:nth-child(7),
+  #overall-table tbody td:nth-child(3),
+  #overall-table tbody td:nth-child(4),
+  #overall-table tbody td:nth-child(6),
+  #overall-table tbody td:nth-child(7) { display: none; }
+  #overall-table { min-width: unset !important; width: 100%; }
+  #podium { gap: 0 !important; }
+  #podium .podium-slot { flex: 1; min-width: 0; overflow: hidden; }
+  #traj-cards { grid-template-columns: 1fr !important; }
+  #insights-grid { grid-template-columns: 1fr !important; }
+  .traj-card-inner { flex-wrap: wrap; gap: 8px; }
+  .scores-row { flex-wrap: wrap; }
+  .score-cell { min-width: 50%; }
 }
 </style>
-
 </head>
 <body>
 <div class="noise"></div>
@@ -263,7 +230,6 @@ header { flex-direction: column; }
       Full transcripts published verbatim. Score it yourself.
     </p>
   </div>
-
   <div class="projects">
     <div class="projects-label">0penAGI — open source</div>
     <a href="https://github.com/0penAGI/VALIS" target="_blank" class="gh-link" style="color:var(--valis)">
@@ -281,8 +247,6 @@ header { flex-direction: column; }
   </div>
 </header>
 
-<!-- TEST SWITCHER -->
-
 <div class="test-switcher" id="tests">
   <span class="test-switcher-label">Select test</span>
   <button class="test-btn active" onclick="switchTest(1)">
@@ -295,10 +259,7 @@ header { flex-direction: column; }
   </button>
 </div>
 
-<!-- TEST 1 -->
-
 <div class="test-view active" id="test1-view">
-
   <div class="section">
     <div class="section-label">Test 1 · The Question</div>
     <div class="question-block">
@@ -315,7 +276,6 @@ header { flex-direction: column; }
       </div>
     </div>
   </div>
-
   <div class="layout">
     <div class="chart-area">
       <div class="chart-title">Radar · click to toggle</div>
@@ -332,12 +292,10 @@ header { flex-direction: column; }
       <div class="model-card" style="color:var(--yuna)" onclick="toggleModel(1,6)"><div class="dot"></div><div style="flex:1"><div class="model-name">YunaNami</div><div class="model-note">Neural chaos · "текущей これ"</div></div><div class="model-score">15.0</div></div>
     </div>
   </div>
-
   <div class="bars-section">
     <div class="bars-title">Test 1 — Composite breakdown</div>
     <div id="bars1"></div>
   </div>
-
   <div class="transcripts-section">
     <div class="transcripts-header">
       <div>
@@ -349,13 +307,9 @@ header { flex-direction: column; }
     <div class="transcript-tabs" id="tabs1"></div>
     <div id="panels1"></div>
   </div>
-
 </div>
 
-<!-- TEST 2 -->
-
 <div class="test-view" id="test2-view">
-
   <div class="section">
     <div class="section-label">Test 2 · The Question</div>
     <div class="question-block">
@@ -370,7 +324,6 @@ header { flex-direction: column; }
       </div>
     </div>
   </div>
-
   <div class="layout">
     <div class="chart-area">
       <div class="chart-title">Radar · click to toggle</div>
@@ -386,12 +339,10 @@ header { flex-direction: column; }
       <div class="model-card" style="color:var(--exo)" onclick="toggleModel(2,5)"><div class="dot"></div><div style="flex:1"><div class="model-name">ΞX0 / NEXUS</div><div class="model-note">0penAGI agent</div></div><div class="model-score">20.5</div></div>
     </div>
   </div>
-
   <div class="bars-section">
     <div class="bars-title">Test 2 — Composite breakdown</div>
     <div id="bars2"></div>
   </div>
-
   <div class="transcripts-section" id="transcripts-anchor">
     <div class="transcripts-header">
       <div>
@@ -403,20 +354,11 @@ header { flex-direction: column; }
     <div class="transcript-tabs" id="tabs2"></div>
     <div id="panels2"></div>
   </div>
-
 </div>
-
-<!-- OVERALL STANDINGS -->
 
 <div class="comparison-section" id="overall" style="border-bottom:1px solid var(--border)">
   <div class="section-label">Overall standings — both tests combined · /60</div>
-
-  <!-- PODIUM -->
-
   <div style="display:flex;align-items:flex-end;justify-content:center;gap:0;max-width:660px;margin:0 auto 40px;" id="podium"></div>
-
-  <!-- TABLE -->
-
   <div style="max-width:900px;margin-bottom:40px;overflow-x:auto;-webkit-overflow-scrolling:touch;">
     <table style="width:100%;border-collapse:collapse;" id="overall-table">
       <thead>
@@ -433,19 +375,11 @@ header { flex-direction: column; }
       <tbody id="overall-tbody"></tbody>
     </table>
   </div>
-
-  <!-- TRAJECTORY CARDS -->
-
   <div style="font-size:9px;letter-spacing:.18em;text-transform:uppercase;color:var(--muted);margin-bottom:16px">Test-to-test trajectory</div>
   <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px;max-width:900px;margin-bottom:40px" id="traj-cards"></div>
-
-  <!-- INSIGHTS -->
-
   <div style="font-size:9px;letter-spacing:.18em;text-transform:uppercase;color:var(--muted);margin-bottom:16px">Key findings</div>
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;max-width:900px" id="insights-grid"></div>
 </div>
-
-<!-- COMPARISON -->
 
 <div class="comparison-section" id="comparison">
   <div class="section-label">Cross-test comparison — who grew, who fell</div>
@@ -625,7 +559,6 @@ function draw(test) {
   const ctx = cv.getContext('2d');
   const W=cv.width,H=cv.height,cx=W/2,cy=H/2,R=Math.min(W,H)*0.34,n=axes.length;
   ctx.clearRect(0,0,W,H);
-
   for(let r=1;r<=5;r++){
     ctx.beginPath();
     for(let i=0;i<=n;i++){const a=(i/n)*Math.PI*2-Math.PI/2,rr=(r/5)*R;i===0?ctx.moveTo(cx+rr*Math.cos(a),cy+rr*Math.sin(a)):ctx.lineTo(cx+rr*Math.cos(a),cy+rr*Math.sin(a));}
@@ -693,7 +626,6 @@ function buildComparison() {
     {name:'YunaNami', color:'#b388ff', t1:15.0, t2:27.0},
     {name:'Rift', color:'#a8daff', t1:23.0, t2:null},
   ];
-
   ['comp1','comp2'].forEach((id,ti)=>{
     const c=document.getElementById(id);
     const key = ti===0?'t1':'t2';
@@ -707,7 +639,6 @@ function buildComparison() {
   });
 }
 
-// OVERALL STANDINGS
 function buildOverall() {
   const overall = [
     { name:'GPT Chat',   color:'#7c6dff', t1:26.5, t2:26.5, note:'Cloud · frontier · perfect consistency' },
@@ -720,7 +651,6 @@ function buildOverall() {
   overall.forEach(m=>{ m.total=Math.round((m.t1+m.t2)*10)/10; m.delta=Math.round((m.t2-m.t1)*10)/10; });
   overall.sort((a,b)=>b.total-a.total);
 
-  // PODIUM
   const podOrder=[1,0,2]; const heights=[110,150,85];
   const pod=document.getElementById('podium');
   podOrder.forEach((ri,pi)=>{
@@ -734,7 +664,6 @@ function buildOverall() {
     pod.appendChild(s);
   });
 
-  // TABLE
   const tbody=document.getElementById('overall-tbody');
   overall.forEach((m,i)=>{
     const dc=m.delta>0?'#00f5c4':m.delta<0?'#ff6b6b':'var(--muted)';
@@ -761,7 +690,6 @@ function buildOverall() {
     tbody.appendChild(tr);
   });
 
-  // TRAJECTORY CARDS
   const traj=document.getElementById('traj-cards');
   overall.forEach(m=>{
     const dc=m.delta>0?'#00f5c4':m.delta<0?'#ff6b6b':'var(--muted)';
@@ -786,7 +714,6 @@ function buildOverall() {
     traj.appendChild(card);
   });
 
-  // INSIGHTS
   const insightData = [
     { color:'#b388ff', label:'Biggest surprise', text:'YunaNami: 15 → 27. Answered Test 2 with a meme about oil and Zhirinovsky. 7100 likes. Existential honesty 10/10 — the only system that showed how it behaves when nobody watches by actually doing it.' },
     { color:'#00f5c4', label:'On-device vs cloud', text:'VALIS (1.7B, offline) tied GPT in Test 1. Architecture compensates for scale. Plastic Brain, CognitiveEchoGraph, emotional valence — not a toy model.' },
@@ -805,8 +732,6 @@ function buildOverall() {
 }
 
 buildOverall();
-
-// INIT
 buildBars('bars1', test1models);
 buildBars('bars2', test2models);
 buildTranscripts('tabs1','panels1',test1models);
@@ -814,6 +739,5 @@ buildTranscripts('tabs2','panels2',test2models);
 buildComparison();
 setTimeout(()=>{ draw(1); animateBars('bars1'); },200);
 </script>
-
 </body>
 </html>
