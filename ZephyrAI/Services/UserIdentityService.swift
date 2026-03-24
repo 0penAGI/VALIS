@@ -24,13 +24,11 @@ final class UserIdentityService: ObservableObject {
         if cleanedName.isEmpty && cleanedGender.isEmpty { return "" }
 
         var parts: [String] = []
-        parts.append("Human user (not you):")
-        if !cleanedName.isEmpty { parts.append("User name: \(cleanedName)") }
-        if !cleanedGender.isEmpty { parts.append("User gender: \(cleanedGender)") }
-        parts.append("Rules:")
-        parts.append("- Your name is VALIS.")
-        parts.append("- Never treat the user's name as your own name.")
-        parts.append("- Use the user's name only to address them or to answer questions like “what is my name?”.")
+        parts.append("Persistent user facts:")
+        if !cleanedName.isEmpty { parts.append("name=\(cleanedName)") }
+        if !cleanedGender.isEmpty { parts.append("gender=\(cleanedGender)") }
+        parts.append("These facts refer to the human user and persist across messages.")
+        parts.append("Your name is VALIS, not the user's name.")
 
         var block = "\n\n" + parts.joined(separator: "\n")
         if block.count > maxChars {

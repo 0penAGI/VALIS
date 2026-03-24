@@ -155,6 +155,10 @@ class MemoryService: ObservableObject {
     private let restIdleThreshold: TimeInterval = 180
     private let restConsolidationInterval: TimeInterval = 600
     private let duplicateEmbeddingThreshold: Double = 0.965
+    private let hiddenSystemMemoryPrefixes = ["[experience]", "[self-reflection]", "[self-reflection-loop]", "[drift-monitor]"]
+    private let attentionTopK = 8
+    private let episodicCandidateLimit = 2
+    private let episodicActivationStrength = 0.58
     
     init() {
         let detected = MemoryProfile.detect()
@@ -168,6 +172,7 @@ class MemoryService: ObservableObject {
         loadMemories()
         loadGraph()
         loadEchoGraph()
+        QuantumMemoryService.shared.loadStatsIfNeeded()
         demoteLegacyIdentityMemoriesIfNeeded()
         seedEchoGraphIfNeeded()
         startEchoLoop()
@@ -302,7 +307,27 @@ class MemoryService: ObservableObject {
     }
 
     func addExperienceMemory(_ content: String, importanceOverride: Double) {
-        let enriched = buildCognitiveLayer(for: content, importanceOverride: importanceOverride)
+        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        guard !hasNearDuplicateMemory(for: trimmed, lookback: 96) else { return }
+
+        let lower = trimmed.lowercased()
+        let isReflection = lower.hasPrefix("[self-reflection]") || lower.hasPrefix("[self-reflection-loop]")
+        let perspective: String = {
+            if lower.hasPrefix("[self-reflection-loop]") { return "meta" }
+            if isReflection { return "self" }
+            if lower.hasPrefix("[experience]") { return "episodic" }
+            if lower.hasPrefix("[drift-monitor]") { return "monitor" }
+            return "self"
+        }()
+
+        let boundedImportance = max(0.45, min(1.55, importanceOverride))
+        let enriched = buildCognitiveLayer(
+            for: trimmed,
+            importanceOverride: boundedImportance,
+            isReflection: isReflection,
+            perspective: perspective
+        )
         memories.append(enriched)
         saveMemories()
         updateGraph(for: enriched)
@@ -310,10 +335,9 @@ class MemoryService: ObservableObject {
             memoryId: enriched.id,
             embedding: enriched.embedding,
             importance: enriched.importance,
-            strength: 0.35,
-            isPersistent: enriched.isIdentity
+            strength: episodicActivationStrength,
+            isPersistent: false
         )
-        applyIdentityRestorationIfNeeded(from: enriched)
         saveGraph()
         saveEchoGraph()
     }
@@ -756,15 +780,16 @@ class MemoryService: ObservableObject {
     /// LLM-facing memory block. This intentionally avoids the full "field snapshot" framing
     /// to reduce templating/stamp effects in answers.
     func getLLMContextBlock(maxChars: Int) -> String {
-        getLLMContextBlock(maxChars: maxChars, forUserText: "")
+        getLLMContextBlock(maxChars: maxChars, forUserText: "", candidateLimit: 3)
     }
 
-    func getLLMContextBlock(maxChars: Int, forUserText userText: String) -> String {
+    func getLLMContextBlock(maxChars: Int, forUserText userText: String, candidateLimit: Int = 3) -> String {
         if memories.isEmpty { return "" }
         if maxChars <= 0 { return "" }
 
         let now = Date()
-        let field = echoGraph.fieldVector()
+        let baseField = echoGraph.fieldVector()
+        let field = attendedField(baseField: baseField, queryText: userText, memoryPool: visibleMemories())
         let novelty = recentNoveltySignal(window: noveltyWindowSize)
         let dynamicThreshold = dynamicContextGateThreshold(novelty: novelty)
 
@@ -772,6 +797,7 @@ class MemoryService: ObservableObject {
         let predictedSet = Set(predicted)
 
         let candidates = memories
+            .filter { !isHiddenSystemMemory($0) }
             .compactMap { mem -> QuantumMemoryService.Candidate? in
                 let activation = echoGraph.activation(for: mem.id)
                 guard contextGatePass(
@@ -797,14 +823,52 @@ class MemoryService: ObservableObject {
         guard !sorted.isEmpty else { return "" }
 
         let selected: [QuantumMemoryService.Candidate] = {
+            let selectionCount = max(1, candidateLimit)
+            let pinned = sorted.filter { $0.memory.isPinned }
+            let reservedPinned = Array(pinned.prefix(min(2, selectionCount)))
+            let remainingSlots = max(0, selectionCount - reservedPinned.count)
+            let pool = sorted.filter { candidate in
+                !reservedPinned.contains(where: { $0.memory.id == candidate.memory.id })
+            }
+            if remainingSlots == 0 {
+                return reservedPinned
+            }
             guard QuantumFeatures.isMemorySearchEnabled(),
                   QuantumMemoryService.shared.isEnabled(),
-                  sorted.count > 1 else {
-                return Array(sorted.prefix(3))
+                  pool.count > 1 else {
+                return reservedPinned + Array(pool.prefix(remainingSlots))
             }
             let motivators = MotivationService.shared.state
-            return QuantumMemoryService.shared.collapse(candidates: sorted, k: 3, motivators: motivators).selected
+            let enableTrace = QuantumMemoryService.shared.isTraceEnabled()
+            let seed: UInt64? = {
+                if let configured = QuantumMemoryService.shared.configuredSeed() { return configured }
+                guard QuantumMemoryService.shared.isDeterministic() else { return nil }
+                return deterministicSeed(candidates: pool, motivators: motivators, userText: userText)
+            }()
+            let result = QuantumMemoryService.shared.collapse(
+                candidates: pool,
+                k: remainingSlots,
+                motivators: motivators,
+                seed: seed,
+                enableTrace: enableTrace
+            )
+            if enableTrace, let trace = result.trace {
+                let seedLine = trace.seedUsed.map { " seed=\($0)" } ?? ""
+                let betaStr = String(format: "%.2f", trace.beta)
+                let divStr = String(format: "%.2f", trace.diversityStrength)
+                let cauStr = String(format: "%.2f", trace.cautionBias)
+                let minPStr = String(format: "%.2f", trace.minPenalty)
+                print("[QuantumCollapse] candidates=\(trace.candidateIds.count) collapsed=\(trace.collapsedIds.count) beta=\(betaStr) mark=\(trace.markCount) div=\(divStr) caution=\(cauStr) minP=\(minPStr)\(seedLine)")
+            }
+            return reservedPinned + result.selected
         }()
+
+        let episodicSelected = selectEpisodicMemories(
+            userText: userText,
+            field: field,
+            now: now,
+            novelty: novelty
+        )
 
         var lines: [String] = []
         var referencedIds: [UUID] = []
@@ -819,6 +883,13 @@ class MemoryService: ObservableObject {
             if text.isEmpty { continue }
             lines.append("- \(text)")
             referencedIds.append(node.memory.id)
+        }
+
+        for memory in episodicSelected {
+            let cleaned = compressMemory(cleanHiddenMemoryContent(memory.content), maxWords: 18)
+            guard !cleaned.isEmpty else { continue }
+            lines.append("- [recent lived] \(cleaned)")
+            referencedIds.append(memory.id)
         }
 
         recordAccess(for: referencedIds)
@@ -839,24 +910,53 @@ class MemoryService: ObservableObject {
         return block
     }
 
+    private func deterministicSeed(candidates: [QuantumMemoryService.Candidate], motivators: MotivatorState, userText: String) -> UInt64 {
+        // Stable hash across runs: FNV-1a 64-bit over ids + quantized motivators + userText.
+        var hash: UInt64 = 0xcbf29ce484222325
+        func mix(_ bytes: [UInt8]) {
+            for b in bytes {
+                hash ^= UInt64(b)
+                hash &*= 0x100000001b3
+            }
+        }
+
+        for c in candidates.prefix(32) {
+            mix(Array(c.memory.id.uuidString.utf8))
+        }
+
+        let qCur = Int((max(0.0, min(1.0, motivators.curiosity)) * 100).rounded())
+        let qCau = Int((max(0.0, min(1.0, motivators.caution)) * 100).rounded())
+        let qMood = Int((max(0.0, min(1.0, motivators.mood)) * 100).rounded())
+        mix(Array("c\(qCur)-k\(qCau)-m\(qMood)".utf8))
+
+        if !userText.isEmpty {
+            mix(Array(userText.lowercased().prefix(140).utf8))
+        }
+
+        return hash == 0 ? 1 : hash
+    }
+
     func getContextBlock(maxChars: Int) -> String {
         if memories.isEmpty { return "" }
         if maxChars <= 0 { return "" }
 
         let now = Date()
-        let field = echoGraph.fieldVector()
+        let baseField = echoGraph.fieldVector()
+        let querySeed = conversationSummary.isEmpty ? userProfile.topTopics.joined(separator: " ") : conversationSummary
+        let field = attendedField(baseField: baseField, queryText: querySeed, memoryPool: visibleMemories())
         let fieldLine = formatFieldVector(field, targetCount: 10)
 
         let activationLevel = echoGraph.averageActivation(excludingPersistent: true)
         let novelty = recentNoveltySignal(window: noveltyWindowSize)
         let dynamicThreshold = dynamicContextGateThreshold(novelty: novelty)
 
-        let recent = memories.sorted { $0.timestamp > $1.timestamp }
+        let visibleMemories = memories.filter { !isHiddenSystemMemory($0) }
+        let recent = visibleMemories.sorted { $0.timestamp > $1.timestamp }
         let affectSample = Array(recent.prefix(8))
         let avgValence = affectSample.map { $0.emotionValence }.reduce(0.0, +) / Double(max(1, affectSample.count))
         let avgIntensity = affectSample.map { $0.emotionIntensity }.reduce(0.0, +) / Double(max(1, affectSample.count))
 
-        let candidates = memories
+        let candidates = visibleMemories
             .compactMap { mem -> QuantumMemoryService.Candidate? in
                 let activation = echoGraph.activation(for: mem.id)
                 guard contextGatePass(
@@ -874,23 +974,28 @@ class MemoryService: ObservableObject {
 
         let selectedNodes: [QuantumMemoryService.Candidate] = {
             let sorted = candidates.sorted { $0.score > $1.score }
+            let pinned = sorted.filter { $0.memory.isPinned }
+            let reservedPinned = Array(pinned.prefix(1))
+            let pool = sorted.filter { candidate in
+                !reservedPinned.contains(where: { $0.memory.id == candidate.memory.id })
+            }
             guard QuantumFeatures.isMemorySearchEnabled(),
                   QuantumMemoryService.shared.isEnabled(),
-                  sorted.count > 1 else {
-                return Array(sorted.prefix(3))
+                  pool.count > 1 else {
+                return reservedPinned + Array(pool.prefix(max(0, 3 - reservedPinned.count)))
             }
             let motivators = MotivationService.shared.state
             let enableTrace = QuantumMemoryService.shared.isTraceEnabled()
             let result = QuantumMemoryService.shared.collapse(
-                candidates: sorted,
-                k: 3,
+                candidates: pool,
+                k: max(0, 3 - reservedPinned.count),
                 motivators: motivators,
                 enableTrace: enableTrace
             )
             if enableTrace, let trace = result.trace {
                 print("[QuantumCollapse] candidates=\(trace.candidateIds.count) collapsed=\(trace.collapsedIds.count) beta=\(String(format: "%.2f", trace.beta)) mark=\(trace.markCount) div=\(String(format: "%.2f", trace.diversityStrength)) caution=\(String(format: "%.2f", trace.cautionBias))")
             }
-            return result.selected
+            return reservedPinned + result.selected
         }()
         var nodeLines: [String] = []
         var nodeIds: [UUID] = []
@@ -977,20 +1082,11 @@ class MemoryService: ObservableObject {
         preferences: UserPreferenceProfile
     ) -> String {
         var text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        let prompt = userPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
-
-
         text = normalizeWhitespace(text)
         text = removeDuplicateLines(text)
 
         if detail != .brief {
             text = ensureReadableParagraphs(text)
-        }
-
-        if motivators.caution > 0.9 &&
-            isSensitiveHighRiskPrompt(prompt) &&
-            !containsCautionHint(in: text) {
-            text += "\n\nЕсли тема чувствительная (медицина, финансы, право), уточни контекст и ограничения."
         }
 
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1112,7 +1208,7 @@ class MemoryService: ObservableObject {
         let surpriseBoost = surpriseRetention(for: memory) * 0.35
         var score = (memory.importance + surpriseBoost) * activation * timeWeight
         if memory.isPinned {
-            score *= 1.2
+            score = (score * 2.2) + 0.75
         }
         if !field.isEmpty,
            !memory.embedding.isEmpty,
@@ -1120,6 +1216,90 @@ class MemoryService: ObservableObject {
             score += cosineSimilarity(a: memory.embedding, b: field)
         }
         return score
+    }
+
+    private func attendedField(baseField: [Double], queryText: String, memoryPool: [Memory]) -> [Double] {
+        guard !baseField.isEmpty else { return [] }
+        let queryEmbedding = generateEmbedding(from: queryText)
+        let anchors = memoryPool.filter { $0.embedding.count == baseField.count && !$0.embedding.isEmpty }
+        guard !anchors.isEmpty else { return baseField }
+
+        let scored = anchors.map { memory -> (memory: Memory, score: Double) in
+            let querySim = queryEmbedding.count == memory.embedding.count
+                ? max(0.0, cosineSimilarity(a: queryEmbedding, b: memory.embedding))
+                : 0.0
+            let latentSim = max(0.0, cosineSimilarity(a: baseField, b: memory.embedding))
+            let pinBias = memory.isPinned ? 0.25 : 0.0
+            let identityBias = memory.isIdentity ? 0.18 : 0.0
+            let activationBias = min(1.0, echoGraph.activation(for: memory.id)) * 0.22
+            let score = (querySim * 0.52) + (latentSim * 0.38) + pinBias + identityBias + activationBias
+            return (memory, score)
+        }
+        .sorted { $0.score > $1.score }
+
+        let top = Array(scored.prefix(attentionTopK))
+        guard !top.isEmpty else { return baseField }
+
+        let weights = attentionWeights(for: top.map(\.score))
+        guard !weights.isEmpty else { return baseField }
+
+        var attended = Array(repeating: 0.0, count: baseField.count)
+        for (index, item) in top.enumerated() {
+            let weight = weights[index]
+            for dim in attended.indices {
+                attended[dim] += item.memory.embedding[dim] * weight
+            }
+        }
+
+        let blend = queryText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? 0.32 : 0.48
+        var merged = Array(repeating: 0.0, count: baseField.count)
+        for dim in merged.indices {
+            merged[dim] = (baseField[dim] * (1.0 - blend)) + (attended[dim] * blend)
+        }
+        return normalizeVector(merged)
+    }
+
+    private func attentionWeights(for scores: [Double]) -> [Double] {
+        guard !scores.isEmpty else { return [] }
+        let maxScore = scores.max() ?? 0.0
+        let exps = scores.map { exp(($0 - maxScore) * 3.2) }
+        let sum = exps.reduce(0.0, +)
+        guard sum > 0 else { return [] }
+        return exps.map { $0 / sum }
+    }
+
+    private func normalizeVector(_ vector: [Double]) -> [Double] {
+        let norm = sqrt(vector.reduce(0.0) { $0 + ($1 * $1) })
+        guard norm > 0 else { return vector }
+        return vector.map { $0 / norm }
+    }
+
+    func visibleMemories() -> [Memory] {
+        memories.filter { !isHiddenSystemMemory($0) }
+    }
+
+    private func hiddenMemories() -> [Memory] {
+        memories.filter(isHiddenSystemMemory)
+    }
+
+    private func isHiddenSystemMemory(_ memory: Memory) -> Bool {
+        let trimmed = memory.content.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return hiddenSystemMemoryPrefixes.contains { trimmed.hasPrefix($0) }
+    }
+
+    private func cleanHiddenMemoryContent(_ text: String) -> String {
+        var value = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let patterns = [
+            "^\\[experience\\]\\s*",
+            "^\\[self-reflection\\]\\s*",
+            "^\\[self-reflection-loop\\]\\s*",
+            "^\\[drift-monitor\\]\\s*"
+        ]
+        for pattern in patterns {
+            value = value.replacingOccurrences(of: pattern, with: "", options: .regularExpression)
+        }
+        value = value.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+        return value.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func timeWeight(for memory: Memory, now: Date) -> Double {
@@ -1134,6 +1314,60 @@ class MemoryService: ObservableObject {
 
         let uShape = max(recency, antiquity)
         return 0.35 + (0.65 * uShape)
+    }
+
+    private func episodicScore(for memory: Memory, field: [Double], now: Date, queryText: String) -> Double {
+        var score = relevanceScore(for: memory, field: field, now: now)
+        let age = max(0.0, now.timeIntervalSince(memory.timestamp))
+        let recentBoost = exp(-age / max(1.0, 60 * 60 * 24 * 5)) * 0.45
+        score += recentBoost
+
+        if memory.isSelfReflection {
+            score += 0.12
+        }
+
+        if !queryText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let cleaned = cleanHiddenMemoryContent(memory.content)
+            let promptConcepts = Set(extractConcepts(from: queryText))
+            let memoryConcepts = Set(extractConcepts(from: cleaned))
+            if !promptConcepts.isEmpty && !memoryConcepts.isDisjoint(with: promptConcepts) {
+                score += 0.18
+            }
+        }
+
+        return score
+    }
+
+    private func selectEpisodicMemories(userText: String, field: [Double], now: Date, novelty: Double) -> [Memory] {
+        let eligible = hiddenMemories().filter { memory in
+            let lower = memory.content.lowercased()
+            return !lower.hasPrefix("[drift-monitor]")
+        }
+        guard !eligible.isEmpty else { return [] }
+
+        let threshold = max(0.08, dynamicContextGateThreshold(novelty: novelty) - 0.08)
+        let scored = eligible.compactMap { memory -> (memory: Memory, score: Double)? in
+            let activation = echoGraph.activation(for: memory.id)
+            guard contextGatePass(
+                memory: memory,
+                activation: activation,
+                field: field,
+                dynamicThreshold: threshold,
+                novelty: novelty
+            ) else {
+                return nil
+            }
+            let score = episodicScore(for: memory, field: field, now: now, queryText: userText)
+            return (memory, score)
+        }
+        .sorted { lhs, rhs in
+            if lhs.score == rhs.score {
+                return lhs.memory.timestamp > rhs.memory.timestamp
+            }
+            return lhs.score > rhs.score
+        }
+
+        return Array(scored.prefix(episodicCandidateLimit).map(\.memory))
     }
 
     private func formatFieldVector(_ field: [Double], targetCount: Int) -> String {
@@ -1364,10 +1598,14 @@ class MemoryService: ObservableObject {
             let lastUse = max(memory.timestamp, memory.lastAccess)
             let age = now.timeIntervalSince(lastUse)
             let activation = echoGraph.activation(for: memory.id)
+            let isEpisodic = isHiddenSystemMemory(memory)
 
             if memory.importance >= 1.4 { return true }
             if activation >= 0.9 { return true }
             if memory.predictionError >= 1.15 { return true }
+            if isEpisodic && age < (60 * 60 * 24 * 45) && (memory.importance >= 0.75 || activation >= 0.18) {
+                return true
+            }
             if age < maxAge && memory.importance >= importanceFloor && activation >= activationFloor {
                 return true
             }
@@ -1497,7 +1735,33 @@ class MemoryService: ObservableObject {
         }
         .sorted { $0.quality > $1.quality }
 
-        for item in scored.prefix(maxCount) {
+        let selected: [(snippet: String, confidence: Double, relevance: Double, quality: Double)]
+        if QuantumMemoryService.shared.isEnabled(), scored.count > maxCount {
+            let motivators = MotivationService.shared.state
+            let candidates = scored.map { item in
+                QuantumMemoryService.Candidate(
+                    memory: buildCognitiveLayer(
+                        for: "[external:\(source)] \(item.snippet)",
+                        importanceOverride: min(1.6, max(0.5, 0.7 + (item.quality * 0.9)))
+                    ),
+                    activation: item.relevance,
+                    score: item.quality
+                )
+            }
+            let result = QuantumMemoryService.shared.collapse(
+                candidates: candidates,
+                k: maxCount,
+                motivators: motivators,
+                seed: QuantumMemoryService.shared.configuredSeed(),
+                enableTrace: QuantumMemoryService.shared.isTraceEnabled()
+            )
+            let selectedKeys = Set(result.selected.map { normalizeForDedup($0.memory.content) })
+            selected = scored.filter { selectedKeys.contains(normalizeForDedup("[external:\(source)] \($0.snippet)")) }
+        } else {
+            selected = Array(scored.prefix(maxCount))
+        }
+
+        for item in selected {
             if item.quality < 0.25 { continue }
             let normalized = normalizeForDedup(item.snippet)
             if normalized.isEmpty { continue }
@@ -1741,7 +2005,7 @@ private enum MemoryProfile {
 
     var autonomousInterval: TimeInterval {
         switch self {
-        case .eco: return 900
+        case .eco: return 1200
         case .beast: return 600
         case .godmode: return 480
         }
@@ -1749,7 +2013,7 @@ private enum MemoryProfile {
 
     var echoTickInterval: UInt64 {
         switch self {
-        case .eco: return 100_000_000
+        case .eco: return 300_000_000
         case .beast: return 50_000_000
         case .godmode: return 40_000_000
         }
@@ -1757,7 +2021,7 @@ private enum MemoryProfile {
 
     var spontaneousTickInterval: UInt64 {
         switch self {
-        case .eco: return 8_000_000_000
+        case .eco: return 12_000_000_000
         case .beast: return 5_000_000_000
         case .godmode: return 4_000_000_000
         }
@@ -1765,7 +2029,7 @@ private enum MemoryProfile {
 
     var compressedBudget: Int {
         switch self {
-        case .eco: return 400
+        case .eco: return 280
         case .beast: return 600
         case .godmode: return 800
         }
@@ -1773,7 +2037,7 @@ private enum MemoryProfile {
 
     var rawBudget: Int {
         switch self {
-        case .eco: return 800
+        case .eco: return 560
         case .beast: return 1200
         case .godmode: return 1600
         }

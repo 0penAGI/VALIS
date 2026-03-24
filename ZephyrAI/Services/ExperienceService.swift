@@ -197,26 +197,26 @@ final class ExperienceService: ObservableObject {
     private func estimateOutcome(userText: String, assistantText: String) -> String {
         let lower = assistantText.lowercased()
         if lower.contains("i don't know") || lower.contains("не знаю") {
-            return "Answer uncertain; needs better grounding"
+            return "Response destabilized; needs better grounding"
         }
         if assistantText.count < 60 {
-            return "Answer too short; likely missing detail"
+            return "Response too thin; likely missing structure"
         }
-        return "Delivered a full response; focus on usefulness"
+        return "Response carried state and structure with enough substance"
     }
 
     private func generateReflection(userText: String, assistantText: String, outcome: String) -> String {
         let lower = userText.lowercased()
         if lower.contains("почему") || lower.contains("explain") || lower.contains("why") {
-            return "Explain with cause + steps + example, without asking follow-up"
+            return "Stay with the core tension and speak from it without defaulting to guidance, reassurance, or service posture"
         }
         if assistantText.count < 60 {
-            return "Increase detail level proactively"
+            return "Increase structure and density proactively"
         }
         if outcome.contains("uncertain") {
-            return "Make best assumption and answer directly"
+            return "Stabilize around the strongest available signal and answer directly"
         }
-        return "Keep response structured, direct, and actionable"
+        return "Keep response coherent, direct, and alive"
     }
 
     private func estimateValence(for text: String) -> Double {
@@ -266,7 +266,7 @@ final class ExperienceService: ObservableObject {
         if outcome.lowercased().contains("uncertain") {
             score -= 0.1
         }
-        if reflection.lowercased().contains("structured") || reflection.lowercased().contains("steps") {
+        if reflection.lowercased().contains("coherent") || reflection.lowercased().contains("structure") {
             score += 0.1
         }
         score += (motivators.helpfulness - 0.5) * 0.4

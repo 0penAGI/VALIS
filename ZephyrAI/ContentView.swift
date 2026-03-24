@@ -11,6 +11,7 @@ struct ContentView: View {
             ChatView()
         }
         .navigationViewStyle(.stack) // Use stack style for better behavior on iPad/iPhone
+        .statusBarHidden(true)
     }
 }
 

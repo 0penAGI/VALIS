@@ -9,15 +9,9 @@ struct SettingsView: View {
     private let glassBlurRadius: CGFloat = 4
     private let glassMaxOffset: CGFloat = 18
     @Environment(\.dismiss) private var dismiss
-    @ObservedObject private var identityService = IdentityService.shared
-    
-    @State private var masterPrompt: String = ""
-    @State private var isEditingPrompt = false
     @State private var isGlassActive = false
     @Environment(\.colorScheme) private var colorScheme
     @AppStorage(LLMModelStorage.key) private var selectedModelRaw: String = LLMModelStorage.defaultValue.rawValue
-    @AppStorage(UserIdentityService.nameKey) private var userName: String = ""
-    @AppStorage(UserIdentityService.genderKey) private var userGender: String = ""
 
     private var glassBackground: some View {
         let baseOpacity = colorScheme == .dark ? glassOpacityDark : glassOpacityLight
@@ -49,58 +43,6 @@ struct SettingsView: View {
                 }
 
                 List {
-                Section {
-                    VStack(alignment: .leading, spacing: 8) {
-                        VStack(alignment: .leading, spacing: 10) {
-                            TextField("User Name", text: $userName)
-                                .textInputAutocapitalization(.words)
-                                .autocorrectionDisabled()
-                                .padding(10)
-                                .background(Color(UIColor.secondarySystemBackground).opacity(colorScheme == .dark ? 0.7 : 1.0))
-                                .clipShape(RoundedRectangle(cornerRadius: 8))
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 8)
-                                        .stroke(colorScheme == .dark ? Color.white.opacity(0.08) : Color.black.opacity(0.08), lineWidth: 1)
-                                )
-
-                            TextField("Gender", text: $userGender)
-                                .textInputAutocapitalization(.never)
-                                .autocorrectionDisabled()
-                                .padding(10)
-                                .background(Color(UIColor.secondarySystemBackground).opacity(colorScheme == .dark ? 0.7 : 1.0))
-                                .clipShape(RoundedRectangle(cornerRadius: 8))
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 8)
-                                        .stroke(colorScheme == .dark ? Color.white.opacity(0.08) : Color.black.opacity(0.08), lineWidth: 1)
-                                )
-                        }
-
-                        HStack {
-                            Text("AI Personality")
-                                .font(.headline)
-                                .foregroundColor(colorScheme == .dark ? .white : .primary)
-                            Spacer()
-                            Text(isEditingPrompt ? "" : "")
-                                .font(.caption)
-                                .foregroundColor(colorScheme == .dark ? .white.opacity(0.7) : .secondary)
-                        }
-                        TextEditor(text: $masterPrompt)
-                            .frame(minHeight: 140)
-                            .padding(8)
-                            .background(Color(UIColor.secondarySystemBackground).opacity(colorScheme == .dark ? 0.7 : 1.0))
-                            .clipShape(RoundedRectangle(cornerRadius: 8))
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 8)
-                                    .stroke(colorScheme == .dark ? Color.white.opacity(0.08) : Color.black.opacity(0.08), lineWidth: 1)
-                            )
-                            .onChange(of: masterPrompt) { _, _ in
-                                isEditingPrompt = true
-                            }
-                    }
-                    .padding(.vertical, 6)
-                }
-                .listRowBackground(Color.clear)
-
                 Section("Model") {
                     VStack(alignment: .leading, spacing: 10) {
                         Picker("Model Size", selection: $selectedModelRaw) {
@@ -118,12 +60,54 @@ struct SettingsView: View {
                     .padding(.vertical, 6)
                 }
                 .listRowBackground(Color.clear)
-                
-                Section("Memory") {
+
+                Section("Memories") {
+                    Button {
+                        ChatViewModel.shared.createNewChat()
+                        dismiss()
+                    } label: {
+                        HStack(spacing: 10) {
+                            Image(systemName: "plus")
+                                .font(.system(size: 13, weight: .semibold))
+                            Text("New Chat")
+                            Spacer()
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.vertical, 10)
+                        .padding(.horizontal, 12)
+                        .foregroundColor(colorScheme == .dark ? .white : .primary)
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                    }
+                    .buttonStyle(.plain)
+
+                    NavigationLink {
+                        ChatListView()
+                    } label: {
+                        Text("Chats")
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.vertical, 10)
+                            .padding(.horizontal, 12)
+                            .foregroundColor(colorScheme == .dark ? .white : .primary)
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                    }
+                    .buttonStyle(.plain)
+
+                    NavigationLink {
+                        PersonaListView()
+                    } label: {
+                        Text("Persona")
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.vertical, 10)
+                            .padding(.horizontal, 12)
+                            .foregroundColor(colorScheme == .dark ? .white : .primary)
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                    }
+                    .buttonStyle(.plain)
+
                     NavigationLink {
                         MemoryListView()
                     } label: {
-                        Text("Open Memories")
+                        Text("Memories")
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.vertical, 10)
                             .padding(.horizontal, 12)
@@ -156,30 +140,15 @@ struct SettingsView: View {
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
+                ToolbarItem(placement: .navigationBarLeading) {
                     Button {
                         dismiss()
                     } label: {
-                        Image(systemName: "xmark")
+                        Image(systemName: "chevron.left")
                             .font(.system(size: 13, weight: .semibold))
                     }
                     .foregroundColor(colorScheme == .dark ? .white : .black)
                 }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button {
-                        identityService.updateUserPrompt(masterPrompt)
-                        isEditingPrompt = false
-                        dismiss()
-                    } label: {
-                        Image(systemName: "checkmark")
-                            .font(.system(size: 13, weight: .semibold))
-                    }
-                    .foregroundColor(colorScheme == .dark ? .white : .black)
-                }
-            }
-            .onAppear {
-                masterPrompt = identityService.currentUserPrompt
-                isEditingPrompt = false
             }
             .tint(colorScheme == .dark ? .white : .black)
             .toolbarBackground(.hidden, for: .navigationBar)

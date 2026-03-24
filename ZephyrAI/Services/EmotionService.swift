@@ -22,7 +22,8 @@ final class EmotionService: ObservableObject {
     @Published private(set) var state: EmotionState = .neutral
 
     private let decayInterval: TimeInterval = 300
-    private let smoothing: Double = 0.3
+    private let smoothing: Double = 0.25
+    private let momentum: Double = 0.15
 
     private init() {}
 
@@ -88,15 +89,22 @@ final class EmotionService: ObservableObject {
     }
 
     private func blend(with signal: EmotionState, reason: String) {
-        let newValence = state.valence * (1.0 - smoothing) + signal.valence * smoothing
-        let newIntensity = state.intensity * (1.0 - smoothing) + signal.intensity * smoothing
-        let newStability = min(1.0, state.stability * 0.85 + 0.15)
+        // Momentum-based blending (less robotic, more "alive")
+        let carriedValence = state.valence * (1.0 - momentum)
+        let newValence = carriedValence + signal.valence * smoothing
+
+        let carriedIntensity = state.intensity * (1.0 - momentum)
+        let newIntensity = carriedIntensity + signal.intensity * smoothing
+
+        // Stability now reacts to emotional change instead of always increasing
+        let delta = abs(signal.valence - state.valence)
+        let newStability = clamp(state.stability + (0.1 - delta * 0.2), 0.2, 1.0)
 
         state = EmotionState(
             label: labelFor(valence: newValence, intensity: newIntensity),
             valence: clamp(newValence, -1.0, 1.0),
             intensity: clamp(newIntensity, 0.0, 1.0),
-            stability: clamp(newStability, 0.0, 1.0),
+            stability: newStability,
             lastUpdated: Date()
         )
     }
@@ -106,9 +114,10 @@ final class EmotionService: ObservableObject {
         var valence = 0.0
         var intensity = 0.2
 
-        let positive = ["love", "glad", "happy", "thanks", "great", "awesome", "рад", "спасибо", "круто", "супер"]
-        let negative = ["sad", "sorry", "hate", "angry", "bad", "pain", "груст", "боль", "злюсь", "плохо"]
-        let anxious = ["anxious", "fear", "panic", "worried", "тревог", "страх", "паник", "боюсь"]
+        let positive = ["love", "glad", "happy", "thanks", "great", "awesome", "рад", "спасибо", "круто", "супер", "beautiful", "nice", "amazing", "обожаю"]
+        let negative = ["sad", "sorry", "hate", "angry", "bad", "pain", "груст", "боль", "злюсь", "плохо", "ужас", "раздражает"]
+        let anxious = ["anxious", "fear", "panic", "worried", "тревог", "страх", "паник", "боюсь", "stress", "напряжение"]
+        let soft = ["calm", "relax", "peace", "тихо", "спокойно", "мягко"]
 
         if positive.contains(where: lower.contains) {
             valence += 0.5
@@ -121,6 +130,10 @@ final class EmotionService: ObservableObject {
         if anxious.contains(where: lower.contains) {
             valence -= 0.3
             intensity += 0.5
+        }
+        if soft.contains(where: lower.contains) {
+            valence += 0.2
+            intensity -= 0.1
         }
 
         valence = clamp(valence, -1.0, 1.0)
@@ -136,11 +149,19 @@ final class EmotionService: ObservableObject {
     }
 
     private func labelFor(valence: Double, intensity: Double) -> String {
-        if intensity < 0.25 { return "neutral" }
-        if valence >= 0.35 { return "positive" }
-        if valence <= -0.35 { return "negative" }
-        if valence < 0 { return "tense" }
-        return "calm"
+        if intensity < 0.2 { return "neutral" }
+
+        if valence >= 0.6 { return "joy" }
+        if valence >= 0.3 { return "warm" }
+
+        if valence <= -0.6 { return "distress" }
+        if valence <= -0.3 { return "sad" }
+
+        if intensity > 0.6 && valence < 0 { return "anxious" }
+
+        if intensity < 0.4 { return "calm" }
+
+        return "tense"
     }
 
     private func clamp(_ v: Double, _ min: Double, _ max: Double) -> Double {

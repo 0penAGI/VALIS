@@ -24,7 +24,7 @@ struct ArtifactView: UIViewRepresentable {
     }
 
     func updateUIView(_ webView: WKWebView, context: Context) {
-        let doc = wrappedHTML(html)
+        let doc = wrappedHTML(sanitizeArtifactHTMLForDisplay(html))
         if context.coordinator.lastHTML != doc {
             context.coordinator.lastHTML = doc
             webView.loadHTMLString(doc, baseURL: nil)
@@ -38,6 +38,18 @@ struct ArtifactView: UIViewRepresentable {
           <head>
             <meta charset="utf-8">
             <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=yes">
+            <script>
+            window.MathJax = {
+              tex: {
+                inlineMath: [['\\\\(', '\\\\)']],
+                displayMath: [['\\\\[', '\\\\]']]
+              },
+              svg: { fontCache: 'global' }
+            };
+            </script>
+            <script type="text/javascript" id="MathJax-script" async
+              src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js">
+            </script>
             <style>
               html, body {
                 margin: 0;
@@ -66,4 +78,14 @@ struct ArtifactView: UIViewRepresentable {
             decisionHandler(.allow)
         }
     }
+}
+
+private func sanitizeArtifactHTMLForDisplay(_ html: String) -> String {
+    var cleaned = html
+    cleaned = cleaned.replacingOccurrences(
+        of: #"(?is)<img\b(?:(?!>).)*\bsrc\s*=\s*(['"])(?!data:image/)(https?://.*?)\1[^>]*>"#,
+        with: "",
+        options: [.regularExpression, .caseInsensitive]
+    )
+    return cleaned
 }

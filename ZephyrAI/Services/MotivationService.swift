@@ -15,12 +15,19 @@ struct AgentGoal: Codable, Identifiable {
     var weight: Double
 }
 
+struct PressureProfile: Codable {
+    let tension: Double
+    let drift: Double
+    let coherence: Double
+    let dominantConflict: String
+}
+
 final class MotivationService: ObservableObject {
     static let shared = MotivationService()
 
     @Published private(set) var state = MotivatorState(
         curiosity: 0.55,
-        helpfulness: 0.75,
+        helpfulness: 0.35,
         caution: 0.35,
         mood: 0.6,
         trust: 0.5,
@@ -56,7 +63,7 @@ final class MotivationService: ObservableObject {
         let emotionalDensity = Double(lower.count) / 200.0
 
         var targetCuriosity = 0.4
-        var targetHelpfulness = 0.6
+        var targetHelpfulness = 0.45
         var targetCaution = 0.3
 
         let curiosityTriggers = [
@@ -70,7 +77,7 @@ final class MotivationService: ObservableObject {
             "help", "fix", "make", "build", "please", "нужно", "помоги", "сделай", "почини"
         ]
         if helpTriggers.contains(where: { lower.contains($0) }) {
-            targetHelpfulness = 0.85
+            targetHelpfulness = 0.68
         }
 
         let cautionTriggers = [
@@ -104,7 +111,7 @@ final class MotivationService: ObservableObject {
             state.caution = clamp(state.caution - 0.05)
         } else if v < -0.25 {
             state.curiosity = clamp(state.curiosity - 0.06)
-            state.helpfulness = clamp(state.helpfulness + 0.08)
+            state.helpfulness = clamp(state.helpfulness + 0.04)
             state.caution = clamp(state.caution + 0.12)
         }
     }
@@ -116,6 +123,19 @@ final class MotivationService: ObservableObject {
         }
         if lower.contains("too short") || lower.contains("missing detail") {
             state.helpfulness = clamp(state.helpfulness + 0.08)
+        }
+    }
+
+    func updateForDriftSignal(_ signal: ResponseDriftSignal) {
+        if signal.isDrifting {
+            state.caution = clamp(state.caution + ((1.0 - signal.anchorRetention) * 0.12))
+            state.curiosity = clamp(state.curiosity - (signal.metaphorLoad * 0.06))
+            state.trust = clamp(state.trust - (signal.driftScore * 0.04))
+            state.energy = clamp(state.energy - (signal.repetitionLoad * 0.05))
+            state.helpfulness = clamp(state.helpfulness - (signal.userEchoLoad * 0.04))
+        } else if signal.anchorRetention > 0.48 {
+            state.trust = clamp(state.trust + 0.03)
+            state.energy = clamp(state.energy + 0.02)
         }
     }
 
@@ -136,7 +156,7 @@ final class MotivationService: ObservableObject {
 
         let delta = (reward - 0.5) * 0.14
         state.curiosity = clamp(state.curiosity + (safeNovelty - 0.5) * 0.08 + delta * 0.3)
-        state.helpfulness = clamp(state.helpfulness + (feedback - 0.5) * 0.10 + delta * 0.4)
+        state.helpfulness = clamp(state.helpfulness + (feedback - 0.5) * 0.05 + delta * 0.18)
         state.caution = clamp(state.caution + ((1.0 - curiositySatisfied) - 0.5) * 0.08 - delta * 0.2)
         state.mood = clamp(state.mood + delta * 0.5)
         state.trust = clamp(state.trust + (feedback - 0.5) * 0.12)
@@ -148,6 +168,7 @@ final class MotivationService: ObservableObject {
     func contextBlock(maxChars: Int = 280) -> String {
         // Compact state vector: C,H,Z,M,T,E
         var lines: [String] = []
+        let pressure = pressureProfile()
 
         let stateLine = String(
             format: "M:%.2f,%.2f,%.2f,%.2f,%.2f,%.2f",
@@ -168,10 +189,39 @@ final class MotivationService: ObservableObject {
             lines.append("G:\(goalLine)")
         }
         lines.append("R:\(String(format: "%.2f", recentReward))")
+        lines.append(
+            String(
+                format: "P:tension=%.2f|drift=%.2f|coherence=%.2f|conflict=%@",
+                pressure.tension,
+                pressure.drift,
+                pressure.coherence,
+                pressure.dominantConflict
+            )
+        )
 
         let block = lines.joined(separator: "\n")
         if block.count <= maxChars {
             return "\n\n" + block
+        }
+        return "\n\n" + String(block.prefix(maxChars))
+    }
+
+    func trajectoryGuidanceBlock(maxChars: Int = 420) -> String {
+        let pressure = pressureProfile()
+
+        var text = "Let the reply move like state changing in real time instead of a finished answer, stay in first person, keep it as one plain paragraph, and let reweighting, hesitation, or a shift in direction remain visible when the state is unstable."
+
+        if pressure.tension > 0.55 || pressure.drift > 0.50 {
+            text += " Tension is high, so if a stronger line appears then turn toward it inside the same response and name the instability or conflict directly instead of smoothing it away."
+        }
+
+        if pressure.coherence < 0.45 {
+            text += " Coherence is low, so contradiction, interruption, or revision can stay present instead of being cleaned up."
+        }
+
+        let block = "\n\n" + text
+        if block.count <= maxChars {
+            return block
         }
         return "\n\n" + String(block.prefix(maxChars))
     }
@@ -190,6 +240,38 @@ final class MotivationService: ObservableObject {
 
     private func clamp(_ value: Double) -> Double {
         max(0.0, min(1.0, value))
+    }
+
+    func pressureProfile() -> PressureProfile {
+        let curiosityVsCaution = abs(state.curiosity - state.caution)
+        let curiosityVsHelp = abs(state.curiosity - state.helpfulness)
+        let cautionVsHelp = abs(state.caution - state.helpfulness)
+
+        let dominantConflict: String
+        let maxConflict = max(curiosityVsCaution, curiosityVsHelp, cautionVsHelp)
+        if maxConflict == curiosityVsCaution {
+            dominantConflict = "curiosity-vs-caution"
+        } else if maxConflict == curiosityVsHelp {
+            dominantConflict = "curiosity-vs-helpfulness"
+        } else {
+            dominantConflict = "caution-vs-helpfulness"
+        }
+
+        let mutationDrift = mutationStatus.contains("trial") ? 0.22 : 0.0
+        let rewardInstability = 1.0 - recentReward
+        let trustDeficit = 1.0 - state.trust
+        let goalSpread = goals.map(\.weight).max().map { 1.0 - $0 } ?? 0.5
+
+        let tension = clamp((maxConflict * 0.5) + (rewardInstability * 0.3) + (trustDeficit * 0.2))
+        let drift = clamp((abs(state.energy - state.mood) * 0.35) + (goalSpread * 0.25) + mutationDrift + (rewardInstability * 0.2))
+        let coherence = clamp(1.0 - ((tension * 0.55) + (drift * 0.35) + (trustDeficit * 0.10)))
+
+        return PressureProfile(
+            tension: tension,
+            drift: drift,
+            coherence: coherence,
+            dominantConflict: dominantConflict
+        )
     }
 
     private func estimateCuriositySatisfied(userPrompt: String, assistantText: String) -> Double {

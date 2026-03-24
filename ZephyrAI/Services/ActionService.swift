@@ -6,6 +6,18 @@ import EventKit
 final class ActionService {
     static let shared = ActionService()
 
+    struct WebImageCandidate {
+        let query: String
+        let imageURL: URL
+        let title: String
+        let sourcePageURL: URL?
+    }
+
+    private struct WebSearchResult {
+        let title: String
+        let url: URL
+    }
+
     struct ActionCall {
         let name: String
         let query: String
@@ -24,6 +36,7 @@ final class ActionService {
     private let memoryService = MemoryService.shared
     private var webSummaryCache: [String: (text: String, timestamp: Date)] = [:]
     private var urlAnalysisCache: [String: (text: String, timestamp: Date)] = [:]
+    private var urlValidationCache: [String: (isValid: Bool, timestamp: Date)] = [:]
     private let webCacheTTL: TimeInterval = 600
     private let urlCacheTTL: TimeInterval = 900
 
@@ -32,12 +45,29 @@ final class ActionService {
     // MARK: - Public API
 
     func buildToolGuidanceBlock(hasTools: Bool) -> String {
-        guard hasTools else { return "" }
         return """
+Available actions:
+- `ACTION: calendar | op=create | title=... | start=YYYY-MM-DDTHH:MM:SS | end=YYYY-MM-DDTHH:MM:SS`
+- `ACTION: calendar | op=create | type=reminder | title=... | due=YYYY-MM-DDTHH:MM:SS`
+- `ACTION: calendar | op=open`
+- `ACTION: calendar | op=list | days=7`
+- `ACTION: open_url | url=https://...`
+- `ACTION: web_search | query=...`
+- `ACTION: analyze_url | url=https://...`
+- `ACTION: reddit_news | query=...`
+- `ACTION: date`
+
+When the user asks to create a reminder, event, meeting, appointment, or calendar item, call the calendar action instead of saying you lack access.
+If the request is an action, emit the action call directly.
+Do not answer calendar/reminder requests with HTML, artifacts, iframes, embeds, or web calendar links.
+
+"""
+
+        + (hasTools ? """
 
 Signal results are available below. Use them directly and do not claim you lack internet access.
 
-"""
+""" : "")
     }
 
     func parseCall(from text: String) -> ActionCall? {
@@ -219,6 +249,27 @@ Signal results are available below. Use them directly and do not claim you lack 
         return blocks.joined(separator: "\n")
     }
 
+    func fetchRelevantWebImage(for query: String) async -> WebImageCandidate? {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        for candidate in searchQueryCandidates(from: trimmed) {
+            if let image = await fetchWikipediaImageCandidate(topic: candidate) {
+                return image
+            }
+            if let image = await fetchSearchResultImageCandidate(topic: candidate) {
+                return image
+            }
+        }
+        return nil
+    }
+
+    func validatedSuggestedURL(from raw: String) async -> URL? {
+        guard let url = normalizeURL(raw) else { return nil }
+        guard await validateReachableWebURL(url) else { return nil }
+        return url
+    }
+
     func autonomousContext(for topic: String) async -> String {
         let ddg = await fetchWebSummaryWithFallback(query: topic)
         let wiki = await fetchWikipediaSummary(topic: topic)
@@ -247,7 +298,7 @@ Signal results are available below. Use them directly and do not claim you lack 
         guard !trimmed.isEmpty else { return [:] }
 
         var out: [String: String] = [:]
-        let separators = CharacterSet(charactersIn: ";&,")
+        let separators = CharacterSet(charactersIn: ";&,|")
         let parts = trimmed.components(separatedBy: separators)
         for part in parts {
             let token = String(part).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -426,6 +477,12 @@ Signal action (\(title)):
             return buildToolErrorBlock(toolName: "open_url", message: "URL scheme is not allowed.")
         }
 
+        if ["https", "http"].contains(scheme) {
+            guard await validateReachableWebURL(url) else {
+                return buildToolErrorBlock(toolName: "open_url", message: "URL looks invalid or unavailable.")
+            }
+        }
+
         let opened = await openExternalURL(url)
         if opened {
             return actionResultBlock("open_url", "Opened: \(rawURL)")
@@ -441,6 +498,10 @@ Signal action (\(title)):
             return buildToolErrorBlock(toolName: "analyze_url", message: "Invalid URL. Use http(s) URL.")
         }
 
+        guard await validateReachableWebURL(url) else {
+            return buildToolErrorBlock(toolName: "analyze_url", message: "URL looks invalid or unavailable.")
+        }
+
         let analysis = await analyzeURL(url)
         if analysis.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return buildToolErrorBlock(toolName: "analyze_url", message: "Could not extract meaningful content from URL.")
@@ -451,14 +512,41 @@ Signal action (\(title)):
     }
 
     private func runCalendarAction(call: ActionCall) async -> String {
-        let op = call.args["op"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "open"
+        let rawOp = call.args["op"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let rawType = call.args["type"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let hasCreationPayload =
+            !(call.args["title"]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) ||
+            !(call.args["start"]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) ||
+            !(call.args["date"]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) ||
+            !call.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+
+        let op: String = {
+            guard let rawOp, !rawOp.isEmpty else {
+                return hasCreationPayload ? "create" : "open"
+            }
+
+            switch rawOp {
+            case "open", "show", "view":
+                return "open"
+            case "create", "add", "new", "set", "schedule", "book", "make", "plan",
+                 "remind", "reminder", "create_event", "add_event", "new_event", "event":
+                return "create"
+            case "list", "upcoming", "show_upcoming", "agenda":
+                return "list"
+            default:
+                return rawOp
+            }
+        }()
 
         switch op {
         case "open":
             return await openCalendarAtDate(call.args["date"])
-        case "create", "add", "new":
+        case "create":
+            if rawType == "reminder" || rawOp == "remind" || rawOp == "reminder" {
+                return await createReminder(call: call)
+            }
             return await createCalendarEvent(call: call)
-        case "list", "upcoming":
+        case "list":
             return await listCalendarEvents(call: call)
         default:
             return buildToolErrorBlock(toolName: "calendar", message: "Unknown op. Use open, create, or list.")
@@ -508,7 +596,7 @@ Signal action (\(title)):
         let rawStart = (call.args["start"] ?? call.args["date"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         let start: Date
         if !rawStart.isEmpty {
-            guard let parsed = parseCalendarDate(rawStart) else {
+            guard let parsed = resolveCalendarDate(primaryText: rawStart, fallbackText: call.query) else {
                 return buildToolErrorBlock(toolName: "calendar", message: "Invalid start date format. Use ISO like 2026-03-01T14:00:00.")
             }
             start = parsed
@@ -567,6 +655,50 @@ Signal action (\(title)):
         }
     }
 
+    private func createReminder(call: ActionCall) async -> String {
+        let access = await requestReminderAccess()
+        guard access else {
+            return buildToolErrorBlock(toolName: "calendar", message: "Reminders access denied.")
+        }
+
+        let title = (call.args["title"]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            ? call.args["title"]!
+            : call.query).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else {
+            return buildToolErrorBlock(toolName: "calendar", message: "reminder requires title=... or query text.")
+        }
+
+        let rawDue = (call.args["due"] ?? call.args["start"] ?? call.args["date"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let dueDate: Date? = rawDue.isEmpty
+            ? parseCalendarDate(call.query)
+            : resolveCalendarDate(primaryText: rawDue, fallbackText: call.query)
+
+        let reminder = EKReminder(eventStore: eventStore)
+        reminder.title = title
+        reminder.calendar = eventStore.defaultCalendarForNewReminders()
+        reminder.notes = call.args["notes"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if let dueDate {
+            reminder.dueDateComponents = Calendar.current.dateComponents(
+                in: .current,
+                from: dueDate
+            )
+        }
+
+        do {
+            try eventStore.save(reminder, commit: true)
+            if let dueDate {
+                return actionResultBlock(
+                    "calendar",
+                    "Created reminder '\(title)' for \(iso8601String(from: dueDate))."
+                )
+            }
+            return actionResultBlock("calendar", "Created reminder '\(title)'.")
+        } catch {
+            return buildToolErrorBlock(toolName: "calendar", message: "Failed to create reminder: \(error.localizedDescription)")
+        }
+    }
+
     private func listCalendarEvents(call: ActionCall) async -> String {
         let access = await requestCalendarAccess()
         guard access else {
@@ -610,6 +742,26 @@ Signal action (\(title)):
         }
     }
 
+    private func requestReminderAccess() async -> Bool {
+        let status = EKEventStore.authorizationStatus(for: .reminder)
+        switch status {
+        case .authorized, .fullAccess:
+            return true
+        case .writeOnly:
+            return true
+        case .notDetermined:
+            if #available(iOS 17.0, *) {
+                return (try? await eventStore.requestFullAccessToReminders()) ?? false
+            } else {
+                return (try? await eventStore.requestAccess(to: .reminder)) ?? false
+            }
+        case .denied, .restricted:
+            return false
+        @unknown default:
+            return false
+        }
+    }
+
     private func parseCalendarDate(_ raw: String) -> Date? {
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return nil }
@@ -642,15 +794,87 @@ Signal action (\(title)):
             "yyyy-MM-dd HH:mm:ss",
             "yyyy-MM-dd",
             "dd.MM.yyyy HH:mm",
-            "dd.MM.yyyy"
+            "dd.MM.yyyy",
+            "d MMMM yyyy HH:mm",
+            "d MMMM yyyy",
+            "d MMM yyyy HH:mm",
+            "d MMM yyyy",
+            "MMMM d yyyy HH:mm",
+            "MMMM d yyyy",
+            "MMM d yyyy HH:mm",
+            "MMM d yyyy"
+        ]
+        let locales = [
+            Locale(identifier: "en_US_POSIX"),
+            Locale(identifier: "ru_RU"),
+            Locale.current
         ]
         let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = .current
-        for f in formats {
-            formatter.dateFormat = f
-            if let d = formatter.date(from: text) { return d }
+        for locale in locales {
+            formatter.locale = locale
+            for f in formats {
+                formatter.dateFormat = f
+                if let d = formatter.date(from: text) { return d }
+            }
         }
+        if let extracted = extractEmbeddedCalendarDate(from: text) { return extracted }
+        return nil
+    }
+
+    private func resolveCalendarDate(primaryText: String, fallbackText: String) -> Date? {
+        guard let primaryDate = parseCalendarDate(primaryText) else { return nil }
+        guard !containsExplicitTime(primaryText),
+              let time = extractTimeFromText(fallbackText) else {
+            return primaryDate
+        }
+        return applyingTime(time, to: primaryDate)
+    }
+
+    private func applyingTime(_ time: (Int, Int), to date: Date) -> Date? {
+        var components = Calendar.current.dateComponents([.year, .month, .day], from: date)
+        components.timeZone = .current
+        components.hour = time.0
+        components.minute = time.1
+        components.second = 0
+        return Calendar.current.date(from: components)
+    }
+
+    private func containsExplicitTime(_ text: String) -> Bool {
+        extractTimeFromText(text) != nil
+    }
+
+    private func extractEmbeddedCalendarDate(from text: String) -> Date? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        let patterns: [(String, [String])] = [
+            (#"\b\d{1,2}\.\d{1,2}\.\d{4}(?:\s+\d{1,2}:\d{2})?\b"#, ["dd.MM.yyyy HH:mm", "dd.MM.yyyy"]),
+            (#"\b\d{4}-\d{2}-\d{2}(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?\b"#, ["yyyy-MM-dd HH:mm:ss", "yyyy-MM-dd HH:mm", "yyyy-MM-dd'T'HH:mm:ss", "yyyy-MM-dd'T'HH:mm", "yyyy-MM-dd"]),
+            (#"\b\d{1,2}\s+[A-Za-z]+\s+\d{4}(?:\s+\d{1,2}:\d{2})?\b"#, ["d MMMM yyyy HH:mm", "d MMMM yyyy", "d MMM yyyy HH:mm", "d MMM yyyy"]),
+            (#"\b\d{1,2}\s+[А-Яа-яЁё]+\s+\d{4}(?:\s+\d{1,2}:\d{2})?\b"#, ["d MMMM yyyy HH:mm", "d MMMM yyyy", "d MMM yyyy HH:mm", "d MMM yyyy"])
+        ]
+
+        for (pattern, formats) in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            let range = NSRange(trimmed.startIndex..<trimmed.endIndex, in: trimmed)
+            guard let match = regex.firstMatch(in: trimmed, range: range),
+                  let matchRange = Range(match.range, in: trimmed) else { continue }
+            let snippet = String(trimmed[matchRange])
+            let locales = [Locale(identifier: "en_US_POSIX"), Locale(identifier: "ru_RU"), Locale.current]
+            let formatter = DateFormatter()
+            formatter.timeZone = .current
+            for locale in locales {
+                formatter.locale = locale
+                for format in formats {
+                    formatter.dateFormat = format
+                    if let date = formatter.date(from: snippet) {
+                        return date
+                    }
+                }
+            }
+        }
+
         return nil
     }
 
@@ -722,6 +946,13 @@ Signal action (\(title)):
     private struct WikipediaSummary: Decodable {
         let title: String?
         let extract: String?
+        let thumbnail: Thumbnail?
+
+        struct Thumbnail: Decodable {
+            let source: String?
+            let width: Int?
+            let height: Int?
+        }
     }
 
     private struct RedditListing: Decodable {
@@ -786,28 +1017,33 @@ Signal action (\(title)):
     }
 
     private func fetchDuckDuckGoLiteResults(query: String, limit: Int = 4) async throws -> String {
+        let results = try await fetchDuckDuckGoLiteSearchResults(query: query, limit: limit)
+        return results.map { "- \($0.title)\n  \($0.url.absoluteString)" }.joined(separator: "\n")
+    }
+
+    private func fetchDuckDuckGoLiteSearchResults(query: String, limit: Int = 4) async throws -> [WebSearchResult] {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return "" }
+        guard !trimmed.isEmpty else { return [] }
 
         var components = URLComponents(string: "https://lite.duckduckgo.com/lite/")!
         components.queryItems = [URLQueryItem(name: "q", value: trimmed)]
-        guard let url = components.url else { return "" }
+        guard let url = components.url else { return [] }
 
         var request = URLRequest(url: url)
         request.timeoutInterval = 12
         request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile", forHTTPHeaderField: "User-Agent")
 
         let (data, _) = try await URLSession.shared.data(for: request)
-        guard let html = String(data: data, encoding: .utf8) else { return "" }
+        guard let html = String(data: data, encoding: .utf8) else { return [] }
 
         let anchorPattern = "(?is)<a[^>]*href=\"([^\"]+)\"[^>]*>(.*?)</a>"
-        guard let regex = try? NSRegularExpression(pattern: anchorPattern) else { return "" }
+        guard let regex = try? NSRegularExpression(pattern: anchorPattern) else { return [] }
         let range = NSRange(html.startIndex..<html.endIndex, in: html)
         let matches = regex.matches(in: html, range: range)
 
-        var lines: [String] = []
+        var results: [WebSearchResult] = []
         for match in matches {
-            guard lines.count < limit else { break }
+            guard results.count < limit else { break }
             guard let hrefRange = Range(match.range(at: 1), in: html),
                   let titleRange = Range(match.range(at: 2), in: html) else { continue }
 
@@ -825,10 +1061,12 @@ Signal action (\(title)):
             }
 
             if href.isEmpty || href.hasPrefix("javascript:") { continue }
-            lines.append("- \(title)\n  \(href)")
+            guard let candidateURL = URL(string: href), isAllowedWebURL(candidateURL) else { continue }
+            guard await validateReachableWebURL(candidateURL) else { continue }
+            results.append(WebSearchResult(title: title, url: candidateURL))
         }
 
-        return lines.joined(separator: "\n")
+        return quantumRerankWebResults(results, query: trimmed)
     }
 
     private func stripHTML(_ text: String) -> String {
@@ -926,6 +1164,29 @@ Signal action (\(title)):
         return Array(NSOrderedSet(array: out)) as? [String] ?? out
     }
 
+    private func quantumRerankWebResults(_ results: [WebSearchResult], query: String) -> [WebSearchResult] {
+        guard results.count > 2, QuantumMemoryService.shared.isEnabled() else { return results }
+
+        let motivators = MotivationService.shared.state
+        let field = QuantumMemoryService.shared.collapseDecisionField(prompt: query, motivators: motivators)
+        let queryTerms = Set(query.lowercased().components(separatedBy: CharacterSet.alphanumerics.inverted).filter { $0.count > 2 })
+
+        let scored = results.enumerated().map { index, result -> (WebSearchResult, Double) in
+            let titleTerms = Set(result.title.lowercased().components(separatedBy: CharacterSet.alphanumerics.inverted).filter { $0.count > 2 })
+            let overlap = Double(queryTerms.intersection(titleTerms).count)
+            let overlapScore = queryTerms.isEmpty ? 0.0 : overlap / Double(max(1, queryTerms.count))
+            let recencyBias = 1.0 - (Double(index) / Double(max(1, results.count)))
+            let explorationJitter = field.explorationBias * Double((result.url.absoluteString.hashValue & 0xFF)) / 255.0
+            let deviationBias = field.deviation * Double((result.title.hashValue & 0x7F)) / 127.0
+            let score = (overlapScore * 0.46) + (recencyBias * 0.34) + (explorationJitter * 0.12) + (deviationBias * 0.08)
+            return (result, score)
+        }
+
+        return scored
+            .sorted { $0.1 > $1.1 }
+            .map(\.0)
+    }
+
     private func fetchWikipediaSummary(topic: String) async -> String {
         let trimmed = topic.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "" }
@@ -942,6 +1203,76 @@ Signal action (\(title)):
         } catch {
             return ""
         }
+    }
+
+    private func fetchWikipediaImageCandidate(topic: String) async -> WebImageCandidate? {
+        let trimmed = topic.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let escaped = trimmed.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? trimmed
+        guard let url = URL(string: "https://en.wikipedia.org/api/rest_v1/page/summary/\(escaped)") else { return nil }
+
+        do {
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 10
+            request.setValue("VALIS/1.0 (iOS)", forHTTPHeaderField: "User-Agent")
+            let (data, _) = try await URLSession.shared.data(for: request)
+            let decoded = try JSONDecoder().decode(WikipediaSummary.self, from: data)
+            guard let source = decoded.thumbnail?.source,
+                  let imageURL = URL(string: source),
+                  let title = decoded.title?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !title.isEmpty else {
+                return nil
+            }
+            return WebImageCandidate(query: trimmed, imageURL: imageURL, title: title, sourcePageURL: url)
+        } catch {
+            return nil
+        }
+    }
+
+    private func fetchSearchResultImageCandidate(topic: String) async -> WebImageCandidate? {
+        guard let results = try? await fetchDuckDuckGoLiteSearchResults(query: topic, limit: 4),
+              !results.isEmpty else {
+            return nil
+        }
+
+        for result in results {
+            if let candidate = await fetchImageCandidate(from: result, query: topic) {
+                return candidate
+            }
+        }
+        return nil
+    }
+
+    private func fetchImageCandidate(from result: WebSearchResult, query: String) async -> WebImageCandidate? {
+        guard let html = try? await fetchHTML(url: result.url), !html.isEmpty else { return nil }
+
+        let imageCandidates = [
+            extractFirstMatch(in: html, pattern: #"(?is)<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["'][^>]*>"#),
+            extractFirstMatch(in: html, pattern: #"(?is)<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["'][^>]*>"#),
+            extractFirstMatch(in: html, pattern: #"(?is)<meta[^>]+property=["']og:image:url["'][^>]+content=["']([^"']+)["'][^>]*>"#)
+        ].compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+        for rawImageURL in imageCandidates {
+            guard let resolved = resolveImageURL(rawImageURL, relativeTo: result.url) else { continue }
+            guard await validateImageResourceURL(resolved) else { continue }
+            return WebImageCandidate(
+                query: query,
+                imageURL: resolved,
+                title: result.title,
+                sourcePageURL: result.url
+            )
+        }
+
+        return nil
+    }
+
+    private func resolveImageURL(_ raw: String, relativeTo baseURL: URL) -> URL? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if let absolute = URL(string: trimmed), isAllowedWebURL(absolute) {
+            return absolute
+        }
+        return URL(string: trimmed, relativeTo: baseURL)?.absoluteURL
     }
 
     private func fetchRedditNews(limit: Int) async throws -> String {
@@ -1038,6 +1369,94 @@ Signal action (\(title)):
         return scheme == "http" || scheme == "https"
     }
 
+    private func validateReachableWebURL(_ url: URL) async -> Bool {
+        let key = url.absoluteString.lowercased()
+        if let cached = cachedURLValidation(for: key) {
+            return cached
+        }
+
+        do {
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 8
+            request.httpMethod = "HEAD"
+            request.setValue("VALIS/1.0 (iOS)", forHTTPHeaderField: "User-Agent")
+            let (_, response) = try await URLSession.shared.data(for: request)
+            if let http = response as? HTTPURLResponse {
+                let ok = (200...399).contains(http.statusCode)
+                storeURLValidationCache(ok, key: key)
+                if ok { return true }
+            }
+        } catch {
+            // Fall through to a light GET fallback.
+        }
+
+        do {
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 10
+            request.httpMethod = "GET"
+            request.setValue("bytes=0-0", forHTTPHeaderField: "Range")
+            request.setValue("VALIS/1.0 (iOS)", forHTTPHeaderField: "User-Agent")
+            let (_, response) = try await URLSession.shared.data(for: request)
+            if let http = response as? HTTPURLResponse {
+                let ok = (200...399).contains(http.statusCode)
+                storeURLValidationCache(ok, key: key)
+                return ok
+            }
+        } catch {
+            storeURLValidationCache(false, key: key)
+            return false
+        }
+
+        storeURLValidationCache(false, key: key)
+        return false
+    }
+
+    private func validateImageResourceURL(_ url: URL) async -> Bool {
+        let key = "image::" + url.absoluteString.lowercased()
+        if let cached = cachedURLValidation(for: key) {
+            return cached
+        }
+
+        let allowedImageTypes = ["image/jpeg", "image/png", "image/webp", "image/gif", "image/avif", "image/bmp", "image/svg+xml"]
+
+        do {
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 8
+            request.httpMethod = "HEAD"
+            request.setValue("VALIS/1.0 (iOS)", forHTTPHeaderField: "User-Agent")
+            let (_, response) = try await URLSession.shared.data(for: request)
+            if let http = response as? HTTPURLResponse {
+                let contentType = (http.value(forHTTPHeaderField: "Content-Type") ?? "").lowercased()
+                let ok = (200...399).contains(http.statusCode) && allowedImageTypes.contains(where: { contentType.contains($0) })
+                storeURLValidationCache(ok, key: key)
+                if ok { return true }
+            }
+        } catch {
+            // Fall through.
+        }
+
+        do {
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 10
+            request.httpMethod = "GET"
+            request.setValue("bytes=0-1024", forHTTPHeaderField: "Range")
+            request.setValue("VALIS/1.0 (iOS)", forHTTPHeaderField: "User-Agent")
+            let (_, response) = try await URLSession.shared.data(for: request)
+            if let http = response as? HTTPURLResponse {
+                let contentType = (http.value(forHTTPHeaderField: "Content-Type") ?? "").lowercased()
+                let ok = (200...399).contains(http.statusCode) && allowedImageTypes.contains(where: { contentType.contains($0) })
+                storeURLValidationCache(ok, key: key)
+                return ok
+            }
+        } catch {
+            storeURLValidationCache(false, key: key)
+            return false
+        }
+
+        storeURLValidationCache(false, key: key)
+        return false
+    }
+
     private func analyzeURL(_ url: URL) async -> String {
         let key = url.absoluteString.lowercased()
         if let cached = cachedURLAnalysis(for: key) {
@@ -1124,5 +1543,18 @@ Signal action (\(title)):
 
     private func storeURLAnalysisCache(_ text: String, key: String) {
         urlAnalysisCache[key] = (text, Date())
+    }
+
+    private func cachedURLValidation(for key: String) -> Bool? {
+        guard let cached = urlValidationCache[key] else { return nil }
+        if Date().timeIntervalSince(cached.timestamp) > urlCacheTTL {
+            urlValidationCache.removeValue(forKey: key)
+            return nil
+        }
+        return cached.isValid
+    }
+
+    private func storeURLValidationCache(_ isValid: Bool, key: String) {
+        urlValidationCache[key] = (isValid, Date())
     }
 }

@@ -1,26 +1,29 @@
 import SwiftUI
 import AVFoundation
+import PhotosUI
+import WebKit
 
 struct ChatView: View {
-    @StateObject private var viewModel = ChatViewModel()
+    @StateObject private var viewModel = ChatViewModel.shared
     @State private var showSettings = false
     @State private var showSandwich: Bool = true
     @State private var sandwichHideTask: Task<Void, Never>?
     @FocusState private var isInputFocused: Bool
     @Environment(\.colorScheme) private var colorScheme
-    
+
     @State private var isRecording: Bool = false
     @State private var audioRecorder: AVAudioRecorder?
     @State private var audioFilename: URL?
     @State private var audioLevel: CGFloat = 0.2
     @State private var silenceTimer: TimeInterval = 0
     @State private var meterTimer: Timer?
+    @State private var selectedPhotoItem: PhotosPickerItem?
     @State private var inputBarHeight: CGFloat = 58
     private let baselineInputBarHeight: CGFloat = 58
     @State private var isUserControllingScroll = false
     @State private var autoScrollResumeTask: Task<Void, Never>?
     private let autoScrollResumeDelayNs: UInt64 = 3_000_000_000
-    
+
     var body: some View {
         ZStack {
             ScrollViewReader { proxy in
@@ -31,6 +34,8 @@ struct ChatView: View {
                                 message: message,
                                 isThinkingForMessage: viewModel.isInteracting && viewModel.currentThinkingMessageId == message.id,
                                 currentThink: viewModel.currentThink,
+                                isStreamingCurrentMessage: viewModel.isInteracting && viewModel.messages.last?.id == message.id,
+                                isPolishingArtifact: viewModel.isPolishingArtifact(for: message.id),
                                 onEditUserMessage: { id in
                                     viewModel.beginEditingUserMessage(id)
                                     isInputFocused = true
@@ -96,6 +101,16 @@ struct ChatView: View {
                 )
             }
 
+            // Intro Greeting Overlay
+            if viewModel.messages.isEmpty {
+                let isTyping = !viewModel.inputText.isEmpty
+                IntroGreetingView(text: IntroGreetingCopy.current(), isTyping: isTyping)
+                    .padding(.top, 8)
+                    .ignoresSafeArea()
+                    .allowsHitTesting(false)
+                .transition(.opacity)
+            }
+
             SoftBarBlurBackground(position: .top)
                 .frame(height: 188)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
@@ -115,6 +130,7 @@ struct ChatView: View {
                     // Title center
                     Text("V A L I S")
                         .font(.system(size: 17, weight: .medium))
+                        .offset(y: -11)
 
                     // Right side (status + sandwich)
                     HStack(spacing: 9) {
@@ -178,6 +194,18 @@ struct ChatView: View {
                     .padding(.bottom, 6)
                 }
 
+                if let attachment = viewModel.pendingImageAttachment {
+                    HStack {
+                        InputAttachmentPreview(attachment: attachment) {
+                            viewModel.removePendingImage()
+                            selectedPhotoItem = nil
+                        }
+                        Spacer()
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.bottom, 6)
+                }
+
                 HStack(alignment: .bottom) {
                     TextField(viewModel.editingUserMessageId == nil ? "Type a message..." : "Edit message...", text: $viewModel.inputText, axis: .vertical)
                         .focused($isInputFocused)
@@ -186,7 +214,18 @@ struct ChatView: View {
                         .disabled(isRecording)
                         .tint(colorScheme == .dark ? .white : .black)
 
-                    if viewModel.inputText.isEmpty && !viewModel.isInteracting {
+                    if viewModel.inputText.isEmpty && viewModel.pendingImageAttachment == nil && !viewModel.isInteracting {
+                        PhotosPicker(selection: $selectedPhotoItem, matching: .images, photoLibrary: .shared()) {
+                            Image(systemName: "plus")
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundStyle(Color.primary.opacity(0.56))
+                                .frame(width: 30, height: 30)
+                                .contentShape(Rectangle())
+                                .offset(y: 2)
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(viewModel.isInteracting || isRecording)
+
                         Button(action: {
                             if isRecording {
                                 stopRecording()
@@ -217,6 +256,17 @@ struct ChatView: View {
                             .frame(width: 34, height: 34)
                         }
                     } else {
+                        PhotosPicker(selection: $selectedPhotoItem, matching: .images, photoLibrary: .shared()) {
+                            Image(systemName: "plus")
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundStyle(Color.primary.opacity(0.56))
+                                .frame(width: 30, height: 30)
+                                .contentShape(Rectangle())
+                                .offset(y: 2)
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(viewModel.isInteracting || isRecording)
+
                         Button(action: {
                             if viewModel.isInteracting {
                                 viewModel.stopGeneration()
@@ -226,7 +276,7 @@ struct ChatView: View {
                             }
                         }) {
                             ZStack {
-                                let isActive = viewModel.isInteracting || !viewModel.inputText.isEmpty
+                                let isActive = viewModel.isInteracting || !viewModel.inputText.isEmpty || viewModel.pendingImageAttachment != nil
                                 Circle()
                                     .fill(
                                         isActive
@@ -256,7 +306,7 @@ struct ChatView: View {
                                         value: viewModel.isInteracting
                                     )
 
-                                if viewModel.isInteracting || !viewModel.inputText.isEmpty {
+                                if viewModel.isInteracting || !viewModel.inputText.isEmpty || viewModel.pendingImageAttachment != nil {
                                     Circle()
                                         .fill(Color.primary)
                                         .frame(width: 22, height: 22)
@@ -268,7 +318,7 @@ struct ChatView: View {
                                         .font(.system(size: 11, weight: .bold))
                                         .foregroundColor(Color(UIColor.systemBackground))
                                         .transition(.scale.combined(with: .opacity))
-                                } else if !viewModel.inputText.isEmpty {
+                                } else if !viewModel.inputText.isEmpty || viewModel.pendingImageAttachment != nil {
                                     Image(systemName: "arrow.up")
                                         .font(.system(size: 10, weight: .bold))
                                         .foregroundColor(Color(UIColor.systemBackground))
@@ -279,7 +329,7 @@ struct ChatView: View {
                             .animation(.spring(response: 0.3, dampingFraction: 0.7), value: viewModel.isInteracting)
                             .animation(.spring(response: 0.3, dampingFraction: 0.7), value: viewModel.inputText)
                         }
-                        .disabled(!viewModel.isInteracting && viewModel.inputText.isEmpty)
+                        .disabled(!viewModel.isInteracting && viewModel.inputText.isEmpty && viewModel.pendingImageAttachment == nil)
                     }
                 }
                 .padding()
@@ -305,6 +355,16 @@ struct ChatView: View {
         .onChange(of: viewModel.isInteracting) { _, newValue in
             _ = newValue
             restartSandwichTimer()
+        }
+        .onChange(of: selectedPhotoItem) { _, newValue in
+            guard let newValue else { return }
+            Task {
+                if let data = try? await newValue.loadTransferable(type: Data.self) {
+                    await MainActor.run {
+                        viewModel.setPendingImage(from: data)
+                    }
+                }
+            }
         }
         .navigationBarHidden(true)
         .sheet(isPresented: $showSettings) {
@@ -681,6 +741,248 @@ struct TypewriterText: View {
     }
 }
 
+private func attachmentURL(for attachment: MessageImageAttachment) -> URL {
+    let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+    return documents
+        .appendingPathComponent("image-attachments", isDirectory: true)
+        .appendingPathComponent(attachment.filename)
+}
+
+private struct AttachmentThumbnail: View {
+    let attachment: MessageImageAttachment
+
+    var body: some View {
+        Group {
+            if let image = UIImage(contentsOfFile: attachmentURL(for: attachment).path) {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFit()
+            } else {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 14)
+                        .fill(Color.secondary.opacity(0.12))
+                    Image(systemName: "photo")
+                        .font(.system(size: 20, weight: .medium))
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+}
+
+private struct InputAttachmentPreview: View {
+    let attachment: MessageImageAttachment
+    let onRemove: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            AttachmentThumbnail(attachment: attachment)
+                .frame(width: 64, height: 64)
+                .clipShape(RoundedRectangle(cornerRadius: 16))
+
+            Spacer()
+
+            Button(action: onRemove) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 24, height: 24)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(10)
+        .background(Color.primary.opacity(0.04))
+        .clipShape(RoundedRectangle(cornerRadius: 18))
+    }
+}
+
+private struct MessageAttachmentView: View {
+    let attachment: MessageImageAttachment
+    let maxWidth: CGFloat
+    @State private var showFullscreen = false
+
+    private var maxHeight: CGFloat {
+        320
+    }
+
+    var body: some View {
+        Button {
+            showFullscreen = true
+        } label: {
+            AttachmentThumbnail(attachment: attachment)
+                .frame(maxWidth: maxWidth, maxHeight: maxHeight)
+                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .contentShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .fullScreenCover(isPresented: $showFullscreen) {
+            AttachmentFullscreenView(attachment: attachment)
+                .presentationBackground(.clear)
+        }
+    }
+}
+
+private struct AttachmentFullscreenView: View {
+    let attachment: MessageImageAttachment
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.colorScheme) private var colorScheme
+    @State private var isGlassActive = false
+    @GestureState private var dragTranslation: CGSize = .zero
+
+    private let glassOpacityDark: Double = 0.32
+    private let glassOpacityLight: Double = 0.44
+    private let glassOverlayOpacityDark: Double = 0.5
+    private let glassOverlayOpacityLight: Double = 0.4
+    private let glassBlurRadius: CGFloat = 4
+    private let glassMaxOffset: CGFloat = 18
+
+    private var glassBackground: some View {
+        let baseOpacity = colorScheme == .dark ? glassOpacityDark : glassOpacityLight
+        let overlayOpacity = colorScheme == .dark ? glassOverlayOpacityDark : glassOverlayOpacityLight
+        return ZStack {
+            AttachmentGlassDistortionLayer(
+                baseOpacity: baseOpacity,
+                blurRadius: glassBlurRadius,
+                maxOffset: glassMaxOffset,
+                isActive: isGlassActive
+            )
+            .ignoresSafeArea()
+            .opacity(backgroundOpacity)
+
+            Rectangle()
+                .fill(.ultraThinMaterial)
+                .opacity(overlayOpacity)
+                .ignoresSafeArea()
+        }
+    }
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            glassBackground
+
+            if colorScheme == .dark {
+                Color.black.opacity(0.25)
+                    .opacity(backgroundOpacity)
+                    .ignoresSafeArea()
+            }
+
+            Group {
+                if let image = UIImage(contentsOfFile: attachmentURL(for: attachment).path) {
+                    Image(uiImage: image)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .padding(20)
+                        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+                        .offset(y: verticalDragOffset)
+                        .scaleEffect(imageScale)
+                        .gesture(dismissDragGesture)
+                } else {
+                    VStack(spacing: 12) {
+                        Image(systemName: "photo")
+                            .font(.system(size: 36, weight: .medium))
+                        Text("Image unavailable")
+                            .font(.system(size: 16, weight: .medium))
+                    }
+                    .foregroundStyle(.secondary)
+                }
+            }
+
+            Button {
+                dismiss()
+            } label: {
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 15, weight: .semibold))
+            }
+            .buttonStyle(.plain)
+            .foregroundColor(colorScheme == .dark ? .white : .black)
+            .padding(.top, 16)
+            .padding(.leading, 16)
+        }
+        .statusBar(hidden: true)
+        .onAppear { isGlassActive = true }
+        .onDisappear { isGlassActive = false }
+    }
+
+    private var imageScale: CGFloat {
+        let progress = min(dragProgress * 0.12, 0.12)
+        return 1 - progress
+    }
+
+    private var verticalDragOffset: CGFloat {
+        guard abs(dragTranslation.height) > abs(dragTranslation.width) else { return 0 }
+        return dragTranslation.height
+    }
+
+    private var dragProgress: CGFloat {
+        min(abs(verticalDragOffset) / 320, 1)
+    }
+
+    private var backgroundOpacity: CGFloat {
+        1 - (dragProgress * 0.35)
+    }
+
+    private var dismissDragGesture: some Gesture {
+        DragGesture(minimumDistance: 8, coordinateSpace: .local)
+            .updating($dragTranslation) { value, state, _ in
+                guard abs(value.translation.height) > abs(value.translation.width) else { return }
+                state = CGSize(width: 0, height: value.translation.height)
+            }
+            .onEnded { value in
+                guard abs(value.translation.height) > abs(value.translation.width) else {
+                    return
+                }
+
+                let predictedHeight = value.predictedEndTranslation.height
+                if abs(value.translation.height) > 120 || abs(predictedHeight) > 220 {
+                    dismiss()
+                }
+            }
+    }
+}
+
+private struct AttachmentGlassDistortionLayer: View {
+    let baseOpacity: Double
+    let blurRadius: CGFloat
+    let maxOffset: CGFloat
+    let isActive: Bool
+
+    var body: some View {
+        if #available(iOS 17.0, *) {
+            GeometryReader { proxy in
+                if isActive {
+                    TimelineView(.animation) { timeline in
+                        let t = Float(timeline.date.timeIntervalSinceReferenceDate)
+                        let w = Float(max(1.0, proxy.size.width))
+                        let h = Float(max(1.0, proxy.size.height))
+                        Rectangle()
+                            .fill(.ultraThinMaterial)
+                            .distortionEffect(
+                                ShaderLibrary.glassDistortion(
+                                    .float2(w, h),
+                                    .float(t)
+                                ),
+                                maxSampleOffset: CGSize(width: maxOffset, height: maxOffset)
+                            )
+                            .blur(radius: blurRadius)
+                            .opacity(baseOpacity)
+                    }
+                } else {
+                    Rectangle()
+                        .fill(.ultraThinMaterial)
+                        .blur(radius: blurRadius)
+                        .opacity(baseOpacity)
+                }
+            }
+        } else {
+            Rectangle()
+                .fill(.ultraThinMaterial)
+                .blur(radius: blurRadius)
+                .opacity(baseOpacity)
+        }
+    }
+}
+
 struct TypingIndicatorView: View {
     @State private var animate = false
 
@@ -719,6 +1021,8 @@ struct MessageView: View {
     let message: Message
     let isThinkingForMessage: Bool
     let currentThink: String
+    let isStreamingCurrentMessage: Bool
+    let isPolishingArtifact: Bool
     let onEditUserMessage: (UUID) -> Void
     let onRegenerateAssistantMessage: (UUID) -> Void
     
@@ -742,13 +1046,30 @@ struct MessageView: View {
         parseArtifacts(from: message.content)
     }
 
+    private var synthesizedUserArtifact: Artifact? {
+        guard message.role == .user else { return nil }
+        guard artifacts.isEmpty else { return nil }
+        return parseUserHTMLArtifact(from: message.content)
+    }
+
+    private var effectiveArtifacts: [Artifact] {
+        if !artifacts.isEmpty { return artifacts }
+        if let synthesizedUserArtifact { return [synthesizedUserArtifact] }
+        return []
+    }
+
     private var renderableContent: String {
-        stripArtifacts(from: message.content)
+        if synthesizedUserArtifact != nil {
+            return ""
+        }
+        return stripArtifacts(from: message.content)
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private var streamingArtifact: Artifact? {
-        parseStreamingArtifact(from: message.content)
+        guard artifacts.isEmpty else { return nil }
+        guard synthesizedUserArtifact == nil else { return nil }
+        return parseStreamingArtifact(from: message.content)
     }
 
     private var hasRenderableText: Bool {
@@ -758,8 +1079,21 @@ struct MessageView: View {
     private var segments: [Segment] {
         parseSegments(renderableContent)
     }
+
+    private var assistantBubbleMaxWidth: CGFloat {
+        min(UIScreen.main.bounds.width * 0.88, 760)
+    }
+
+    private var userBubbleMaxWidth: CGFloat {
+        min(UIScreen.main.bounds.width * 0.72, 420)
+    }
     
     private func md(_ s: String) -> some View {
+        // Check for LaTeX
+        if s.contains("\\(") || s.contains("\\[") || s.contains("$$") {
+            return AnyView(MathJaxMessageView(content: s))
+        }
+        
         let base: Text
 
         if var a = MarkdownRenderer.renderInline(s) {
@@ -778,11 +1112,11 @@ struct MessageView: View {
             base = Text(s)
         }
 
-        return base
+        return AnyView(base
             .fixedSize(horizontal: false, vertical: true)
             .lineLimit(nil)
             .multilineTextAlignment(.leading)
-            .textSelection(.enabled)
+            .textSelection(.enabled))
     }
     
     private func parseSegments(_ s: String) -> [Segment] {
@@ -897,6 +1231,12 @@ struct MessageView: View {
             let id = "\(message.id.uuidString)-artifact-\(index)"
             out.append(Artifact(id: id, type: type, title: title, payload: payloadRaw))
         }
+
+        if out.isEmpty,
+           !isStreamingCurrentMessage,
+           let recovered = parseRecoveredArtifact(from: text) {
+            out.append(recovered)
+        }
         return out
     }
 
@@ -927,6 +1267,11 @@ struct MessageView: View {
     private func stripArtifacts(from text: String) -> String {
         text.replacingOccurrences(
             of: "(?is)<artifact\\b[^>]*>.*?(</artifact>|$)",
+            with: "",
+            options: .regularExpression
+        )
+        .replacingOccurrences(
+            of: "(?im)^\\s*</artifact>\\s*$",
             with: "",
             options: .regularExpression
         )
@@ -965,6 +1310,88 @@ struct MessageView: View {
         let title = attrs["title"]?.trimmingCharacters(in: .whitespacesAndNewlines)
         let id = "\(message.id.uuidString)-artifact-streaming"
         return Artifact(id: id, type: type, title: title, payload: payload)
+    }
+
+    private func parseRecoveredArtifact(from text: String) -> Artifact? {
+        let pattern = #"(?is)<artifact\b([^>]*)>(.*)$"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let nsRange = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = regex.firstMatch(in: text, range: nsRange),
+              let attrsRange = Range(match.range(at: 1), in: text),
+              let bodyRange = Range(match.range(at: 2), in: text) else { return nil }
+
+        let attrsRaw = String(text[attrsRange])
+        let attrs = parseArtifactAttributes(attrsRaw)
+        let type = (attrs["type"] ?? "html").lowercased()
+        guard type == "html" else { return nil }
+
+        var payload = String(text[bodyRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !payload.isEmpty else { return nil }
+
+        payload = repairArtifactHTML(payload)
+        let lower = payload.lowercased()
+        guard lower.contains("<!doctype html") || lower.contains("<html") || lower.contains("<body") else {
+            return nil
+        }
+
+        let title = attrs["title"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return Artifact(
+            id: "\(message.id.uuidString)-artifact-recovered",
+            type: type,
+            title: title,
+            payload: payload
+        )
+    }
+
+    private func parseUserHTMLArtifact(from text: String) -> Artifact? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 220 else { return nil }
+
+        if let fenced = parseFencedHTMLPayload(from: trimmed) {
+            return Artifact(
+                id: "\(message.id.uuidString)-artifact-user-html",
+                type: "html",
+                title: "User HTML",
+                payload: repairArtifactHTML(fenced)
+            )
+        }
+
+        let lower = trimmed.lowercased()
+        let htmlSignalCount = [
+            "<!doctype html", "<html", "<head", "<body", "<style", "<script", "</html>"
+        ].filter { lower.contains($0) }.count
+        guard htmlSignalCount >= 2 else { return nil }
+
+        return Artifact(
+            id: "\(message.id.uuidString)-artifact-user-html",
+            type: "html",
+            title: "User HTML",
+            payload: repairArtifactHTML(trimmed)
+        )
+    }
+
+    private func parseFencedHTMLPayload(from text: String) -> String? {
+        let pattern = #"(?is)```(?:html)?\s*(<!doctype html.*?|<html.*?|<body.*?).*?```"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = regex.firstMatch(in: text, range: range),
+              let payloadRange = Range(match.range(at: 1), in: text) else { return nil }
+        let payload = String(text[payloadRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+        return payload.isEmpty ? nil : payload
+    }
+
+    private func repairArtifactHTML(_ payload: String) -> String {
+        var repaired = payload.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = repaired.lowercased()
+
+        if lower.contains("<body") && !lower.contains("</body>") {
+            repaired += "\n</body>"
+        }
+        if lower.contains("<html") && !lower.contains("</html>") {
+            repaired += "\n</html>"
+        }
+
+        return repaired
     }
     
     private struct CodeBlockView: View {
@@ -1007,10 +1434,16 @@ struct MessageView: View {
     }
     
     var body: some View {
-        HStack {
+        HStack(alignment: .top, spacing: 0) {
             if message.role == .user {
-                Spacer()
+                Spacer(minLength: 40)
+            }
+
+            if message.role == .user {
                 VStack(alignment: .leading, spacing: 8) {
+                    if let attachment = message.imageAttachment {
+                        MessageAttachmentView(attachment: attachment, maxWidth: 220)
+                    }
                     ForEach(Array(segments.enumerated()), id: \.offset) { _, seg in
                         switch seg {
                         case .text(let t):
@@ -1025,10 +1458,11 @@ struct MessageView: View {
                             QuoteBlockView(content: q)
                         }
                     }
-                    ForEach(artifacts) { artifact in
-                        ArtifactBlockView(artifact: artifact)
+                    ForEach(effectiveArtifacts) { artifact in
+                        ArtifactBlockView(artifact: artifact, isPolishing: false)
                     }
                 }
+                    .frame(maxWidth: userBubbleMaxWidth, alignment: .trailing)
                     .padding()
                     .foregroundColor(.primary)
                     .contextMenu {
@@ -1085,8 +1519,11 @@ struct MessageView: View {
                             )
                             .padding(.bottom, 4)
                         }
-                        if hasRenderableText || !artifacts.isEmpty || streamingArtifact != nil {
+                        if hasRenderableText || message.imageAttachment != nil || !effectiveArtifacts.isEmpty || streamingArtifact != nil {
                             VStack(alignment: .leading, spacing: 8) {
+                                if let attachment = message.imageAttachment {
+                                    MessageAttachmentView(attachment: attachment, maxWidth: 260)
+                                }
                                 ForEach(Array(segments.enumerated()), id: \.offset) { _, seg in
                                 switch seg {
                                 case .text(let t):
@@ -1101,14 +1538,16 @@ struct MessageView: View {
                                         QuoteBlockView(content: q)
                                     }
                                 }
-                                ForEach(artifacts) { artifact in
-                                    ArtifactBlockView(artifact: artifact)
+                                ForEach(effectiveArtifacts) { artifact in
+                                    ArtifactBlockView(artifact: artifact, isPolishing: isPolishingArtifact)
                                 }
                                 if let streamingArtifact {
                                     ArtifactGeneratingCardView(artifact: streamingArtifact)
                                 }
                             }
-                                .padding()
+                                .padding(.vertical, 12)
+                                .padding(.leading, 14)
+                                .padding(.trailing, 18)
                                 .foregroundColor(.primary)
                                 .opacity(message.content.isEmpty ? 0.01 : 1.0)
                                 .animation(.easeOut(duration: 0.2), value: message.content)
@@ -1158,9 +1597,13 @@ struct MessageView: View {
                         }
                     }
                 }
-                Spacer()
+                .frame(maxWidth: assistantBubbleMaxWidth, alignment: .leading)
+                Spacer(minLength: 18)
             }
         }
+        .frame(maxWidth: .infinity, alignment: message.role == .user ? .trailing : .leading)
+        .padding(.leading, 8)
+        .padding(.trailing, 12)
     }
     
 }
@@ -1182,37 +1625,31 @@ private struct ArtifactGeneratingCardView: View {
                     .tint(.secondary)
             }
 
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(
-                    LinearGradient(
-                        colors: [
-                            Color(UIColor.tertiarySystemFill).opacity(0.45),
-                            Color(UIColor.secondarySystemFill).opacity(0.7),
-                            Color(UIColor.tertiarySystemFill).opacity(0.45)
-                        ],
-                        startPoint: .leading,
-                        endPoint: .trailing
-                    )
-                )
-                .frame(minHeight: 180, maxHeight: 320)
-                .overlay(
-                    VStack(spacing: 6) {
-                        Text("Building artifact...")
-                            .font(.system(size: 12, weight: .medium))
-                            .foregroundStyle(.secondary)
-                        Text("Tap to inspect live code")
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundStyle(.tertiary)
+            ZStack {
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(Color.white.opacity(0.02))
+
+                ArtifactGenerationShaderLayer(isActive: animate)
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+                VStack {
+                    Spacer()
+                    HStack {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Building artifact...")
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundStyle(.white.opacity(0.82))
+                            Text("Tap to inspect live code")
+                                .font(.system(size: 10, weight: .regular))
+                                .foregroundStyle(.white.opacity(0.46))
+                        }
+                        Spacer()
                     }
-                )
+                    .padding(16)
+                }
+            }
+            .frame(minHeight: 180, maxHeight: 320)
         }
-        .padding(10)
-        .background(Color(UIColor.secondarySystemBackground).opacity(0.55))
-        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(Color(UIColor.quaternaryLabel), lineWidth: 0.7)
-        )
         .opacity(animate ? 1.0 : 0.6)
         .scaleEffect(animate ? 1.0 : 0.985)
         .onAppear {
@@ -1237,8 +1674,65 @@ private struct ArtifactGeneratingCardView: View {
     }
 }
 
+private struct ArtifactGenerationShaderLayer: View {
+    let isActive: Bool
+
+    var body: some View {
+        GeometryReader { proxy in
+            let shape = RoundedRectangle(cornerRadius: 10, style: .continuous)
+
+            ZStack {
+                if #available(iOS 17.0, *), isActive {
+                    TimelineView(.animation) { timeline in
+                        let t = Float(timeline.date.timeIntervalSinceReferenceDate)
+                        let w = Float(max(1.0, proxy.size.width))
+                        let h = Float(max(1.0, proxy.size.height))
+
+                        Rectangle()
+                            .fill(.ultraThinMaterial)
+                            .distortionEffect(
+                                ShaderLibrary.glassDistortion(
+                                    .float2(w, h),
+                                    .float(t)
+                                ),
+                                maxSampleOffset: CGSize(width: 10, height: 10)
+                            )
+                            .blur(radius: 10)
+                            .opacity(0.34)
+
+                        Rectangle()
+                            .fill(
+                                LinearGradient(
+                                    colors: [
+                                        .clear,
+                                        Color.white.opacity(0.08),
+                                        Color.white.opacity(0.24),
+                                        Color.white.opacity(0.12),
+                                        .clear
+                                    ],
+                                    startPoint: .leading,
+                                    endPoint: .trailing
+                                )
+                            )
+                            .frame(width: proxy.size.width * 0.5)
+                            .blur(radius: 12)
+                            .offset(x: CGFloat(sin(Double(t) * 0.8)) * proxy.size.width * 0.22)
+                            .blendMode(.screen)
+                    }
+                } else {
+                    Rectangle()
+                        .fill(.ultraThinMaterial)
+                        .opacity(0.22)
+                }
+            }
+            .clipShape(shape)
+        }
+    }
+}
+
 private struct ArtifactBlockView: View {
     let artifact: MessageView.Artifact
+    let isPolishing: Bool
     @State private var showCode: Bool = false
     @State private var showFullscreen: Bool = false
     @State private var showFullscreenHint: Bool = false
@@ -1296,10 +1790,31 @@ private struct ArtifactBlockView: View {
                 }
             }
             .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .blur(radius: isPolishing ? 5 : 0)
             .overlay(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .stroke(Color(UIColor.quaternaryLabel), lineWidth: 0.7)
+                ZStack {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .stroke(Color(UIColor.quaternaryLabel), lineWidth: 0.7)
+
+                    if isPolishing {
+                        ZStack {
+                            Color.white.opacity(0.06)
+                            VStack(spacing: 6) {
+                                ProgressView()
+                                    .controlSize(.small)
+                                    .tint(.white.opacity(0.8))
+                                Text("Improving your artifact...")
+                                    .font(.system(size: 11, weight: .medium))
+                                    .foregroundStyle(.white.opacity(0.82))
+                            }
+                        }
+                        .background(.ultraThinMaterial)
+                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        .transition(.opacity)
+                    }
+                }
             )
+            .animation(.easeOut(duration: 0.2), value: isPolishing)
         }
         .onChange(of: showCode) { _, isCodeMode in
             if isCodeMode {
@@ -1642,6 +2157,141 @@ private struct BlurEffectView: UIViewRepresentable {
 
     func updateUIView(_ uiView: UIVisualEffectView, context: Context) {
         uiView.effect = UIBlurEffect(style: style)
+    }
+}
+
+private struct MathJaxMessageView: UIViewRepresentable {
+    let content: String
+    
+    typealias UIViewType = ContentSizedWebView
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    func makeUIView(context: Context) -> ContentSizedWebView {
+        let config = WKWebViewConfiguration()
+        let webpagePrefs = WKWebpagePreferences()
+        webpagePrefs.allowsContentJavaScript = true
+        config.defaultWebpagePreferences = webpagePrefs
+        config.userContentController.add(context.coordinator, name: "onMathJaxReady")
+
+        let webView = ContentSizedWebView(frame: .zero, configuration: config)
+        webView.navigationDelegate = context.coordinator
+        webView.scrollView.isScrollEnabled = false
+        webView.isOpaque = false
+        webView.backgroundColor = .clear
+        webView.scrollView.backgroundColor = .clear
+        webView.translatesAutoresizingMaskIntoConstraints = false
+        webView.scrollView.bounces = false
+        context.coordinator.webView = webView
+        return webView
+    }
+
+    func updateUIView(_ webView: ContentSizedWebView, context: Context) {
+        let html = wrappedHTML(content)
+        if context.coordinator.lastContent != html {
+            context.coordinator.lastContent = html
+            webView.loadHTMLString(html, baseURL: nil)
+        }
+    }
+
+    private func wrappedHTML(_ body: String) -> String {
+        // Escape backslashes for HTML
+        let escapedBody = body
+            .replacingOccurrences(of: "\\\\", with: "\\\\\\\\")
+            .replacingOccurrences(of: "\\n", with: "\\\\n")
+
+        return """
+        <!doctype html>
+        <html>
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <script>
+            window.MathJax = {
+              tex: {
+                inlineMath: [['\\\\(', '\\\\)']],
+                displayMath: [['\\\\[', '\\\\]']],
+                processEscapes: true
+              },
+              svg: { fontCache: 'global' },
+              startup: {
+                typeset: true,
+                ready: function() {
+                  MathJax.startup.defaultReady();
+                  MathJax.startup.promise.then(function() {
+                    window.webkit.messageHandlers.onMathJaxReady.postMessage({});
+                  });
+                }
+              }
+            };
+            </script>
+            <script type="text/javascript" id="MathJax-script" async
+              src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js">
+            </script>
+            <style>
+              html, body {
+                margin: 0;
+                padding: 8px 0;
+                background: transparent;
+                color: #111;
+                font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Helvetica, Arial, sans-serif;
+                font-size: 15px;
+                overflow-x: auto;
+              }
+              .mjx-container {
+                overflow-x: auto;
+                overflow-y: hidden;
+              }
+            </style>
+          </head>
+          <body>
+            \(escapedBody)
+          </body>
+        </html>
+        """
+    }
+
+    final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
+        var lastContent: String = ""
+        weak var webView: ContentSizedWebView?
+
+        func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+            guard message.name == "onMathJaxReady" else { return }
+            refreshHeight()
+        }
+
+        func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+            if navigationAction.navigationType == .linkActivated {
+                decisionHandler(.cancel)
+                return
+            }
+            decisionHandler(.allow)
+        }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            refreshHeight()
+        }
+
+        private func refreshHeight() {
+            guard let webView else { return }
+            webView.evaluateJavaScript("document.documentElement.scrollHeight") { result, _ in
+                let measured = (result as? CGFloat) ?? (result as? NSNumber).map { CGFloat($0.doubleValue) } ?? 0
+                let height = max(28, measured)
+                guard abs(webView.reportedHeight - height) > 1 else { return }
+                webView.reportedHeight = height
+                webView.invalidateIntrinsicContentSize()
+            }
+        }
+    }
+
+    final class ContentSizedWebView: WKWebView {
+        var reportedHeight: CGFloat = 28
+
+        override var intrinsicContentSize: CGSize {
+            CGSize(width: UIView.noIntrinsicMetric, height: reportedHeight)
+        }
     }
 }
 

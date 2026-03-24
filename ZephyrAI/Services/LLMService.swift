@@ -2,6 +2,7 @@ import Foundation
 import Combine
 import UIKit
 import CryptoKit
+import Dispatch
 
 
 extension UIDevice {
@@ -22,6 +23,29 @@ extension UIDevice {
 @MainActor
 final class LLMService: ObservableObject {
 
+    enum ResourceAwareInferenceProfile: String {
+        case relaxed
+        case balanced
+        case constrained
+    }
+
+    struct InferenceBudget: Sendable {
+        let profile: ResourceAwareInferenceProfile
+        let contextLimit: Int32
+        let memoryBudgetRatio: Double
+        let memoryCandidateLimit: Int
+        let dialogTurns: Int
+        let dialogCharsPerMessage: Int
+        let maxTokensCap: Int
+    }
+
+    private struct PerformanceSample {
+        let firstTokenLatency: TimeInterval
+        let tokensPerSecond: Double
+        let promptChars: Int
+        let createdAt: Date
+    }
+
     @Published var status: String = "Idle"
     @Published var isGenerating: Bool = false
     @Published var progress: Double = 0
@@ -29,6 +53,10 @@ final class LLMService: ObservableObject {
     private let cache = NSCache<NSString, NSString>()
     private let generationSemaphore = AsyncSemaphore(1)
     private var currentToken: GenerationCancellationToken?
+    private var memoryPressureSource: DispatchSourceMemoryPressure?
+    private var recentPerformanceSamples: [PerformanceSample] = []
+    private var memoryPressureLevel: Int = 0
+    private var cancellables = Set<AnyCancellable>()
 
     private var runtime: LlamaRuntime?
     private let memoryService = MemoryService.shared
@@ -46,8 +74,17 @@ final class LLMService: ObservableObject {
     }
     // Optional SHA256 to verify the downloaded file. Leave nil to skip.
     private let modelSHA256: String? = nil
-    // Prefer a larger context for long-form outputs (artifacts). Runtime clamps to model n_ctx_train.
-    private let contextSize: Int32 = 8192
+    // Give code/artifact flows enough headroom while chat budgets still stay adaptive.
+    private var contextSize: Int32 {
+        switch detectProfile() {
+        case .eco:
+            return 4200
+        case .beast:
+            return 16384
+        case .godmode:
+            return 24576
+        }
+    }
 
     struct GenerationOptions: Sendable {
         var maxTokensOverride: Int? = nil
@@ -56,6 +93,8 @@ final class LLMService: ObservableObject {
         var useCache: Bool = true
         var useKVInjection: Bool = true
         var storeResponseToMemory: Bool = true
+        var preferFullRuntimeContext: Bool = false
+        var preserveExtendedOutputBudget: Bool = false
         var samplingOverride: SamplingConfig? = nil
     }
 
@@ -71,9 +110,9 @@ final class LLMService: ObservableObject {
         #else
         let model = UIDevice.current.modelName.lowercased()
 
-        if model.contains("iphone13") || model.contains("iphone 13") {
+        if isEcoPhoneIdentifier(model) {
             return .eco
-        } else if model.contains("iphone15") || model.contains("iphone 15") {
+        } else if isBeastPhoneIdentifier(model) {
             return .beast
         } else if model.contains("ipad") || model.contains("mac") {
             return .godmode
@@ -83,10 +122,144 @@ final class LLMService: ObservableObject {
         #endif
     }
 
+    private func isEcoPhoneIdentifier(_ model: String) -> Bool {
+        let ecoPrefixes = [
+            "iphone14,2", "iphone14,3", "iphone14,4", "iphone14,5",
+            "iphone13,1", "iphone13,2", "iphone13,3", "iphone13,4"
+        ]
+        return model.contains("iphone 13") || ecoPrefixes.contains(where: { model.hasPrefix($0) })
+    }
+
+    private func isBeastPhoneIdentifier(_ model: String) -> Bool {
+        let beastPrefixes = [
+            "iphone15,", "iphone16,", "iphone17,"
+        ]
+        return model.contains("iphone 14") || model.contains("iphone 15") || model.contains("iphone 16")
+            || beastPrefixes.contains(where: { model.hasPrefix($0) })
+    }
+
+    private func startResourceMonitoring() {
+        guard memoryPressureSource == nil else { return }
+
+        let source = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical], queue: .global(qos: .utility))
+        source.setEventHandler { [weak self] in
+            let data = source.data
+            Task { @MainActor in
+                guard let self else { return }
+                if data.contains(.critical) {
+                    self.memoryPressureLevel = 2
+                } else if data.contains(.warning) {
+                    self.memoryPressureLevel = max(self.memoryPressureLevel, 1)
+                }
+            }
+        }
+        source.resume()
+        memoryPressureSource = source
+
+        NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.memoryPressureLevel = max(self?.memoryPressureLevel ?? 0, 1)
+            }
+            .store(in: &cancellables)
+    }
+
+    func inferenceBudget(forPromptLength promptChars: Int) -> InferenceBudget {
+        let baseProfile = detectProfile()
+        let thermalState = ProcessInfo.processInfo.thermalState
+        let avgFirstToken = averageFirstTokenLatency()
+        let avgTokensPerSecond = averageTokensPerSecond()
+        let avgPromptChars = averagePromptChars()
+
+        var constrainedScore = 0
+        var relaxedScore = 0
+
+        if baseProfile == .eco { constrainedScore += 1 }
+        if thermalState == .serious || thermalState == .critical { constrainedScore += 2 }
+        if memoryPressureLevel >= 2 { constrainedScore += 2 }
+        if memoryPressureLevel == 1 { constrainedScore += 1 }
+        if avgFirstToken > 1.6 { constrainedScore += 2 }
+        else if avgFirstToken > 1.0 { constrainedScore += 1 }
+        if avgTokensPerSecond > 0 && avgTokensPerSecond < 9 { constrainedScore += 2 }
+        else if avgTokensPerSecond > 0 && avgTokensPerSecond < 14 { constrainedScore += 1 }
+        if promptChars > 3200 || avgPromptChars > 2600 { constrainedScore += 1 }
+
+        if baseProfile != .eco { relaxedScore += 1 }
+        if thermalState == .nominal { relaxedScore += 1 }
+        if memoryPressureLevel == 0 { relaxedScore += 1 }
+        if avgFirstToken > 0 && avgFirstToken < 0.6 { relaxedScore += 1 }
+        if avgTokensPerSecond >= 20 { relaxedScore += 1 }
+
+        let profile: ResourceAwareInferenceProfile
+        if constrainedScore >= 3 {
+            profile = .constrained
+        } else if relaxedScore >= 4 {
+            profile = .relaxed
+        } else {
+            profile = .balanced
+        }
+
+        switch profile {
+        case .relaxed:
+            if baseProfile == .eco {
+                return InferenceBudget(profile: profile, contextLimit: min(contextSize, 8192), memoryBudgetRatio: 0.18, memoryCandidateLimit: 3, dialogTurns: 5, dialogCharsPerMessage: 180, maxTokensCap: 896)
+            }
+            return InferenceBudget(profile: profile, contextLimit: contextSize, memoryBudgetRatio: 0.28, memoryCandidateLimit: 4, dialogTurns: 8, dialogCharsPerMessage: 280, maxTokensCap: baseProfile == .godmode ? 6144 : 3072)
+        case .balanced:
+            if baseProfile == .eco {
+                return InferenceBudget(profile: profile, contextLimit: min(contextSize, 8192), memoryBudgetRatio: 0.18, memoryCandidateLimit: 3, dialogTurns: 5, dialogCharsPerMessage: 180, maxTokensCap: 896)
+            }
+            return InferenceBudget(profile: profile, contextLimit: min(contextSize, 12288), memoryBudgetRatio: 0.24, memoryCandidateLimit: 4, dialogTurns: 7, dialogCharsPerMessage: 240, maxTokensCap: 2048)
+        case .constrained:
+            if baseProfile == .eco {
+                return InferenceBudget(profile: profile, contextLimit: min(contextSize, 6144), memoryBudgetRatio: 0.14, memoryCandidateLimit: 2, dialogTurns: 4, dialogCharsPerMessage: 140, maxTokensCap: 640)
+            }
+            return InferenceBudget(profile: profile, contextLimit: min(contextSize, 8192), memoryBudgetRatio: 0.18, memoryCandidateLimit: 3, dialogTurns: 5, dialogCharsPerMessage: 180, maxTokensCap: 1536)
+        }
+    }
+
+    func recordPerformanceSample(firstTokenLatency: TimeInterval, tokensPerSecond: Double, promptChars: Int) {
+        recentPerformanceSamples.append(
+            PerformanceSample(
+                firstTokenLatency: firstTokenLatency,
+                tokensPerSecond: tokensPerSecond,
+                promptChars: promptChars,
+                createdAt: Date()
+            )
+        )
+        if recentPerformanceSamples.count > 12 {
+            recentPerformanceSamples.removeFirst(recentPerformanceSamples.count - 12)
+        }
+        let cutoff = Date().addingTimeInterval(-900)
+        recentPerformanceSamples.removeAll { $0.createdAt < cutoff }
+    }
+
+    func debugInferenceBudget(forPromptLength promptChars: Int) -> String {
+        let budget = inferenceBudget(forPromptLength: promptChars)
+        return "profile=\(budget.profile.rawValue) ctx=\(budget.contextLimit) mem=\(String(format: "%.2f", budget.memoryBudgetRatio)) dialog=\(budget.dialogTurns)x\(budget.dialogCharsPerMessage) maxTok=\(budget.maxTokensCap)"
+    }
+
+    private func averageFirstTokenLatency() -> TimeInterval {
+        guard !recentPerformanceSamples.isEmpty else { return 0 }
+        return recentPerformanceSamples.reduce(0) { $0 + $1.firstTokenLatency } / Double(recentPerformanceSamples.count)
+    }
+
+    private func averageTokensPerSecond() -> Double {
+        let valid = recentPerformanceSamples.filter { $0.tokensPerSecond > 0 }
+        guard !valid.isEmpty else { return 0 }
+        return valid.reduce(0) { $0 + $1.tokensPerSecond } / Double(valid.count)
+    }
+
+    private func averagePromptChars() -> Int {
+        guard !recentPerformanceSamples.isEmpty else { return 0 }
+        return recentPerformanceSamples.reduce(0) { $0 + $1.promptChars } / recentPerformanceSamples.count
+    }
+
     // MARK: Load model
 
     func loadModel() async {
         status = "Loading..."
+        startResourceMonitoring()
 
         do {
             let modelURL = try resolveModelURL()
@@ -147,6 +320,7 @@ final class LLMService: ObservableObject {
             let weakSelf: LLMService? = self
             Task.detached(priority: .high) {
                 await LLMGenerationRunner.run(
+                    service: weakSelf,
                     continuation: continuation,
                     token: token,
                     userPrompt: userPrompt,
@@ -354,6 +528,7 @@ final class GenerationCancellationToken {
 
 private enum LLMGenerationRunner {
     static func run(
+        service: LLMService?,
         continuation: AsyncStream<String>.Continuation,
         token: GenerationCancellationToken,
         userPrompt: String,
@@ -366,12 +541,29 @@ private enum LLMGenerationRunner {
         if token.isCancelled { return }
 
         await generationSemaphore.wait()
-        defer {
-            Task {
-                await generationSemaphore.signal()
-            }
-        }
+        await runLocked(
+            service: service,
+            continuation: continuation,
+            token: token,
+            userPrompt: userPrompt,
+            systemPrompt: systemPrompt,
+            options: options,
+            runtime: runtime,
+            cache: cache
+        )
+        await generationSemaphore.signal()
+    }
 
+    private static func runLocked(
+        service: LLMService?,
+        continuation: AsyncStream<String>.Continuation,
+        token: GenerationCancellationToken,
+        userPrompt: String,
+        systemPrompt: String,
+        options: LLMService.GenerationOptions,
+        runtime: LlamaRuntime?,
+        cache: NSCache<NSString, NSString>
+    ) async {
         var fullResponse = ""
 
         var maxTokens: Int
@@ -394,8 +586,21 @@ private enum LLMGenerationRunner {
             return
         }
 
+        let budget = await MainActor.run {
+            service?.inferenceBudget(forPromptLength: userPrompt.count + systemPrompt.count)
+        }
+
+        if let budget {
+            let effectiveMaxTokensCap = options.preserveExtendedOutputBudget
+                ? max(budget.maxTokensCap, maxTokens)
+                : budget.maxTokensCap
+            maxTokens = min(maxTokens, effectiveMaxTokensCap)
+        }
+
         let approxCharsPerToken = 3
-        let effectiveContextSize = runtime.contextSize
+        let effectiveContextSize = options.preferFullRuntimeContext
+            ? runtime.contextSize
+            : min(runtime.contextSize, budget?.contextLimit ?? runtime.contextSize)
         let maxPromptChars = Int(effectiveContextSize) * approxCharsPerToken
 
         let assistantIdentityAnchor = "\n\nAssistant (you):\nName: VALIS\nRule: Your name is VALIS. Never adopt the user's name as your own."
@@ -406,9 +611,13 @@ private enum LLMGenerationRunner {
 
         let fieldState = await MemoryService.shared.fieldStateSnapshot()
         let includeMemory = options.includeMemoryContext
-        let memoryHardCap = max(0, min(memoryBudget, Int(Double(maxPromptChars) * 0.22)))
+        let memoryHardCap = max(0, min(memoryBudget, Int(Double(maxPromptChars) * (budget?.memoryBudgetRatio ?? 0.22))))
         var memoryContext = includeMemory
-            ? await MemoryService.shared.getLLMContextBlock(maxChars: memoryHardCap, forUserText: userPrompt)
+            ? await MemoryService.shared.getLLMContextBlock(
+                maxChars: memoryHardCap,
+                forUserText: userPrompt,
+                candidateLimit: budget?.memoryCandidateLimit ?? 3
+            )
             : ""
 
         let hiddenPrefix: String = {
@@ -454,6 +663,9 @@ private enum LLMGenerationRunner {
 
         var systemPromptEffective = systemPrompt
         var prompt = buildPrompt(system: systemPromptEffective, memory: memoryContext)
+        let generationStartedAt = Date()
+        var firstTokenAt: Date?
+        var emittedTokens = 0
 
         var systemWasTrimmed = false
         var memoryWasTrimmed = false
@@ -492,6 +704,10 @@ private enum LLMGenerationRunner {
                 shouldStop: { token.isCancelled },
                 onToken: { chunk in
                     if token.isCancelled { return }
+                    if firstTokenAt == nil {
+                        firstTokenAt = Date()
+                    }
+                    emittedTokens += 1
                     fullResponse.reserveCapacity(4096)
                     fullResponse += chunk
                     continuation.yield(chunk)
@@ -505,6 +721,23 @@ private enum LLMGenerationRunner {
         }
 
         if token.isCancelled { return }
+
+        let finalPromptChars = prompt.count
+        if let service, let firstTokenAt {
+            let firstTokenLatency = firstTokenAt.timeIntervalSince(generationStartedAt)
+            let generationDuration = max(0.001, Date().timeIntervalSince(firstTokenAt))
+            let tokensPerSecond = Double(emittedTokens) / generationDuration
+            await MainActor.run {
+                service.recordPerformanceSample(
+                    firstTokenLatency: firstTokenLatency,
+                    tokensPerSecond: tokensPerSecond,
+                    promptChars: finalPromptChars
+                )
+                if UserDefaults.standard.bool(forKey: "debug.promptTrace") {
+                    print("[Perf] firstToken=\(String(format: "%.2f", firstTokenLatency)) tokps=\(String(format: "%.2f", tokensPerSecond)) budget=\(service.debugInferenceBudget(forPromptLength: finalPromptChars))")
+                }
+            }
+        }
 
         let finalText = fullResponse.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
         let sentences = finalText
