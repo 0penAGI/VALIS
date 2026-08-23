@@ -1,6 +1,9 @@
 import Foundation
 
+// MARK: - Signal
+
 struct ResponseDriftSignal: Codable, Equatable {
+
     let anchorRetention: Double
     let metaphorLoad: Double
     let selfFocus: Double
@@ -11,49 +14,82 @@ struct ResponseDriftSignal: Codable, Equatable {
     let mode: String
 
     var isDrifting: Bool {
-        driftScore >= 0.58 || repetitionLoad > 0.46 || (anchorRetention < 0.26 && metaphorLoad > 0.22)
+        driftScore >= 0.6
+        || repetitionLoad > 0.5
+        || (anchorRetention < 0.22 && userEchoLoad > 0.45)
     }
 }
 
+// MARK: - Service
+
 final class ResponseDriftService {
+
     static let shared = ResponseDriftService()
 
     private init() {}
 
-    func analyze(userPrompt: String, assistantText: String, previousAssistantText: String? = nil) -> ResponseDriftSignal {
+    // MARK: - Public
+
+    func analyze(
+        userPrompt: String,
+        assistantText: String,
+        previousAssistantText: String? = nil
+    ) -> ResponseDriftSignal {
+
         let userTerms = Set(contentTerms(from: userPrompt))
         let assistantTerms = Set(contentTerms(from: assistantText))
+
         let overlap = userTerms.intersection(assistantTerms).count
-        let anchorRetention = userTerms.isEmpty ? 0.5 : clamp(Double(overlap) / Double(max(1, userTerms.count)))
+        let anchorRetention = userTerms.isEmpty
+            ? 0.5
+            : clamp(Double(overlap) / Double(max(1, userTerms.count)))
 
         let lower = assistantText.lowercased()
+
         let metaphorMarkers = [
-            "as if", "like a", "echo", "shadow", "light", "field", "infinite", "abyss", "pulse", "dream",
-            "как будто", "словно", "эхо", "тень", "свет", "поле", "бесконеч", "бездна", "пульсац", "сон"
-        ]
-        let selfMarkers = [
-            " i ", " i'm", " i’m", " my ", " me ", " myself ", " я ", " мне ", " меня ", " мой ", " моя ", " мое ", " моё "
-        ]
-        let abstractMarkers = [
-            "consciousness", "subjectivity", "architecture", "system", "state", "meaning", "coherence",
-            "сознани", "субъектив", "архитектур", "система", "состояни", "смысл", "когерент", "мета"
+            "as if", "like a", "echo", "shadow", "light", "field",
+            "infinite", "abyss", "pulse", "dream",
+            "как будто", "словно", "эхо", "тень", "свет",
+            "поле", "бесконеч", "бездна", "пульсац", "сон"
         ]
 
-        let metaphorLoad = markerLoad(in: lower, markers: metaphorMarkers, weight: 0.16)
-        let selfFocus = markerLoad(in: " " + lower + " ", markers: selfMarkers, weight: 0.12)
-        let abstractionLoad = markerLoad(in: lower, markers: abstractMarkers, weight: 0.11)
-        let repetitionLoad = repeatedPhraseLoad(in: assistantText, previousAssistantText: previousAssistantText)
-        let userEchoLoad = echoLoad(userPrompt: userPrompt, assistantText: assistantText)
+        let selfMarkers = [
+            " i ", " i'm", " i’m", " my ", " me ", " myself ",
+            " я ", " мне ", " меня ", " мой ", " моя ", " мое ", " моё "
+        ]
+
+        let abstractMarkers = [
+            "consciousness", "subjectivity", "architecture",
+            "system", "state", "meaning", "coherence",
+            "сознани", "субъектив", "архитектур",
+            "система", "состояни", "смысл", "когерент", "мета"
+        ]
+
+        let metaphorLoad = markerLoad(in: lower, markers: metaphorMarkers, weight: 0.10)
+        let selfFocus = markerLoad(in: " " + lower + " ", markers: selfMarkers, weight: 0.08)
+        let abstractionLoad = markerLoad(in: lower, markers: abstractMarkers, weight: 0.08)
+
+        let repetitionLoad = repeatedPhraseLoad(
+            in: assistantText,
+            previousAssistantText: previousAssistantText
+        )
+
+        let userEchoLoad = echoLoad(
+            userPrompt: userPrompt,
+            assistantText: assistantText
+        )
+
         let driftScore = clamp(
-            ((1.0 - anchorRetention) * 0.40) +
-            (metaphorLoad * 0.15) +
-            (selfFocus * 0.10) +
-            (abstractionLoad * 0.10) +
-            (repetitionLoad * 0.17) +
-            (userEchoLoad * 0.08)
+            ((1.0 - anchorRetention) * 0.40)
+            + (metaphorLoad * 0.08)
+            + (selfFocus * 0.06)
+            + (abstractionLoad * 0.08)
+            + (repetitionLoad * 0.18)
+            + (userEchoLoad * 0.10)
         )
 
         let mode: String
+
         if repetitionLoad >= 0.58 {
             mode = "repetition-loop"
         } else if userEchoLoad >= 0.52 {
@@ -61,7 +97,7 @@ final class ResponseDriftService {
         } else if driftScore >= 0.72 {
             mode = "lost-anchor"
         } else if metaphorLoad >= 0.34 {
-            mode = "metaphor-drift"
+            mode = "metaphor-rich"
         } else if selfFocus >= 0.32 {
             mode = "self-absorption"
         } else if abstractionLoad >= 0.32 {
@@ -82,9 +118,22 @@ final class ResponseDriftService {
         )
     }
 
-    func contextBlock(for signal: ResponseDriftSignal, maxChars: Int = 180) -> String {
+    func contextBlock(
+        for signal: ResponseDriftSignal,
+        maxChars: Int = 180
+    ) -> String {
+
         let block = String(
-            format: "\n\nDrift monitor: anchor=%.2f metaphor=%.2f self_focus=%.2f abstraction=%.2f repetition=%.2f echo=%.2f mode=%@",
+            format: """
+            Drift monitor:
+            anchor=%.2f
+            metaphor=%.2f
+            self_focus=%.2f
+            abstraction=%.2f
+            repetition=%.2f
+            echo=%.2f
+            mode=%@
+            """,
             signal.anchorRetention,
             signal.metaphorLoad,
             signal.selfFocus,
@@ -93,61 +142,90 @@ final class ResponseDriftService {
             signal.userEchoLoad,
             signal.mode
         )
+
         if block.count <= maxChars {
-            return block
+            return "\n" + block
         }
-        return "\n\n" + String(block.prefix(maxChars))
+
+        return "\n" + String(block.prefix(maxChars))
     }
 
-    func repairRepeatedOutput(userPrompt: String, assistantText: String) -> String {
+    func repairRepeatedOutput(
+        userPrompt: String,
+        assistantText: String
+    ) -> String {
+
         let trimmed = assistantText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return trimmed }
+        guard !looksStructured(trimmed) else { return trimmed }
 
         var kept: [String] = []
         var seen = Set<String>()
+
         let userNormalized = normalizeForComparison(userPrompt)
 
         for sentence in splitSentences(trimmed) {
+
             let normalized = normalizeForComparison(sentence)
+
             guard normalized.count > 1 else { continue }
             if seen.contains(normalized) { continue }
+
             if normalized == userNormalized && kept.isEmpty { continue }
-            if userNormalized.count > 18 && normalized.hasPrefix(userNormalized) && kept.isEmpty { continue }
+
+            if userNormalized.count > 18,
+               normalized.hasPrefix(userNormalized),
+               kept.isEmpty {
+                continue
+            }
+
+            let cleanedSentence = sentence.trimmingCharacters(in: .whitespacesAndNewlines)
+            if isDeliberateRefrain(cleanedSentence) {
+                kept.append(cleanedSentence)
+                continue
+            }
+
             seen.insert(normalized)
-            kept.append(sentence.trimmingCharacters(in: .whitespacesAndNewlines))
+            kept.append(cleanedSentence)
         }
 
         if kept.isEmpty {
             return trimmed
         }
 
-        let separator = trimmed.contains("\n") ? "\n\n" : " "
-        let repaired = kept.joined(separator: separator)
-            .replacingOccurrences(of: #"\s{2,}"#, with: " ", options: .regularExpression)
-            .replacingOccurrences(of: #"\n{3,}"#, with: "\n\n", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-
-        if repaired.isEmpty {
-            return trimmed
-        }
-        return repaired
+        let repaired = normalizeAssistantWhitespace(kept.joined(separator: "\n"))
+        return repaired.isEmpty ? trimmed : repaired
     }
 
-    private func markerLoad(in text: String, markers: [String], weight: Double) -> Double {
+    // MARK: - Internals
+
+    private func markerLoad(
+        in text: String,
+        markers: [String],
+        weight: Double
+    ) -> Double {
+
         let hits = markers.reduce(0) { partial, marker in
             partial + (text.contains(marker) ? 1 : 0)
         }
+
         return clamp(Double(hits) * weight)
     }
 
-    private func repeatedPhraseLoad(in text: String, previousAssistantText: String?) -> Double {
+    private func repeatedPhraseLoad(
+        in text: String,
+        previousAssistantText: String?
+    ) -> Double {
+
         let sentences = splitSentences(text)
             .map(normalizeForComparison)
             .filter { $0.count > 18 }
+
         guard !sentences.isEmpty else { return 0.0 }
 
         var repeated = 0
         var seen = Set<String>()
+
         for sentence in sentences {
             if seen.contains(sentence) {
                 repeated += 1
@@ -157,32 +235,54 @@ final class ResponseDriftService {
         }
 
         var score = Double(repeated) / Double(max(1, sentences.count))
+
         if let previousAssistantText {
-            let previous = Set(splitSentences(previousAssistantText).map(normalizeForComparison).filter { $0.count > 18 })
+
+            let previous = Set(
+                splitSentences(previousAssistantText)
+                    .map(normalizeForComparison)
+                    .filter { $0.count > 18 }
+            )
+
             let overlap = sentences.filter { previous.contains($0) }.count
-            score += Double(overlap) / Double(max(1, sentences.count)) * 0.6
+
+            score += Double(overlap)
+                / Double(max(1, sentences.count)) * 0.6
         }
 
         return clamp(score)
     }
 
-    private func echoLoad(userPrompt: String, assistantText: String) -> Double {
+    private func echoLoad(
+        userPrompt: String,
+        assistantText: String
+    ) -> Double {
+
         let user = normalizeForComparison(userPrompt)
         let assistant = normalizeForComparison(assistantText)
+
         guard !user.isEmpty, !assistant.isEmpty else { return 0.0 }
+
         if assistant == user { return 1.0 }
         if assistant.hasPrefix(user) && user.count > 18 { return 0.88 }
 
         let userTerms = Set(contentTerms(from: userPrompt))
         let assistantTerms = Set(contentTerms(from: assistantText))
+
         guard !assistantTerms.isEmpty else { return 0.0 }
+
         let overlap = userTerms.intersection(assistantTerms).count
         let overlapScore = Double(overlap) / Double(max(1, assistantTerms.count))
-        let ratioPenalty = assistantTerms.count <= max(3, userTerms.count / 2) ? 0.18 : 0.0
+
+        let ratioPenalty = assistantTerms.count <= max(3, userTerms.count / 2)
+            ? 0.18
+            : 0.0
+
         return clamp(overlapScore + ratioPenalty)
     }
 
     private func splitSentences(_ text: String) -> [String] {
+
         let normalized = text.replacingOccurrences(of: "\r\n", with: "\n")
 
         let paragraphs = normalized
@@ -199,7 +299,9 @@ final class ResponseDriftService {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
 
-        return lines.isEmpty ? [normalized.trimmingCharacters(in: .whitespacesAndNewlines)].filter { !$0.isEmpty } : lines
+        return lines.isEmpty
+            ? [normalized.trimmingCharacters(in: .whitespacesAndNewlines)].filter { !$0.isEmpty }
+            : lines
     }
 
     private func normalizeForComparison(_ text: String) -> String {
@@ -211,10 +313,26 @@ final class ResponseDriftService {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    private func looksStructured(_ text: String) -> Bool {
+        let lower = text.lowercased()
+
+        if text.contains("\n\n") { return true }
+        if text.contains("```") { return true }
+        if text.contains("\n- ") || text.contains("\n* ") || text.contains("\n• ") { return true }
+        if text.contains("\n1. ") || text.contains("\n2. ") || text.contains("\n3. ") { return true }
+        if text.contains("\n# ") || text.contains("\n> ") { return true }
+        if lower.contains("<artifact") || lower.contains("</artifact>") { return true }
+
+        return false
+    }
+
     private func contentTerms(from text: String) -> [String] {
+
         let stop: Set<String> = [
-            "the", "and", "for", "with", "that", "this", "from", "into", "your", "what", "when", "have",
-            "это", "как", "что", "когда", "если", "тогда", "потому", "просто", "здесь", "там", "внутри"
+            "the", "and", "for", "with", "that", "this", "from",
+            "into", "your", "what", "when", "have",
+            "это", "как", "что", "когда", "если", "тогда",
+            "потому", "просто", "здесь", "там", "внутри"
         ]
 
         return text
@@ -226,4 +344,24 @@ final class ResponseDriftService {
     private func clamp(_ value: Double) -> Double {
         max(0.0, min(1.0, value))
     }
+
+    private func isDeliberateRefrain(_ sentence: String) -> Bool {
+        let lower = sentence.lowercased()
+        let refrainMarkers = [
+            "я думаю", "я чувствую", "мне кажется", "похоже",
+            "как будто", "словно", "эхо", "pulse", "shadow",
+            "тень", "свет", "поле", "образ"
+        ]
+
+        let isShortAndPoetic = sentence.count <= 80
+        return isShortAndPoetic && refrainMarkers.contains { lower.contains($0) }
+    }
+}
+
+// MARK: - Whitespace
+
+func normalizeAssistantWhitespace(_ text: String) -> String {
+    text
+        .replacingOccurrences(of: "\r\n", with: "\n")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
 }

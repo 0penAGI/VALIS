@@ -1,9 +1,12 @@
 import Foundation
+import NaturalLanguage
 import SwiftUI
 import AVFoundation
 import Speech
 import Combine
+#if canImport(UIKit)
 import UIKit
+#endif
 
 struct ChatArtifactMemory: Codable, Equatable {
     let type: String
@@ -63,6 +66,9 @@ private struct ConversationAttentionFocus {
     let inheritedMode: PromptMode
     let confidence: Double
     let isAssistantContinuation: Bool
+    let indicatesTopicBreak: Bool
+    let topicBreakConfidence: Double
+    let isContinuationIntent: Bool
 }
 
 @MainActor
@@ -222,6 +228,7 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
     @Published var pendingImageAttachment: MessageImageAttachment?
     @Published var isInteracting: Bool = false
     @Published var status: String = "Starting Models"
+    @Published private(set) var isModelReady: Bool = false
     @Published var currentThink: String = ""
     @Published var currentThinkingMessageId: UUID?
     @Published var editingUserMessageId: UUID?
@@ -250,9 +257,14 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
     private let emotionService = EmotionService.shared
     private let visionAttachmentService = VisionAttachmentService.shared
     private let responseDriftService = ResponseDriftService.shared
+    private let continuousContextService = ContinuousContextService.shared
+    private let voiceLayerService = VoiceLayerService(
+        emotionService: EmotionService.shared
+    )
     private var lastReflectionHash: Int?
     private var lastDriftSignal: ResponseDriftSignal?
     private var statusClearTask: Task<Void, Never>?
+    private var activeRuleBasedContextTask: Task<ActionService.PreparedContext, Never>?
     private var pendingUserFeedbackValence: Double?
     private var turnsSinceSelfReflection: Int = 0
     private let selfReflectionIntervalTurns: Int = 8
@@ -278,6 +290,13 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
                 guard let self = self else { return }
                 self.status = value
                 self.scheduleStatusAutoClearIfNeeded(for: value)
+            }
+            .store(in: &cancellables)
+
+        llmService.$isModelReady
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] value in
+                self?.isModelReady = value
             }
             .store(in: &cancellables)
 
@@ -374,17 +393,63 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
         chatStore.updateCurrentChat(messages: messages, rememberedArtifact: rememberedArtifact, suggestedTitle: title)
     }
 
-    private func suggestedChatTitle(from messages: [Message]) -> String? {
-        guard let firstUserMessage = messages.first(where: { $0.role == .user }) else { return nil }
-        let normalized = firstUserMessage.content
-            .replacingOccurrences(of: "\n", with: " ")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        if normalized.isEmpty, firstUserMessage.imageAttachment != nil {
-            return "Image chat"
+    private func suggestedChatTitle(from messages: [Message]) -> String {
+        let text = messages
+            .filter { $0.role == .user }
+            .suffix(3)
+            .map { $0.content }
+            .joined(separator: " ")
+
+        let cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !cleaned.isEmpty else {
+            return "New chat"
         }
-        guard !normalized.isEmpty else { return nil }
-        if normalized.count <= 32 { return normalized }
-        return String(normalized.prefix(32)).trimmingCharacters(in: .whitespacesAndNewlines) + "..."
+
+        return String(cleaned.prefix(32))
+    }
+
+    func updateArtifactContent(for messageID: UUID, payload: String) {
+        guard let index = messages.firstIndex(where: { $0.id == messageID }) else { return }
+        guard let artifact = extractLastHTMLArtifact(from: messages[index].content) else { return }
+
+        let updatedContent = replaceLastHTMLArtifact(
+            in: messages[index].content,
+            title: artifact.title,
+            payload: payload
+        )
+        guard updatedContent != messages[index].content else { return }
+
+        var updatedMessage = messages[index]
+        updatedMessage.content = updatedContent
+        messages[index] = updatedMessage
+
+        MarkdownRenderer.prewarmInline(updatedContent)
+
+        if let savedArtifact = extractLastHTMLArtifact(from: updatedContent) {
+            rememberedArtifact = ChatArtifactMemory(
+                type: savedArtifact.type,
+                title: savedArtifact.title,
+                payload: savedArtifact.payload,
+                updatedAt: Date()
+            )
+        }
+
+        persistCurrentChatState()
+    }
+
+    private func normalizedConversationSnippet(_ text: String, maxChars: Int = 180) -> String {
+        let cleaned = text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+
+        let trimmed = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !trimmed.isEmpty else { return "" }
+
+        return trimmed.count > maxChars
+            ? String(trimmed.prefix(maxChars)) + "…"
+            : trimmed
     }
 
     private var attachmentsDirectoryURL: URL {
@@ -428,26 +493,29 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
         }
     }
 
-    private func storeExternalImageMemory(query: String, candidate: ActionService.WebImageCandidate?, attachment: MessageImageAttachment?) {
+    private func storeExternalImageMemory(query: String, candidate: ActionService.WebImageCandidate?, attachment: MessageImageAttachment?) async {
         guard let attachment else { return }
         let queryText = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !queryText.isEmpty else { return }
 
-        var parts: [String] = []
-        parts.append("Visual reference saved for \"\(queryText)\".")
-        if let title = candidate?.title.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty {
-            parts.append("Title: \(title).")
-        }
-        if let source = candidate?.sourcePageURL?.absoluteString, !source.isEmpty {
-            parts.append("Source: \(source).")
-        }
-        parts.append("Local attachment: \(attachment.filename).")
+        let analysis = await visionAttachmentService.analyze(attachment)
+        let title = candidate?.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let sourceURL = candidate?.sourcePageURL?.absoluteString
+
+        var snippets = analysis.learningSnippets(
+            query: queryText,
+            title: title?.isEmpty == false ? title : nil,
+            sourceURL: sourceURL?.isEmpty == false ? sourceURL : nil,
+            attachmentFilename: attachment.filename
+        )
+
+        snippets.insert("Visual reference saved for \"\(queryText)\".", at: 0)
 
         memoryService.ingestExternalSnippets(
-            [parts.joined(separator: " ")],
+            snippets,
             source: "image-search",
             query: queryText,
-            maxCount: 1
+            maxCount: 2
         )
     }
 
@@ -467,10 +535,10 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
         }
     }
 
-    private func dataURI(for attachment: MessageImageAttachment) -> String? {
+    private func attachmentSource(for attachment: MessageImageAttachment) -> String? {
         let fileURL = attachmentsDirectoryURL.appendingPathComponent(attachment.filename)
-        guard let data = try? Data(contentsOf: fileURL), !data.isEmpty else { return nil }
-        return "data:image/jpeg;base64,\(data.base64EncodedString())"
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
+        return attachment.filename
     }
 
     private func enrichArtifactHTMLIfNeeded(
@@ -480,13 +548,13 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
     ) -> String {
         guard let attachment,
               let artifact = extractLastHTMLArtifact(from: text),
-              let dataURI = dataURI(for: attachment) else {
+              let imageSource = attachmentSource(for: attachment) else {
             return text
         }
 
-        let updatedPayload = injectImageDataURI(
+        let updatedPayload = injectImageSource(
             into: artifact.payload,
-            dataURI: dataURI,
+            source: imageSource,
             title: imageTitle ?? artifact.title ?? "Reference image"
         )
         guard updatedPayload != artifact.payload else { return text }
@@ -595,34 +663,8 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
     }
 
     private func collapseImageOnlyArtifactIfNeeded(in text: String, attachment: MessageImageAttachment?) -> String {
-        guard let artifact = extractLastHTMLArtifact(from: text) else {
-            return text
-        }
-
-        let lower = artifact.payload.lowercased()
-        let hadImageIntent = lower.contains("<img") || lower.contains("image") || lower.contains("изображ")
-        let hasVerifiedEmbeddedImage = lower.contains("<img") && lower.contains("data:image/")
-        let isImageFocusedArtifact =
-            hadImageIntent &&
-            (lower.contains("<img") || lower.contains("pixabay") || lower.contains("unsplash") || lower.contains("wikipedia"))
-
-        if attachment != nil && isImageFocusedArtifact {
-            let stripped = stripArtifactsFromText(text)
-            let fallback = "I found an image and attached it above, so I’m keeping the chat clean instead of duplicating it as an artifact."
-            let combined = [stripped, fallback]
-                .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-                .joined(separator: "\n\n")
-            return combined.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-
-        guard attachment == nil, hadImageIntent, !hasVerifiedEmbeddedImage else { return text }
-
-        let stripped = stripArtifactsFromText(text)
-        let fallback = "I couldn't verify an image source, so I left the image out."
-        let combined = [stripped, fallback]
-            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-            .joined(separator: "\n\n")
-        return combined.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Disabled collapsing behavior: always preserve artifacts as-is
+        return text
     }
 
     private func sanitizeAssistantOutputLinks(in text: String) async -> String {
@@ -633,9 +675,7 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
         cleaned = await sanitizeMarkdownImages(in: cleaned)
         cleaned = await sanitizeMarkdownLinks(in: cleaned)
         cleaned = await sanitizePlainURLs(in: cleaned)
-        cleaned = cleaned.replacingOccurrences(of: #"\(\s*\)"#, with: "", options: .regularExpression)
-        cleaned = cleaned.replacingOccurrences(of: #"\n{4,}"#, with: "\n\n\n", options: .regularExpression)
-        return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned
     }
 
     private func sanitizeMarkdownImages(in text: String) async -> String {
@@ -700,12 +740,10 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
         }
 
         cleaned = cleaned.replacingOccurrences(of: #"\(\s*\)"#, with: "", options: .regularExpression)
-        cleaned = cleaned.replacingOccurrences(of: #"\s{2,}"#, with: " ", options: .regularExpression)
-        cleaned = cleaned.replacingOccurrences(of: #"\s+\n"#, with: "\n", options: .regularExpression)
-        return cleaned
+        return normalizeAssistantWhitespace(cleaned)
     }
 
-    private func injectImageDataURI(into html: String, dataURI: String, title: String) -> String {
+    private func injectImageSource(into html: String, source: String, title: String) -> String {
         let alt = htmlEscaped(title)
         var updated = html
 
@@ -716,7 +754,7 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
                 let original = String(updated[fullRange])
                 let replaced = original.replacingOccurrences(
                     of: #"(?is)\bsrc\s*=\s*(['"])(.*?)\1"#,
-                    with: #"src="\#(dataURI)""#,
+                    with: #"src="\#(source)""#,
                     options: .regularExpression
                 )
                 return updated.replacingCharacters(in: fullRange, with: replaced)
@@ -725,7 +763,7 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
 
         let imageBlock = """
         <figure style="margin:24px auto;max-width:920px;padding:0;">
-        <img src="\(dataURI)" alt="\(alt)" style="display:block;width:100%;height:auto;border-radius:22px;box-shadow:0 18px 60px rgba(0,0,0,0.22);object-fit:cover;">
+        <img src="\(source)" alt="\(alt)" style="display:block;width:100%;height:auto;border-radius:22px;box-shadow:0 18px 60px rgba(0,0,0,0.22);object-fit:cover;">
         </figure>
         """
 
@@ -820,6 +858,194 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
         return parts.joined(separator: "\n\n")
     }
 
+    private func buildToolAwarePrompt(basePrompt: String, toolContext: String) -> String {
+        let trimmedPrompt = basePrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedToolContext = toolContext.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedToolContext.isEmpty else { return trimmedPrompt }
+
+        let compactToolContext: String
+        if trimmedToolContext.count > 2_400 {
+            compactToolContext = String(trimmedToolContext.prefix(2_400)) + "\n..."
+        } else {
+            compactToolContext = trimmedToolContext
+        }
+
+        return "Verified tool context:\n\(compactToolContext)\n\n\(trimmedPrompt)"
+    }
+
+    private func buildAdaptiveSamplingOverride(
+        promptMode: PromptMode,
+        isArtifactRequest: Bool,
+        quantumField: QuantumMemoryService.QuantumDecisionField?,
+        motivators: MotivatorState,
+        emotion: EmotionState,
+        driftSignal: ResponseDriftSignal?
+    ) -> SamplingConfig {
+        func clamp(_ value: Double, _ lower: Double, _ upper: Double) -> Double {
+            max(lower, min(upper, value))
+        }
+
+        func clampInt(_ value: Int, _ lower: Int, _ upper: Int) -> Int {
+            max(lower, min(upper, value))
+        }
+
+        func mix(_ lhs: Double, _ rhs: Double, weight: Double) -> Double {
+            lhs * (1.0 - weight) + rhs * weight
+        }
+
+        let base: SamplingConfig = {
+            switch promptMode {
+            case .direct:
+                return SamplingConfig(temperature: 0.38, topK: 26, topP: 0.92, repetitionPenalty: 1.08, repeatLastN: 68)
+            case .code:
+                return SamplingConfig(temperature: 0.42, topK: 30, topP: 0.93, repetitionPenalty: 1.08, repeatLastN: 64)
+            case .artifact:
+                return SamplingConfig(temperature: 0.72, topK: 40, topP: 0.95, repetitionPenalty: 1.08, repeatLastN: 64)
+            case .reflective:
+                return SamplingConfig(temperature: 0.58, topK: 38, topP: 0.94, repetitionPenalty: 1.06, repeatLastN: 60)
+            case .creative:
+                return SamplingConfig(temperature: 0.72, topK: 44, topP: 0.95, repetitionPenalty: 1.05, repeatLastN: 60)
+            case .architecture:
+                return SamplingConfig(temperature: 0.52, topK: 34, topP: 0.94, repetitionPenalty: 1.07, repeatLastN: 64)
+            }
+        }()
+
+        var temperature = Double(base.temperature)
+        var topK = Double(base.topK)
+        var topP = Double(base.topP)
+        var repetitionPenalty = Double(base.repetitionPenalty)
+        var repeatLastN = Double(base.repeatLastN)
+
+        if let quantumField, promptMode != .direct, !isArtifactRequest {
+            let quantum = QuantumMemoryService.shared.samplingConfig(for: quantumField)
+            temperature = mix(temperature, Double(quantum.temperature), weight: 0.5)
+            topK = mix(topK, Double(quantum.topK), weight: 0.45)
+            topP = mix(topP, Double(quantum.topP), weight: 0.45)
+            repetitionPenalty = mix(repetitionPenalty, Double(quantum.repetitionPenalty), weight: 0.5)
+            repeatLastN = mix(repeatLastN, Double(quantum.repeatLastN), weight: 0.45)
+        }
+
+        let valence = clamp(emotion.valence, -1.0, 1.0)
+        let intensity = clamp(emotion.intensity, 0.0, 1.0)
+        let stability = clamp(emotion.stability, 0.0, 1.0)
+        let curiosity = clamp(motivators.curiosity, 0.0, 1.0)
+        let helpfulness = clamp(motivators.helpfulness, 0.0, 1.0)
+        let caution = clamp(motivators.caution, 0.0, 1.0)
+        let mood = clamp(motivators.mood, 0.0, 1.0)
+        let trust = clamp(motivators.trust, 0.0, 1.0)
+        let energy = clamp(motivators.energy, 0.0, 1.0)
+        let driftScore = clamp(driftSignal?.driftScore ?? 0.0, 0.0, 1.0)
+        let repetitionLoad = clamp(driftSignal?.repetitionLoad ?? 0.0, 0.0, 1.0)
+        let anchorRetention = clamp(driftSignal?.anchorRetention ?? 0.5, 0.0, 1.0)
+
+        let exploratoryPush = clamp(
+            (curiosity * 0.35)
+            + (helpfulness * 0.15)
+            + (energy * 0.15)
+            + max(0.0, valence) * 0.08
+            + (quantumField?.explorationBias ?? 0.0) * 0.20,
+            0.0,
+            1.0
+        )
+        let cautionLoad = clamp(
+            (caution * 0.42)
+            + ((1.0 - stability) * 0.22)
+            + (driftScore * 0.22)
+            + (repetitionLoad * 0.18)
+            + max(0.0, 1.0 - anchorRetention) * 0.18,
+            0.0,
+            1.0
+        )
+        let tension = clamp(
+            (1.0 - mood) * 0.12
+            + (1.0 - trust) * 0.10
+            + intensity * 0.08,
+            0.0,
+            1.0
+        )
+
+        if promptMode == .direct || promptMode == .code {
+            temperature = clamp(temperature + exploratoryPush * 0.04 - cautionLoad * 0.10 - tension * 0.03, 0.18, 0.62)
+            topK = clamp(topK + exploratoryPush * 4.0 - cautionLoad * 8.0, 12.0, 40.0)
+            topP = clamp(topP - cautionLoad * 0.03 + exploratoryPush * 0.01, 0.84, 0.98)
+            repetitionPenalty = clamp(repetitionPenalty + cautionLoad * 0.05 + repetitionLoad * 0.04, 1.03, 1.20)
+            repeatLastN = clamp(repeatLastN - cautionLoad * 8.0 + exploratoryPush * 2.0, 24.0, 80.0)
+        } else if isArtifactRequest {
+            temperature = clamp(temperature + exploratoryPush * 0.06 - cautionLoad * 0.04, 0.45, 0.92)
+            topK = clamp(topK + exploratoryPush * 6.0 - cautionLoad * 3.0, 24.0, 80.0)
+            topP = clamp(topP + exploratoryPush * 0.01 - cautionLoad * 0.01, 0.88, 0.98)
+            repetitionPenalty = clamp(repetitionPenalty + cautionLoad * 0.03, 1.03, 1.16)
+            repeatLastN = clamp(repeatLastN + exploratoryPush * 4.0 - cautionLoad * 4.0, 32.0, 80.0)
+        } else {
+            temperature = clamp(temperature + exploratoryPush * 0.06 - cautionLoad * 0.08 - tension * 0.03, 0.20, 1.00)
+            topK = clamp(topK + exploratoryPush * 10.0 - cautionLoad * 10.0, 16.0, 80.0)
+            topP = clamp(topP + exploratoryPush * 0.015 - cautionLoad * 0.02, 0.82, 0.98)
+            repetitionPenalty = clamp(repetitionPenalty + cautionLoad * 0.05 + (1.0 - trust) * 0.02, 1.02, 1.22)
+            repeatLastN = clamp(repeatLastN + exploratoryPush * 6.0 - cautionLoad * 6.0, 24.0, 80.0)
+        }
+
+        return SamplingConfig(
+            temperature: Float(temperature),
+            topK: clampInt(Int(round(topK)), 12, 80),
+            topP: Float(topP),
+            repetitionPenalty: Float(repetitionPenalty),
+            repeatLastN: clampInt(Int(round(repeatLastN)), 24, 80)
+        )
+    }
+
+    private func awaitTaskQuickly<T>(_ task: Task<T, Never>, timeoutNanoseconds: UInt64) async -> T? {
+        await withTaskGroup(of: T?.self) { group in
+            group.addTask {
+                await task.value
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+                return nil
+            }
+
+            defer { group.cancelAll() }
+            if let result = await group.next() {
+                return result
+            }
+            return nil
+        }
+    }
+
+    private func buildVerifiedContextPrompt(basePrompt: String, contextLabel: String, context: String) -> String {
+        let trimmedPrompt = basePrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedContext = context.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedContext.isEmpty else { return trimmedPrompt }
+
+        let compactContext: String
+        if trimmedContext.count > 3_600 {
+            compactContext = String(trimmedContext.prefix(3_600)) + "\n..."
+        } else {
+            compactContext = trimmedContext
+        }
+
+        return """
+Verified \(contextLabel):
+\(compactContext)
+
+\(trimmedPrompt)
+"""
+    }
+
+    private func visibleLinkAnalysisThinkText(from analysis: String) -> String {
+        let trimmed = analysis.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+
+        let normalized = trimmed
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\\n{3,}", with: "\n\n", options: .regularExpression)
+
+        if normalized.count <= 4_000 {
+            return normalized
+        }
+
+        return String(normalized.prefix(4_000)) + "\n..."
+    }
+
     private func scheduleStatusAutoClearIfNeeded(for value: String) {
         let lower = value.lowercased()
         let isError = lower.contains("error") || lower.contains("denied") || lower.contains("not available")
@@ -869,12 +1095,14 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
             .store(in: &cancellables)
 
         NotificationCenter.default
+            #if canImport(UIKit)
             .publisher(for: UIApplication.didBecomeActiveNotification)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
                 self?.consumePendingSiriPromptIfNeeded()
             }
             .store(in: &cancellables)
+            #endif
     }
 
     private func consumePendingSiriPromptIfNeeded() {
@@ -916,9 +1144,70 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
         // Preserve exact model output
         existing.append(chunk)
     }
+
+    private func formattedAssistantDisplayText(_ text: String) -> String {
+        let normalized = text.replacingOccurrences(of: "\r\n", with: "\n")
+        let trimmed = normalized.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+
+        // Preserve original structure: no sentence reflow, no space collapsing
+        // Only reduce extreme blank-line spam
+        let collapsed = trimmed.replacingOccurrences(
+            of: "\\n{4,}",
+            with: "\n\n\n",
+            options: .regularExpression
+        )
+
+        return collapsed
+    }
+
+    private func shouldPreserveAssistantStructure(in text: String) -> Bool {
+        let markers = [
+            "\n\n",
+            "```",
+            "\n- ",
+            "\n* ",
+            "\n• ",
+            "\n1. ",
+            "\n2. ",
+            "\n3. ",
+            "\n# ",
+            "\n> ",
+            "<artifact",
+            "</artifact>",
+            "<html",
+            "<body"
+        ]
+
+        return markers.contains(where: { text.contains($0) })
+    }
+
+    private func sentenceFragments(in text: String) -> [String] {
+        let tokenizer = NLTokenizer(unit: .sentence)
+        tokenizer.string = text
+
+        var fragments: [String] = []
+        tokenizer.enumerateTokens(in: text.startIndex..<text.endIndex) { range, _ in
+            let fragment = text[range].trimmingCharacters(in: .whitespacesAndNewlines)
+            if !fragment.isEmpty {
+                fragments.append(String(fragment))
+            }
+            return true
+        }
+
+        if fragments.isEmpty {
+            let fallback = text
+                .split(separator: " ", omittingEmptySubsequences: true)
+                .map(String.init)
+            return fallback.isEmpty ? [text] : fallback
+        }
+
+        return fragments
+    }
     
     func stopGeneration() {
         didUserRequestStopGeneration = true
+        activeRuleBasedContextTask?.cancel()
         llmService.cancelGeneration()
         playStopHaptic()
         // Do not clear generation state here: we need the running task to flush parser
@@ -930,13 +1219,26 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
         let recent = messages
             .filter { $0.role == .user || $0.role == .assistant }
             .suffix(maxTurns)
+        let recentArray = Array(recent)
 
         guard !recent.isEmpty else { return "" }
 
-        let lines: [String] = recent.compactMap { message in
+        let lines: [String] = recentArray.enumerated().compactMap { index, message in
             let role = message.role == .user ? "User" : "Assistant"
             let content = message.content.trimmingCharacters(in: .whitespacesAndNewlines)
             if content.isEmpty { return nil }
+
+            if message.role == .assistant {
+                let previousUserText = recentArray[..<index]
+                    .last(where: { $0.role == .user && !$0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })?
+                    .content ?? ""
+                let summary = assistantContinuationSummary(
+                    from: normalizedConversationSnippet(content, maxChars: maxCharsPerMessage),
+                    fallbackUserText: normalizedConversationSnippet(previousUserText, maxChars: 120)
+                )
+                return "\(role): \(summary)"
+            }
+
             let clipped = content.count > maxCharsPerMessage
                 ? String(content.prefix(maxCharsPerMessage)) + "…"
                 : content
@@ -949,8 +1251,6 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
 
     private func buildConversationAttentionFocus(for userText: String, currentUserMessageID: UUID) -> ConversationAttentionFocus? {
         let trimmed = userText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard isLikelyContextDependentFollowUp(trimmed) else { return nil }
-
         let recent = messages
             .filter { ($0.role == .user || $0.role == .assistant) && $0.id != currentUserMessageID }
             .suffix(8)
@@ -960,6 +1260,11 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
         let currentTerms = Set(extractAttentionTerms(from: trimmed))
         let currentIsUnderspecified = currentTerms.count <= 2
         let recentArray = Array(recent)
+        let continuationIntent = isLikelyContextDependentFollowUp(trimmed)
+        let topicBreakSignal = topicBreakConfidence(for: trimmed, recentMessages: recentArray)
+        let adjustedTopicBreakSignal = continuationIntent ? min(topicBreakSignal, 0.35) : topicBreakSignal
+
+        guard continuationIntent || topicBreakSignal >= 0.62 else { return nil }
 
         var bestSummary: String?
         var bestMode: PromptMode = .direct
@@ -1017,18 +1322,27 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
             bestIsAssistantContinuation = isAssistantCandidate
         }
 
-        guard let bestSummary, bestScore >= 0.42 else { return nil }
+        guard let bestSummary, bestScore >= 0.42 || topicBreakSignal >= 0.62 else { return nil }
         return ConversationAttentionFocus(
             summary: bestSummary,
             inheritedMode: bestMode,
             confidence: min(1.0, bestScore),
-            isAssistantContinuation: bestIsAssistantContinuation
+            isAssistantContinuation: bestIsAssistantContinuation,
+            indicatesTopicBreak: adjustedTopicBreakSignal >= 0.62,
+            topicBreakConfidence: min(1.0, adjustedTopicBreakSignal),
+            isContinuationIntent: continuationIntent
         )
     }
 
     private func buildConversationAttentionBlock(_ focus: ConversationAttentionFocus?) -> String {
         guard let focus else { return "" }
         let clipped = focus.summary.count > 160 ? String(focus.summary.prefix(160)) + "…" : focus.summary
+        if focus.isContinuationIntent {
+            return "\n\nThe user is asking for more detail on the current topic, so stay on the same thread and expand the latest answer instead of switching away: \(clipped)"
+        }
+        if focus.indicatesTopicBreak {
+            return "\n\nThe user's message appears to start a new topic, so drop stale assumptions from the previous thread and answer from the new request first. Only reuse older context if it is clearly relevant: \(clipped)"
+        }
         if focus.isAssistantContinuation {
             return "\n\nThe user's short reply accepts your immediately previous offered continuation, so continue that exact line instead of resetting: \(clipped)"
         }
@@ -1066,19 +1380,58 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
         }
     }
 
-    private func normalizedConversationSnippet(_ text: String, maxChars: Int = 180) -> String {
-        let compact = text
-            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !compact.isEmpty else { return "" }
-        return compact.count > maxChars ? String(compact.prefix(maxChars)) + "…" : compact
-    }
+
 
     private func semanticAttentionSimilarity(between lhs: String, and rhs: String) -> Double {
         let lhsVector = attentionEmbedding(for: lhs)
         let rhsVector = attentionEmbedding(for: rhs)
         guard !lhsVector.isEmpty, lhsVector.count == rhsVector.count else { return 0.0 }
         return cosineSimilarity(lhsVector, rhsVector)
+    }
+
+    private func topicBreakConfidence(for userText: String, recentMessages: [Message]) -> Double {
+        let trimmed = userText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return 0.0 }
+        guard !recentMessages.isEmpty else { return 0.0 }
+
+        let recentCombined = recentMessages
+            .suffix(6)
+            .map { normalizedConversationSnippet($0.content, maxChars: 180) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n")
+        guard !recentCombined.isEmpty else { return 0.0 }
+
+        let currentTerms = Set(extractAttentionTerms(from: trimmed))
+        let priorTerms = Set(extractAttentionTerms(from: recentCombined))
+        let overlap = currentTerms.intersection(priorTerms).count
+        let overlapScore = currentTerms.isEmpty ? 0.0 : Double(overlap) / Double(max(1, currentTerms.count))
+        let semantic = semanticAttentionSimilarity(between: trimmed, and: recentCombined)
+        let novelty = currentTerms.isEmpty ? 0.0 : Double(currentTerms.subtracting(priorTerms).count) / Double(max(1, currentTerms.count))
+
+        let lower = trimmed.lowercased()
+        let explicitShiftSignals = [
+            "new topic", "different question", "another thing", "switching topic",
+            "другая тема", "другой вопрос", "а теперь", "переключимся", "новый вопрос"
+        ]
+        let entitySignals = [
+            "http://", "https://", "www.", ".com", ".ru", ".org", ".ai", ".io"
+        ]
+
+        var score = ((1.0 - overlapScore) * 0.42) + ((1.0 - semantic) * 0.33) + (novelty * 0.25)
+        if explicitShiftSignals.contains(where: { lower.contains($0) }) {
+            score += 0.22
+        }
+        if entitySignals.contains(where: { lower.contains($0) }) {
+            score += 0.12
+        }
+        if lower.range(of: #"\b\d{3,}\b"#, options: .regularExpression) != nil {
+            score += 0.08
+        }
+        if trimmed.count > 48 && currentTerms.count >= 3 {
+            score += 0.05
+        }
+
+        return max(0.0, min(1.0, score))
     }
 
     private func attentionEmbedding(for text: String) -> [Double] {
@@ -1267,6 +1620,54 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
         return cleaned.isEmpty ? compact : cleaned
     }
 
+    private func buildRecentCodeContext(for prompt: String, maxChars: Int = 2_400) -> String {
+        let lower = prompt.lowercased()
+        let codeSignals = [
+            "code", "bug", "debug", "fix", "refactor", "patch", "error", "compile",
+            "improve", "improvement", "enhance", "refine", "update", "modify", "adjust",
+            "optimize", "polish", "tune", "rewrite", "extend", "change", "tweak",
+            "swift", "html", "css", "javascript", "js", "bugfix",
+            "код", "ошиб", "дебаг", "почини", "исправ", "рефактор", "собери", "пофикс",
+            "улучш", "доработ", "улучши", "улучшить", "подправ", "поправ", "сделай лучше", "допили"
+        ]
+        let wantsCodeContext = codeSignals.contains(where: { lower.contains($0) })
+            || shouldUseArtifactContinuation(for: prompt)
+
+        guard wantsCodeContext else { return "" }
+
+        let recentAssistantCode: String? = messages.reversed().compactMap { message in
+            guard message.role == .assistant else { return nil }
+            let content = message.content.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !content.isEmpty else { return nil }
+
+            if let artifact = extractLastHTMLArtifact(from: content) {
+                return artifact.payload
+            }
+
+            if let codeBlock = extractLastFencedCodeBlock(from: content) {
+                return codeBlock
+            }
+
+            if looksLikeCodeHeavyResponse(content) {
+                return content
+            }
+
+            return nil
+        }.first
+
+        guard let code = recentAssistantCode else { return "" }
+        let clipped = code.count > maxChars ? String(code.prefix(maxChars)) + "…" : code
+        guard !clipped.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return "" }
+
+        return """
+
+Recent assistant code:
+```text
+\(clipped)
+```
+"""
+    }
+
     private func extractSearchExpansionTerms(from text: String) -> [String] {
         let lower = text.lowercased()
         let parts = lower.components(separatedBy: CharacterSet.alphanumerics.inverted)
@@ -1297,6 +1698,34 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
         return triggers.contains { lower.contains($0) }
     }
 
+    private func extractLastFencedCodeBlock(from text: String) -> String? {
+        let pattern = #"(?is)```(?:[A-Za-z0-9_+-]*)\s*\n(.*?)\n```"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = regex.matches(in: text, range: range).last,
+              let blockRange = Range(match.range(at: 1), in: text) else { return nil }
+
+        let block = String(text[blockRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+        return block.isEmpty ? nil : block
+    }
+
+    private func looksLikeCodeHeavyResponse(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 120 else { return false }
+
+        let lower = trimmed.lowercased()
+        let codeMarkers = [
+            "<html", "</html>", "<body", "</body>", "<script", "</script>",
+            "func ", "struct ", "class ", "enum ", "extension ", "import ",
+            "let ", "var ", "private func", "public func", "return ", "if ", "guard ",
+            "{", "}", "=>", "self.", "onAppear", "onChange"
+        ]
+        let hits = codeMarkers.reduce(into: 0) { partialResult, marker in
+            if lower.contains(marker) { partialResult += 1 }
+        }
+        return hits >= 4
+    }
+
     private func basePromptMode(for text: String) -> PromptMode {
         let lower = text.lowercased()
         if shouldPreferCleanArtifactContext(for: text) {
@@ -1317,7 +1746,9 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
         let codeSignals = [
             "code", "swift", "python", "javascript", "typescript", "html", "css", "bug", "debug",
             "refactor", "fix", "build app", "compile", "xcode", "stack trace",
-            "код", "ошибка", "дебаг", "рефактор", "почини", "собери", "свифт"
+            "improve", "enhance", "refine", "update", "modify", "adjust", "optimize", "polish",
+            "код", "ошибка", "дебаг", "рефактор", "почини", "собери", "свифт",
+            "улучш", "доработ", "улучши", "улучшить", "подправ", "поправ", "сделай лучше", "допили"
         ]
         if codeSignals.contains(where: { lower.contains($0) }) {
             return .code
@@ -1349,6 +1780,17 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
             return base
         }
         return inherited
+    }
+
+    private func isEcoGenerationDevice() -> Bool {
+        #if targetEnvironment(simulator)
+        return false
+        #elseif canImport(UIKit)
+        let model = UIDevice.current.modelName.lowercased()
+        return model.contains("iphone13") || model.contains("iphone 13")
+        #else
+        return false
+        #endif
     }
 
     private func assemblePromptFragments(_ fragments: [PromptFragment], maxChars: Int) -> String {
@@ -1407,88 +1849,54 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
 
         let topic = String(memory.content.prefix(36))
         let toolContext = await actionService.autonomousContext(for: topic)
-        let systemPrompt = identityService.systemPrompt + "\n" + toolContext
-        let prompt = "I noticed a gap in my knowledge about \(topic). Help me understand it better."
+        let systemPrompt = """
+        \(identityService.systemPrompt(for: LLMModelStorage.load()))
+        \(toolContext)
 
-        isInteracting = true
+        This is a private internal reflection pass.
+        Do not address the user.
+        Do not offer help, follow-up questions, or closing invitations.
+        Keep it concise, grounded, and self-referential only if needed.
+        """
+        let prompt = """
+        Internal reflection topic: \(topic)
+
+        Write a compact private note about this topic in 1-2 sentences.
+        Focus on what is missing, what stands out, or what should be remembered.
+        Avoid any user-facing phrasing.
+        """
         lastSpontaneousAt = Date()
-        let generationId = UUID()
-        activeGenerationId = generationId
 
-        let assistantMessageId = UUID()
-        messages.append(Message(id: assistantMessageId, role: .assistant, content: "", thinkContent: ""))
-        currentThinkingMessageId = assistantMessageId
-        currentThink = ""
-
-        generationTask = Task { [generationId] in
-            var parser = ThinkStreamParser()
-            var visibleBuffer = ""
-            let stream = await llmService.generate(userPrompt: prompt, systemPrompt: systemPrompt)
-            for await chunk in stream {
-                if Task.isCancelled || activeGenerationId != generationId { break }
-                let result = parser.feed(chunk)
-                if let index = messages.firstIndex(where: { $0.id == assistantMessageId }) {
-                    if !result.visible.isEmpty, parser.allowVisibleStreaming {
-                        appendStreamChunk(&visibleBuffer, result.visible)
-                        await MainActor.run {
-                            messages[index].content = visibleBuffer
-                        }
-                    }
-                    if !result.think.isEmpty {
-                        appendStreamChunk(&currentThink, result.think)
-                        if messages[index].thinkContent == nil {
-                            messages[index].thinkContent = ""
-                        }
-                        if var think = messages[index].thinkContent {
-                            appendStreamChunk(&think, result.think)
-                            messages[index].thinkContent = think
-                        }
-                    }
+        generationTask = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                Task { @MainActor in
+                    self.generationTask = nil
                 }
             }
 
-            guard activeGenerationId == generationId else { return }
+            let note = await self.llmService.generateText(
+                userPrompt: prompt,
+                systemPrompt: systemPrompt,
+                options: LLMService.GenerationOptions(
+                    includeMemoryContext: false,
+                    includeHiddenPrefix: false,
+                    useCache: false,
+                    useKVInjection: false,
+                    storeResponseToMemory: false,
+                    preferFullRuntimeContext: false,
+                    managesActiveGenerationState: false
+                )
+            )
+            if Task.isCancelled { return }
 
-            if let index = messages.firstIndex(where: { $0.id == assistantMessageId }) {
-                let tail = parser.flush()
-                if !tail.visible.isEmpty, parser.allowVisibleStreaming {
-                    appendStreamChunk(&visibleBuffer, tail.visible)
-                }
-                if !tail.think.isEmpty {
-                    appendStreamChunk(&currentThink, tail.think)
-                    if messages[index].thinkContent == nil {
-                        messages[index].thinkContent = ""
-                    }
-                    if var think = messages[index].thinkContent {
-                        appendStreamChunk(&think, tail.think)
-                        messages[index].thinkContent = think
-                    }
-                }
-                var finalText = normalizeCompletedArtifactMarkup(in: cleanFinalAnswer(visibleBuffer))
-                if finalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                   let thinkText = messages[index].thinkContent,
-                   !thinkText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    let split = splitThinkIntoFinal(thinkText)
-                    messages[index].thinkContent = split.think
-                    finalText = normalizeCompletedArtifactMarkup(in: split.final)
-                }
-
-                MarkdownRenderer.prewarmInline(finalText)
-                messages[index].content = finalText
-                rememberArtifactIfPresent(in: finalText)
-                storeInternalReflection(
-                    userPrompt: prompt,
-                    draft: finalText,
-                    detail: memoryService.preferredDetailLevel(forUserText: prompt)
+            let cleanedNote = note.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !cleanedNote.isEmpty {
+                self.memoryService.addExperienceMemory(
+                    "[self-reflection-loop] \(cleanedNote)",
+                    importanceOverride: 0.9
                 )
             }
-
-            currentThink = ""
-            currentThinkingMessageId = nil
-            isInteracting = false
-            playGenerationFinishedHaptic()
-            generationTask = nil
-            activeGenerationId = nil
         }
     }
 
@@ -1522,14 +1930,19 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
     }
 
     func sendMessage() {
-        let cleaned = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawText = inputText
+        let cleaned = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
         let attachment = pendingImageAttachment
 
         guard !cleaned.isEmpty || attachment != nil else { return }
+        guard isModelReady else {
+            status = "Model is still loading..."
+            return
+        }
         playSendHaptic()
 
         pendingUserFeedbackValence = nil
-        if let valence = experienceService.applyUserReaction(from: inputText) {
+        if let valence = experienceService.applyUserReaction(from: rawText) {
             motivationService.updateForReaction(valence: valence)
             emotionService.updateForReaction(valence: valence)
             pendingUserFeedbackValence = valence
@@ -1537,24 +1950,24 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
         hasUserInteracted = true
         prepareForNewGeneration()
 
-        MarkdownRenderer.prewarmInline(cleaned)
+        MarkdownRenderer.prewarmInline(rawText)
         inputText = ""
         pendingImageAttachment = nil
         if let editingId = editingUserMessageId,
            let userIndex = messages.firstIndex(where: { $0.id == editingId && $0.role == .user }) {
-            messages[userIndex].content = cleaned
+            messages[userIndex].content = rawText
             messages[userIndex].imageAttachment = attachment
             if userIndex + 1 < messages.count {
                 messages.removeSubrange((userIndex + 1)..<messages.count)
             }
             editingUserMessageId = nil
-            startAssistantGeneration(prompt: cleaned, userMessageId: editingId, imageAttachment: attachment)
+            startAssistantGeneration(prompt: rawText, userMessageId: editingId, imageAttachment: attachment)
             return
         }
 
-        let userMessage = Message(role: .user, content: cleaned, imageAttachment: attachment)
+        let userMessage = Message(role: .user, content: rawText, imageAttachment: attachment)
         messages.append(userMessage)
-        startAssistantGeneration(prompt: cleaned, userMessageId: userMessage.id, imageAttachment: attachment)
+        startAssistantGeneration(prompt: rawText, userMessageId: userMessage.id, imageAttachment: attachment)
     }
 
     func setPendingImage(from data: Data) {
@@ -1594,40 +2007,215 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
         currentThinkingMessageId = nil
     }
 
+    @discardableResult
+    private func appendAssistantPlaceholder(thinkContent: String = "") -> UUID {
+        let assistantMessageId = UUID()
+        messages.append(Message(id: assistantMessageId, role: .assistant, content: "", thinkContent: thinkContent))
+        currentThinkingMessageId = assistantMessageId
+        currentThink = thinkContent
+        return assistantMessageId
+    }
+
+    private func updateAssistantMessage(
+        _ assistantMessageId: UUID,
+        thinkContent: String? = nil,
+        content: String? = nil,
+        imageAttachment: MessageImageAttachment? = nil
+    ) {
+        guard let index = messages.firstIndex(where: { $0.id == assistantMessageId }) else { return }
+        if let thinkContent {
+            messages[index].thinkContent = thinkContent
+        }
+        if let content {
+            messages[index].content = content
+        }
+        if let imageAttachment {
+            messages[index].imageAttachment = imageAttachment
+        }
+    }
+
+    private func completeAssistantGeneration() {
+        currentThink = ""
+        currentThinkingMessageId = nil
+        isInteracting = false
+        playGenerationFinishedHaptic()
+        generationTask = nil
+        activeGenerationId = nil
+        didUserRequestStopGeneration = false
+    }
+
+    private struct StreamedGenerationResult {
+        let visible: String
+        let think: String
+        let sawThinkTag: Bool
+        let emittedImplicitThinking: Bool
+        let didCloseThink: Bool
+    }
+
+    private func streamGeneratedText(
+        userPrompt: String,
+        systemPrompt: String,
+        options: LLMService.GenerationOptions,
+        generationId: UUID,
+        assistantMessageId: UUID? = nil,
+        startingVisibleText: String = "",
+        startingThinkText: String = "",
+        assumeImplicitThinking: Bool = false
+    ) async -> StreamedGenerationResult {
+        var parser = ThinkStreamParser(assumeImplicitThinking: assumeImplicitThinking)
+        var visibleBuffer = startingVisibleText
+        var thinkBuffer = startingThinkText
+        var lastVisibleFlushAt = Date.distantPast
+        var lastThinkFlushAt = Date.distantPast
+        let uiFlushInterval: TimeInterval = 0.05
+        let stream = await llmService.generate(userPrompt: userPrompt, systemPrompt: systemPrompt, options: options)
+
+        for await chunk in stream {
+            if Task.isCancelled || activeGenerationId != generationId {
+                break
+            }
+
+            let result = parser.feed(chunk)
+            if !result.visible.isEmpty, parser.allowVisibleStreaming {
+                appendStreamChunk(&visibleBuffer, result.visible)
+                if let assistantMessageId,
+                   Date().timeIntervalSince(lastVisibleFlushAt) >= uiFlushInterval {
+                    lastVisibleFlushAt = Date()
+                    updateAssistantMessage(assistantMessageId, content: visibleBuffer)
+                }
+            }
+
+            if !result.think.isEmpty {
+                appendStreamChunk(&thinkBuffer, result.think)
+                if let assistantMessageId,
+                   Date().timeIntervalSince(lastThinkFlushAt) >= uiFlushInterval {
+                    lastThinkFlushAt = Date()
+                    updateAssistantMessage(assistantMessageId, thinkContent: thinkBuffer)
+                }
+            }
+        }
+
+        if !Task.isCancelled && activeGenerationId == generationId {
+            let tail = parser.flush()
+            if !tail.visible.isEmpty, parser.allowVisibleStreaming {
+                appendStreamChunk(&visibleBuffer, tail.visible)
+                if let assistantMessageId {
+                    updateAssistantMessage(assistantMessageId, content: visibleBuffer)
+                }
+            }
+            if !tail.think.isEmpty {
+                appendStreamChunk(&thinkBuffer, tail.think)
+                if let assistantMessageId {
+                    updateAssistantMessage(assistantMessageId, thinkContent: thinkBuffer)
+                }
+            }
+        }
+
+        return StreamedGenerationResult(
+            visible: visibleBuffer,
+            think: thinkBuffer,
+            sawThinkTag: parser.sawThinkTag,
+            emittedImplicitThinking: parser.emittedImplicitThinking,
+            didCloseThink: parser.didCloseThink
+        )
+    }
+
     private func startAssistantGeneration(prompt: String, userMessageId: UUID, imageAttachment: MessageImageAttachment? = nil) {
+        guard isModelReady else {
+            status = "Model is still loading..."
+            return
+        }
         isInteracting = true
         let generationId = UUID()
         activeGenerationId = generationId
 
         generationTask = Task { [generationId] in
-            let assistantMessageId = UUID()
-            messages.append(Message(id: assistantMessageId, role: .assistant, content: "", thinkContent: ""))
-            currentThinkingMessageId = assistantMessageId
-            currentThink = ""
-
             if let directActionCall = directActionCall(for: prompt) {
+                let assistantMessageId = appendAssistantPlaceholder()
+
                 let toolContext = await actionService.context(for: directActionCall)
                 let finalText = extractToolUserMessage(from: toolContext, fallback: "")
-                if let index = messages.firstIndex(where: { $0.id == assistantMessageId }) {
-                    messages[index].thinkContent = nil
-                    messages[index].content = finalText.isEmpty ? cleanedToolEnvelope(toolContext) ?? "" : finalText
-                }
-                currentThink = ""
-                currentThinkingMessageId = nil
-                isInteracting = false
-                playGenerationFinishedHaptic()
-                generationTask = nil
-                activeGenerationId = nil
+                updateAssistantMessage(
+                    assistantMessageId,
+                    thinkContent: nil,
+                    content: finalText.isEmpty ? cleanedToolEnvelope(toolContext) ?? "" : finalText
+                )
+                completeAssistantGeneration()
                 return
             }
 
-            let imageAnalysis: VisionAttachmentAnalysis?
-            if let imageAttachment {
-                imageAnalysis = await visionAttachmentService.analyze(imageAttachment)
-            } else {
-                imageAnalysis = nil
+            if let explicitLinkAnalysis = await analyzeExplicitLinksIfNeeded(for: prompt) {
+                let assistantMessageId = appendAssistantPlaceholder()
+                currentThinkingMessageId = assistantMessageId
+
+                memoryService.updateConversationSummary(fromUserText: prompt)
+                memoryService.updateUserProfile(fromUserText: prompt)
+                emotionService.updateForPrompt(prompt)
+
+                let visibleAnalysisThink = visibleLinkAnalysisThinkText(from: explicitLinkAnalysis)
+                currentThink = formattedAssistantDisplayText(visibleAnalysisThink)
+
+                let answerPrompt = buildExplicitLinkAnswerPrompt(userText: prompt, analysis: explicitLinkAnalysis)
+                let answerPromptWithContext = buildVerifiedContextPrompt(
+                    basePrompt: answerPrompt,
+                    contextLabel: "link analysis context",
+                    context: explicitLinkAnalysis
+                )
+                let answerSystemPrompt = buildExplicitLinkSystemPrompt()
+                var answerOptions = LLMService.GenerationOptions(
+                    includeMemoryContext: false,
+                    preferFullRuntimeContext: false
+                )
+                answerOptions.managesActiveGenerationState = false
+                answerOptions.samplingOverride = SamplingConfig(
+                    temperature: 0.2,
+                    topK: 20,
+                    repetitionPenalty: 1.05,
+                    repeatLastN: 64
+                )
+
+                let answer = await llmService.generateText(
+                    userPrompt: answerPromptWithContext,
+                    systemPrompt: answerSystemPrompt,
+                    options: answerOptions
+                )
+
+                var finalText = stripToolDirectivesFromOutput(cleanFinalAnswer(answer))
+                if finalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    finalText = buildExplicitLinkFallbackAnswer(from: explicitLinkAnalysis)
+                }
+                let tone = MarkovMemoryLayer.shared.classifyTone(from: finalText)
+                finalText = voiceLayerService.apply(to: finalText, tone: tone)
+                finalText = formatAssistantDisplayText(finalText)
+
+                updateAssistantMessage(
+                    assistantMessageId,
+                    thinkContent: formattedAssistantDisplayText(visibleAnalysisThink),
+                    content: finalText
+                )
+
+                MarkdownRenderer.prewarmInline(finalText)
+                rememberArtifactIfPresent(in: finalText)
+                storeInternalReflection(
+                    userPrompt: prompt,
+                    draft: finalText,
+                    detail: memoryService.preferredDetailLevel(forUserText: prompt)
+                )
+
+                completeAssistantGeneration()
+                return
             }
+
+            let assistantMessageId = appendAssistantPlaceholder()
+            let imageAnalysisTask: Task<VisionAttachmentAnalysis, Never>?
+            if let imageAttachment {
+                imageAnalysisTask = Task(priority: .utility) { await visionAttachmentService.analyze(imageAttachment) }
+            } else {
+                imageAnalysisTask = nil
+            }
+
             let attentionFocus = buildConversationAttentionFocus(for: prompt, currentUserMessageID: userMessageId)
+            let imageAnalysis = await imageAnalysisTask?.value
             let llmPrompt = buildLLMPrompt(userText: prompt, imageAnalysis: imageAnalysis)
             let conversationAttentionBlock = buildConversationAttentionBlock(attentionFocus)
             let implicitSearchQuery = deriveImplicitSearchQuery(for: prompt, currentUserMessageID: userMessageId)
@@ -1640,30 +2228,62 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
             emotionService.updateForPrompt(llmPrompt)
             let promptMode = classifyPromptMode(for: llmPrompt, attentionFocus: attentionFocus)
             let isArtifactRequest = promptMode == .artifact
-            async let ruleBasedToolContextTask = actionService.aggregateRuleBasedContext(for: llmPrompt)
-            async let implicitSearchContextTask = buildImplicitSearchContext(for: prompt, currentUserMessageID: userMessageId)
+            let selectedModel = LLMModelStorage.load()
+            let systemPromptForModel = identityService.systemPrompt(for: selectedModel)
+            _ = Task(priority: .utility) { await self.buildImplicitSearchContext(for: llmPrompt, currentUserMessageID: userMessageId) }
+            let previousAssistantTextForPrompt = messages
+                .dropLast()
+                .reversed()
+                .first(where: { $0.role == .assistant })?
+                .content
             let webImageQuery = implicitSearchQuery ?? (shouldAttachWebImage(for: prompt) ? prompt : nil)
             let shouldFetchWebImage = implicitSearchQuery != nil || (webImageQuery.map { shouldAttachWebImage(for: $0) } ?? false)
-            async let webImageCandidateTask: ActionService.WebImageCandidate? = {
+            let webImageCandidateTask: Task<ActionService.WebImageCandidate?, Never> = Task(priority: .utility) {
                 guard let query = webImageQuery, shouldFetchWebImage else { return nil }
                 return await actionService.fetchRelevantWebImage(for: query)
-            }()
-            let ruleBasedToolContext = await ruleBasedToolContextTask
-            let implicitSearchContext = await implicitSearchContextTask
-            let toolContext = [ruleBasedToolContext, implicitSearchContext]
-                .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-                .joined(separator: "\n")
-            let webImageCandidate = await webImageCandidateTask
+            }
+            if shouldFetchWebImage, let query = webImageQuery {
+                Task(priority: .utility) { [weak self] in
+                    guard let self else { return }
+                    guard let candidate = await webImageCandidateTask.value else { return }
+                    guard let webAttachment = await self.downloadWebImageAttachment(from: candidate.imageURL) else { return }
+                    await MainActor.run {
+                        if let assistantIndex = self.messages.firstIndex(where: { $0.id == assistantMessageId }) {
+                            self.messages[assistantIndex].imageAttachment = webAttachment
+                        }
+                    }
+                    await self.storeExternalImageMemory(query: query, candidate: candidate, attachment: webAttachment)
+                }
+            }
+            let shouldWaitForRuleBasedContext = shouldWaitForRuleBasedContext(for: prompt, promptMode: promptMode)
+            activeRuleBasedContextTask?.cancel()
+            let ruleBasedContextTask: Task<ActionService.PreparedContext, Never>? = shouldWaitForRuleBasedContext
+                ? Task(priority: .utility) {
+                    await actionService.aggregateRuleBasedContext(for: prompt)
+                }
+                : nil
+            activeRuleBasedContextTask = ruleBasedContextTask
+            let preparedContext = await ruleBasedContextTask?.value ?? ActionService.PreparedContext(blocks: [])
+            if activeGenerationId == generationId {
+                activeRuleBasedContextTask = nil
+            }
+            let toolContext = preparedContext.rendered
+            let hasSearchData = preparedContext.hasSuccessBlock(for: .search) || preparedContext.hasSuccessBlock(for: .news)
+            let userPromptForLLM = buildToolAwarePrompt(basePrompt: llmPrompt, toolContext: toolContext)
+
             motivationService.updateForPrompt(llmPrompt)
-            let shouldExposeInternalFields = promptMode == .architecture
-            let motivationContext = shouldExposeInternalFields ? motivationService.contextBlock() : ""
-            let trajectoryContext = (promptMode == .reflective || promptMode == .creative || promptMode == .architecture) ? motivationService.trajectoryGuidanceBlock() : ""
             let quantumField = (promptMode == .reflective || promptMode == .creative || promptMode == .architecture) ? QuantumMemoryService.shared.collapseDecisionField(
                 prompt: llmPrompt,
                 motivators: motivationService.state
             ) : nil
-            let quantumContext = shouldExposeInternalFields ? (quantumField.map { QuantumMemoryService.shared.decisionContextBlock($0) } ?? "") : ""
-            let quantumGuidance = shouldExposeInternalFields ? (quantumField.map { QuantumMemoryService.shared.decisionGuidanceBlock($0) } ?? "") : ""
+            let adaptiveSampling = buildAdaptiveSamplingOverride(
+                promptMode: promptMode,
+                isArtifactRequest: isArtifactRequest,
+                quantumField: quantumField,
+                motivators: motivationService.state,
+                emotion: emotionService.state,
+                driftSignal: lastDriftSignal
+            )
             let userIdentityContext = UserIdentityService.shared.contextBlock(maxChars: 160)
             let identityProfileContext = (promptMode == .artifact || promptMode == .direct || promptMode == .code) ? "" : identityProfileService.contextBlock()
             let experienceContext: String = {
@@ -1674,25 +2294,19 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
                     return experienceService.contextBlock(for: llmPrompt, maxChars: 220)
                 }
             }()
-            let driftContext: String = {
-                guard let lastDriftSignal else { return "" }
-                guard promptMode == .direct || promptMode == .reflective || promptMode == .creative else { return "" }
-                return responseDriftService.contextBlock(for: lastDriftSignal, maxChars: promptMode == .direct ? 120 : 180)
-            }()
-            let budget = llmService.inferenceBudget(forPromptLength: llmPrompt.count + identityService.systemPrompt.count)
-            let emotionContext = (promptMode == .reflective || promptMode == .creative) ? emotionService.contextBlock() : ""
-            let memoryContext: String = {
-                switch promptMode {
-                case .artifact:
-                    return ""
-                case .direct:
-                    return memoryService.getLLMContextBlock(maxChars: budget.profile == .constrained ? 320 : 520, forUserText: llmPrompt, candidateLimit: 4)
-                case .code:
-                    return memoryService.getLLMContextBlock(maxChars: budget.profile == .constrained ? 280 : 420, forUserText: llmPrompt, candidateLimit: 3)
-                case .reflective, .creative, .architecture:
-                    return memoryService.getLLMContextBlock(maxChars: budget.profile == .constrained ? 420 : 680, forUserText: llmPrompt, candidateLimit: 4)
-                }
-            }()
+            let freshnessContext = buildResponseFreshnessContext(
+                userText: llmPrompt,
+                previousAssistantText: previousAssistantTextForPrompt,
+                promptMode: promptMode
+            )
+            let continuousDeviceContext = continuousContextService.contextBlock()
+            let budget = llmService.inferenceBudget(forPromptLength: userPromptForLLM.count + systemPromptForModel.count)
+            let memoryContext = buildSmartMemoryContext(
+                for: llmPrompt,
+                promptMode: promptMode,
+                budget: budget,
+                attentionFocus: attentionFocus
+            )
             let dialogContext: String = {
                 switch promptMode {
                 case .artifact:
@@ -1711,9 +2325,18 @@ class ChatViewModel: NSObject, ObservableObject, AVAudioRecorderDelegate {
             let detailBlock = ""
             let codeCoachContext = (promptMode == .code) ? codeCoachService.contextBlock(for: llmPrompt, detail: detail) : ""
             let spiceBlock = (promptMode == .creative) ? randomSpiceBlock(for: llmPrompt) : ""
+            let recentCodeContext = buildRecentCodeContext(for: llmPrompt)
             let artifactContinuationBlock = buildArtifactContinuationBlock(for: llmPrompt)
             let artifactSpecializationBlock = isArtifactRequest ? buildArtifactSpecializationBlock(for: llmPrompt) : ""
-            let toolGuidance = actionService.buildToolGuidanceBlock(hasTools: !toolContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            let toolGuidance = shouldIncludeToolGuidance(
+                for: llmPrompt,
+                toolContext: toolContext,
+                promptMode: promptMode
+            ) ? actionService.buildToolGuidanceBlock(hasTools: preparedContext.hasSuccessBlock(for: .search) || preparedContext.hasSuccessBlock(for: .news) || preparedContext.hasSuccessBlock(for: .url)) : ""
+            let hasContextNow = hasSearchData
+            let newsPrimer = !hasContextNow && shouldPrimeNewsTools(for: llmPrompt, promptMode: promptMode)
+                ? actionService.buildNewsToolPrimerBlock()
+                : ""
             let localActionPrompt = isLikelyLocalActionRequest(llmPrompt)
             let artifactSpec = (isArtifactRequest && !localActionPrompt) ? """
 
@@ -1737,10 +2360,24 @@ Artifact spec:
 - Use semantic HTML5 structure.
 - If it's a game, include clear controls/instructions inside the page UI.
 """ : ""
+            let isEcoDevice = isEcoGenerationDevice()
+            let allowsSecondaryPasses = promptMode == .reflective || promptMode == .creative || promptMode == .architecture
             let promptBudgetChars: Int = {
+                if isEcoDevice {
+                    switch promptMode {
+                    case .direct:
+                        return budget.profile == .constrained ? 1200 : 1600
+                    case .code:
+                        return budget.profile == .constrained ? 1300 : 1700
+                    case .artifact:
+                        return 2600
+                    case .reflective, .creative, .architecture:
+                        return budget.profile == .constrained ? 1500 : 2200
+                    }
+                }
                 switch promptMode {
                 case .direct:
-                    return budget.profile == .constrained ? 1800 : 2800
+                    return budget.profile == .constrained ? 1800 : 4000
                 case .code:
                     return budget.profile == .constrained ? 1900 : 3000
                 case .artifact:
@@ -1750,40 +2387,34 @@ Artifact spec:
                 }
             }()
             let systemPrompt = assemblePromptFragments([
-                PromptFragment(priority: 100, text: identityService.systemPrompt, maxChars: 1100),
+                PromptFragment(priority: 100, text: systemPromptForModel, maxChars: isEcoDevice ? 720 : 1100),
+                PromptFragment(priority: 99, text: toolContext, maxChars: isEcoDevice ? 500 : 2000),
                 PromptFragment(priority: 95, text: artifactSpec, maxChars: 900),
                 PromptFragment(priority: 92, text: artifactSpecializationBlock, maxChars: 480),
-                PromptFragment(priority: 90, text: conversationAttentionBlock, maxChars: 320),
-                PromptFragment(priority: 89, text: driftContext, maxChars: 180),
+                PromptFragment(priority: 91, text: newsPrimer, maxChars: 180),
+                PromptFragment(priority: 90, text: conversationAttentionBlock, maxChars: isEcoDevice ? 180 : 320),
+                PromptFragment(priority: 89, text: continuousDeviceContext, maxChars: 180),
+                PromptFragment(priority: 88, text: freshnessContext, maxChars: isEcoDevice ? 180 : 320),
                 PromptFragment(priority: 88, text: userIdentityContext, maxChars: 160),
-                PromptFragment(priority: 87, text: dialogContext, maxChars: promptMode == .direct ? 760 : 980),
-                PromptFragment(priority: 86, text: memoryContext, maxChars: promptMode == .direct ? 640 : 920),
-                PromptFragment(priority: 84, text: motivationContext, maxChars: 180),
-                PromptFragment(priority: 80, text: quantumContext, maxChars: 180),
-                PromptFragment(priority: 76, text: emotionContext, maxChars: 140),
-                PromptFragment(priority: 72, text: trajectoryContext, maxChars: 340),
+                PromptFragment(priority: 87, text: dialogContext, maxChars: isEcoDevice ? (promptMode == .direct ? 360 : 520) : (promptMode == .direct ? 760 : 980)),
+                PromptFragment(priority: 86, text: memoryContext, maxChars: isEcoDevice ? (promptMode == .direct ? 240 : 360) : (promptMode == .direct ? 640 : 920)),
                 PromptFragment(priority: 68, text: identityProfileContext, maxChars: 100),
-                PromptFragment(priority: 60, text: toolGuidance, maxChars: 260),
-                PromptFragment(priority: 56, text: toolContext, maxChars: 420),
+                PromptFragment(priority: 85, text: toolGuidance, maxChars: isEcoDevice ? 260 : 460),
                 PromptFragment(priority: 52, text: codeCoachContext, maxChars: 420),
+                PromptFragment(priority: 51, text: recentCodeContext, maxChars: 1_000),
                 PromptFragment(priority: 48, text: artifactContinuationBlock, maxChars: 720),
                 PromptFragment(priority: 44, text: experienceContext, maxChars: 220),
-                PromptFragment(priority: 20, text: quantumGuidance, maxChars: 180),
                 PromptFragment(priority: 10, text: spiceBlock, maxChars: 60),
                 PromptFragment(priority: 1, text: detailBlock, maxChars: 20)
             ], maxChars: promptBudgetChars)
 
             var assistantWebAttachment: MessageImageAttachment?
-            if let webImageCandidate,
-               let webAttachment = await downloadWebImageAttachment(from: webImageCandidate.imageURL),
-               let assistantIndex = messages.firstIndex(where: { $0.id == assistantMessageId }) {
-                messages[assistantIndex].imageAttachment = webAttachment
-                assistantWebAttachment = webAttachment
-                storeExternalImageMemory(query: webImageQuery ?? prompt, candidate: webImageCandidate, attachment: webAttachment)
-            }
 
-            var parser = ThinkStreamParser()
+            let assumesImplicitThinking = selectedModel == .small
+            var parser = ThinkStreamParser(assumeImplicitThinking: assumesImplicitThinking)
             var visibleBuffer = ""
+
+            
             var genOptions: LLMService.GenerationOptions = isArtifactRequest
                 ? LLMService.GenerationOptions(
                     maxTokensOverride: 24_000,
@@ -1792,28 +2423,26 @@ Artifact spec:
                     useCache: false,
                     useKVInjection: false,
                     storeResponseToMemory: false,
-                    preferFullRuntimeContext: true,
+                    preferFullRuntimeContext: false,
                     preserveExtendedOutputBudget: true,
-                    samplingOverride: SamplingConfig(
-                        temperature: 0.7,
-                        topK: 40,
-                        repetitionPenalty: 1.08,
-                        repeatLastN: 64
-                    )
+                    samplingOverride: adaptiveSampling
                 )
-                : LLMService.GenerationOptions(preferFullRuntimeContext: true)
-            if promptMode == .direct {
-                genOptions.samplingOverride = SamplingConfig(
-                    temperature: 0.42,
-                    topK: 28,
-                    repetitionPenalty: 1.08,
-                    repeatLastN: 72
+                : LLMService.GenerationOptions(
+                    includeMemoryContext: false,
+                    includeHiddenPrefix: false,
+                    preferFullRuntimeContext: promptMode == .reflective || promptMode == .creative || promptMode == .architecture
                 )
-            } else if !isArtifactRequest, let quantumField {
-                genOptions.samplingOverride = QuantumMemoryService.shared.samplingConfig(for: quantumField)
+            if !isArtifactRequest {
+                genOptions.samplingOverride = adaptiveSampling
+            }
+            if isEcoDevice, !isArtifactRequest, selectedModel == .small {
+                genOptions.useThinkTagPrompting = false
+            }
+            if selectedModel == .large {
+                genOptions.useThinkTagPrompting = false
             }
 
-            let stream = await llmService.generate(userPrompt: llmPrompt, systemPrompt: systemPrompt, options: genOptions)
+            let stream = await llmService.generate(userPrompt: userPromptForLLM, systemPrompt: systemPrompt, options: genOptions)
             for await chunk in stream {
                 if Task.isCancelled || activeGenerationId != generationId {
                     break
@@ -1823,7 +2452,7 @@ Artifact spec:
                     if !result.visible.isEmpty, parser.allowVisibleStreaming {
                         appendStreamChunk(&visibleBuffer, result.visible)
                         await MainActor.run {
-                            messages[index].content = visibleBuffer
+                            updateAssistantMessage(assistantMessageId, content: visibleBuffer)
                         }
                     }
                     if !result.think.isEmpty {
@@ -1857,14 +2486,20 @@ Artifact spec:
                     }
                 }
                 var finalText = normalizeCompletedArtifactMarkup(in: cleanFinalAnswer(visibleBuffer))
+                if let repaired = repairReasoningLeakIfNeeded(in: finalText, parserSawThinkTag: parser.sawThinkTag) {
+                    if !(repaired.think?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) {
+                        updateAssistantMessage(assistantMessageId, thinkContent: repaired.think)
+                    }
+                    finalText = repaired.final
+                }
                 let endedInsideThink = !parser.didCloseThink && !currentThink.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
 
                 if finalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                    let thinkText = messages[index].thinkContent,
                    !thinkText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                   parser.didCloseThink {
-                    let split = splitThinkIntoFinal(thinkText)
-                    messages[index].thinkContent = split.think
+                   (parser.didCloseThink || parser.emittedImplicitThinking) {
+                    let split = splitThinkIntoFinal(thinkText, preferImplicitReasoningSplit: parser.emittedImplicitThinking)
+                    updateAssistantMessage(assistantMessageId, thinkContent: split.think)
                     finalText = normalizeCompletedArtifactMarkup(in: split.final)
                 }
 
@@ -1874,6 +2509,9 @@ Artifact spec:
                 var currentFinalText = finalText
                 var currentThinkText = messages[index].thinkContent ?? ""
                 var seenToolCalls = Set<String>()
+                let hasSearchContext = preparedContext.hasSuccessBlock(for: .search)
+                let hasNewsContext = preparedContext.hasSuccessBlock(for: .news)
+                var didUseToolContext = hasSearchContext || hasNewsContext
                 let immediateActionTools: Set<String> = ["calendar", "open_calendar", "open_url", "url"]
 
                 while toolLoopIterations < maxToolIterations {
@@ -1887,6 +2525,7 @@ Artifact spec:
 
                     let toolContextFromCall = await self.actionService.context(for: toolCall)
                     if toolContextFromCall.isEmpty { break }
+                    didUseToolContext = true
 
                     if immediateActionTools.contains(toolCall.name) {
                         currentFinalText = extractToolUserMessage(from: toolContextFromCall, fallback: currentFinalText)
@@ -1896,59 +2535,105 @@ Artifact spec:
                     accumulatedToolContext += "\n" + toolContextFromCall
                     let rerunGuidance = self.actionService.buildToolGuidanceBlock(hasTools: !accumulatedToolContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     let rerunPrompt = assemblePromptFragments([
-                        PromptFragment(priority: 100, text: identityService.systemPrompt, maxChars: 1100),
-                        PromptFragment(priority: 90, text: rerunGuidance, maxChars: 320),
+                        PromptFragment(priority: 100, text: systemPromptForModel, maxChars: 1100),
+                        PromptFragment(priority: 91, text: self.actionService.buildNewsToolPrimerBlock(), maxChars: 180),
+                        PromptFragment(priority: 90, text: rerunGuidance, maxChars: 380),
                         PromptFragment(priority: 89, text: conversationAttentionBlock, maxChars: 240),
-                        PromptFragment(priority: 88, text: driftContext, maxChars: 180),
-                        PromptFragment(priority: 87, text: userIdentityContext, maxChars: 160),
-                        PromptFragment(priority: 86, text: accumulatedToolContext, maxChars: 420),
-                        PromptFragment(priority: 85, text: codeCoachContext, maxChars: 420),
-                        PromptFragment(priority: 84, text: artifactContinuationBlock, maxChars: 720),
-                        PromptFragment(priority: 82, text: memoryContext, maxChars: promptMode == .direct ? 260 : 520),
-                        PromptFragment(priority: 78, text: identityProfileContext, maxChars: 80),
-                        PromptFragment(priority: 74, text: motivationContext, maxChars: 180),
-                        PromptFragment(priority: 70, text: experienceContext, maxChars: 320),
-                        PromptFragment(priority: 66, text: dialogContext, maxChars: promptMode == .direct ? 180 : 420),
-                        PromptFragment(priority: 60, text: emotionContext, maxChars: 120),
-                        PromptFragment(priority: 56, text: detailBlock, maxChars: 80),
-                        PromptFragment(priority: 50, text: trajectoryContext, maxChars: 320),
-                        PromptFragment(priority: 46, text: quantumContext, maxChars: 180),
-                        PromptFragment(priority: 42, text: quantumGuidance, maxChars: 300),
-                        PromptFragment(priority: 20, text: spiceBlock, maxChars: 90)
+                        PromptFragment(priority: 87, text: freshnessContext, maxChars: 220),
+                        PromptFragment(priority: 86, text: userIdentityContext, maxChars: 160),
+                        PromptFragment(priority: 85, text: accumulatedToolContext, maxChars: promptMode == .direct ? 960 : 1_440),
+                        PromptFragment(priority: 84, text: codeCoachContext, maxChars: 420),
+                        PromptFragment(priority: 83, text: recentCodeContext, maxChars: 1_000),
+                        PromptFragment(priority: 83, text: artifactContinuationBlock, maxChars: 720),
+                        PromptFragment(priority: 81, text: memoryContext, maxChars: promptMode == .direct ? 260 : 520),
+                        PromptFragment(priority: 77, text: identityProfileContext, maxChars: 80),
+                        PromptFragment(priority: 69, text: experienceContext, maxChars: 320),
+                        PromptFragment(priority: 65, text: dialogContext, maxChars: promptMode == .direct ? 180 : 420),
+                        PromptFragment(priority: 55, text: detailBlock, maxChars: 80),
+                        PromptFragment(priority: 19, text: spiceBlock, maxChars: 90)
                     ], maxChars: promptBudgetChars)
                     var rerunOptions = LLMService.GenerationOptions()
-                    if promptMode == .direct {
-                        rerunOptions.samplingOverride = SamplingConfig(
-                            temperature: 0.42,
-                            topK: 28,
-                            repetitionPenalty: 1.08,
-                            repeatLastN: 72
-                        )
-                    } else {
-                        rerunOptions.samplingOverride = quantumField.map { QuantumMemoryService.shared.samplingConfig(for: $0) }
+                    rerunOptions.managesActiveGenerationState = false
+                    rerunOptions.samplingOverride = adaptiveSampling
+                    if selectedModel == .large {
+                        rerunOptions.useThinkTagPrompting = false
                     }
-                    let rerunOutput = await llmService.generateText(userPrompt: prompt, systemPrompt: rerunPrompt, options: rerunOptions)
+                    rerunOptions.includeMemoryContext = false
+                    let rerunUserPrompt = buildToolAwarePrompt(basePrompt: llmPrompt, toolContext: accumulatedToolContext)
+                    let rerunResult = await streamGeneratedText(
+                        userPrompt: rerunUserPrompt,
+                        systemPrompt: rerunPrompt,
+                        options: rerunOptions,
+                        generationId: generationId,
+                        assistantMessageId: assistantMessageId,
+                        assumeImplicitThinking: assumesImplicitThinking
+                    )
 
-                    var rerunParser = ThinkStreamParser()
-                    let first = rerunParser.feed(rerunOutput)
-                    let rerunTail = rerunParser.flush()
-                    let rerunThink = first.think + rerunTail.think
-                    let rerunVisible = normalizeCompletedArtifactMarkup(in: cleanFinalAnswer(first.visible + rerunTail.visible))
+                    var rerunVisible = normalizeCompletedArtifactMarkup(in: cleanFinalAnswer(rerunResult.visible))
+                    var rerunThinkText = rerunResult.think
+                    if let repaired = repairReasoningLeakIfNeeded(in: rerunVisible, parserSawThinkTag: rerunResult.sawThinkTag) {
+                        rerunThinkText = repaired.think ?? rerunThinkText
+                        rerunVisible = repaired.final
+                    }
 
-                    currentThinkText = rerunThink
+                    currentThinkText = rerunThinkText
                     if !rerunVisible.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        currentFinalText = rerunVisible
-                    } else if !rerunThink.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        let split = splitThinkIntoFinal(rerunThink)
+                        currentFinalText = formatAssistantDisplayText(rerunVisible)
+                    } else if !rerunThinkText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        let split = splitThinkIntoFinal(rerunThinkText, preferImplicitReasoningSplit: rerunResult.emittedImplicitThinking)
                         currentThinkText = split.think
-                        currentFinalText = normalizeCompletedArtifactMarkup(in: split.final)
+                        currentFinalText = formatAssistantDisplayText(normalizeCompletedArtifactMarkup(in: split.final))
                     }
 
                     toolLoopIterations += 1
                 }
 
+                if !didUseToolContext,
+                   promptMode != .artifact,
+                   allowsSecondaryPasses,
+                   shouldIncludeToolGuidance(for: llmPrompt, toolContext: "", promptMode: promptMode) {
+                    let fallbackQuery = implicitSearchQuery ?? bestSearchQuery(for: llmPrompt) ?? llmPrompt
+                    let fallbackCall = ActionService.ActionCall(
+                        name: "web_search",
+                        query: fallbackQuery,
+                        args: ["query": fallbackQuery]
+                    )
+                    let fallbackToolContext = await self.actionService.context(for: fallbackCall)
+                    if !fallbackToolContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        let fallbackPrompt = buildVerifiedContextPrompt(
+                            basePrompt: llmPrompt,
+                            contextLabel: "search evidence",
+                            context: fallbackToolContext
+                        )
+                        var fallbackOptions = LLMService.GenerationOptions(
+                            includeMemoryContext: false,
+                            preferFullRuntimeContext: false
+                        )
+                        fallbackOptions.managesActiveGenerationState = false
+                        fallbackOptions.samplingOverride = adaptiveSampling
+                        if selectedModel == .large {
+                            fallbackOptions.useThinkTagPrompting = false
+                        }
+
+                        let fallbackResult = await streamGeneratedText(
+                            userPrompt: fallbackPrompt,
+                            systemPrompt: buildSearchAnswerSystemPrompt(),
+                            options: fallbackOptions,
+                            generationId: generationId,
+                            assistantMessageId: assistantMessageId
+                        )
+                        let fallbackVisible = normalizeCompletedArtifactMarkup(
+                            in: cleanFinalAnswer(fallbackResult.visible)
+                        )
+                        if !fallbackVisible.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            currentFinalText = formatAssistantDisplayText(fallbackVisible)
+                            currentThinkText = fallbackResult.think
+                        }
+                    }
+                }
+
                 if !currentThinkText.isEmpty {
-                    messages[index].thinkContent = currentThinkText
+                    updateAssistantMessage(assistantMessageId, thinkContent: currentThinkText)
                 }
                 finalText = currentFinalText
 
@@ -1957,30 +2642,57 @@ Artifact spec:
                     let resumed = await continueIncompleteArtifactIfNeeded(
                         partialText: finalText,
                         userPrompt: llmPrompt,
-                        systemPrompt: systemPrompt
+                        systemPrompt: systemPrompt,
+                        generationId: generationId,
+                        assistantMessageId: assistantMessageId
                     )
                     finalText = normalizeCompletedArtifactMarkup(in: resumed)
                 } else if !isArtifactRequest,
                           !didUserRequestStopGeneration,
+                          !isEcoDevice,
+                          allowsSecondaryPasses,
                           endedInsideThink,
                           finalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     finalText = await recoverFinalFromInterruptedThinking(
                         userPrompt: llmPrompt,
                         systemPrompt: systemPrompt,
-                        promptMode: promptMode
+                        promptMode: promptMode,
+                        generationId: generationId,
+                        assistantMessageId: assistantMessageId
                     )
                 } else if !isArtifactRequest,
                           !didUserRequestStopGeneration,
+                          !isEcoDevice,
+                          allowsSecondaryPasses,
                           shouldAttemptTextContinuation(for: finalText) {
                     finalText = await continueIncompleteTextIfNeeded(
                         partialText: finalText,
                         userPrompt: llmPrompt,
                         systemPrompt: systemPrompt,
-                        promptMode: promptMode
+                        promptMode: promptMode,
+                        generationId: generationId,
+                        assistantMessageId: assistantMessageId
                     )
                 }
 
+                if isEcoDevice,
+                   !isArtifactRequest,
+                   finalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    let split = splitThinkIntoFinal(currentThinkText, preferImplicitReasoningSplit: true)
+                    let fallback = cleanFinalAnswer(split.final).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !fallback.isEmpty {
+                        finalText = fallback
+                    } else if !currentFinalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        finalText = currentFinalText
+                    } else {
+                        finalText = "Ответ оборвался из-за лимита генерации на устройстве. Могу продолжить короче."
+                    }
+                }
+
+                finalText = ensureHTMLWrappedAsArtifactIfNeeded(finalText)
+
                 if isArtifactRequest {
+                    let webImageCandidate = await webImageCandidateTask.value
                     let sanitized = await sanitizeArtifactImageSourcesIfNeeded(
                         in: finalText,
                         preferredAttachment: assistantWebAttachment,
@@ -1988,9 +2700,8 @@ Artifact spec:
                     )
                     finalText = sanitized.text
                     if assistantWebAttachment == nil,
-                       let sanitizedAttachment = sanitized.attachment,
-                       let assistantIndex = messages.firstIndex(where: { $0.id == assistantMessageId }) {
-                        messages[assistantIndex].imageAttachment = sanitizedAttachment
+                       let sanitizedAttachment = sanitized.attachment {
+                        updateAssistantMessage(assistantMessageId, imageAttachment: sanitizedAttachment)
                         assistantWebAttachment = sanitizedAttachment
                     }
                     finalText = enrichArtifactHTMLIfNeeded(
@@ -2003,50 +2714,34 @@ Artifact spec:
                 }
 
                 if !isArtifactRequest {
-                    finalText = responseDriftService.repairRepeatedOutput(userPrompt: prompt, assistantText: finalText)
+                    finalText = responseDriftService.repairRepeatedOutput(
+                        userPrompt: prompt,
+                        assistantText: finalText
+                    )
                 }
+
+                if !isArtifactRequest {
+                    let tone = MarkovMemoryLayer.shared.classifyTone(from: finalText)
+                    finalText = voiceLayerService.apply(to: finalText, tone: tone)
+                }
+                finalText = formatAssistantDisplayText(finalText)
 
                 let artifactDraft = isArtifactRequest ? extractLastHTMLArtifact(from: finalText) : nil
                 let originChatID = chatStore.currentChatID
-                let previousAssistantText = messages[..<index]
-                    .reversed()
-                    .first(where: { $0.role == .assistant })?
-                    .content
 
                 MarkdownRenderer.prewarmInline(finalText)
-                messages[index].content = finalText
+                updateAssistantMessage(assistantMessageId, content: finalText)
                 rememberArtifactIfPresent(in: finalText)
-                emotionService.updateForAssistantResponse(finalText)
-                storeInternalReflection(
-                    userPrompt: prompt,
-                    draft: finalText,
-                    detail: detail
-                )
-                let novelty = estimateTurnNovelty(for: prompt)
-                motivationService.updateForTurnReward(
+                schedulePostFactumStateUpdate(
                     userPrompt: prompt,
                     assistantText: finalText,
-                    userFeedback: pendingUserFeedbackValence,
-                    novelty: novelty
-                )
-                pendingUserFeedbackValence = nil
-
-                let finalAnswer = messages[index].content
-                let driftSignal = responseDriftService.analyze(
-                    userPrompt: prompt,
-                    assistantText: finalAnswer,
-                    previousAssistantText: previousAssistantText
-                )
-                lastDriftSignal = driftSignal
-                motivationService.updateForDriftSignal(driftSignal)
-                storeDriftSignalIfNeeded(driftSignal, userPrompt: prompt, assistantText: finalAnswer)
-                experienceService.recordExperience(
                     userMessageId: userMessageId,
                     assistantMessageId: assistantMessageId,
-                    userText: prompt,
-                    assistantText: finalAnswer
+                    previousAssistantText: previousAssistantTextForPrompt,
+                    detail: detail,
+                    userFeedback: pendingUserFeedbackValence
                 )
-                performSelfReflectionIfNeeded(userPrompt: prompt, assistantText: finalAnswer)
+                pendingUserFeedbackValence = nil
 
                 if let artifactDraft,
                    shouldRunArtifactSelfCheck(for: artifactDraft.payload) {
@@ -2059,13 +2754,7 @@ Artifact spec:
                 }
             }
 
-            currentThink = ""
-            currentThinkingMessageId = nil
-            isInteracting = false
-            playGenerationFinishedHaptic()
-            generationTask = nil
-            activeGenerationId = nil
-            didUserRequestStopGeneration = false
+            completeAssistantGeneration()
         }
     }
 
@@ -2090,16 +2779,201 @@ Artifact spec:
         ]
         let hasArtifact = artifactSignals.contains(where: { lower.contains($0) })
         let hasIntent = intentSignals.contains(where: { lower.contains($0) })
+        if rememberedArtifact != nil && shouldUseArtifactContinuation(for: prompt) {
+            return true
+        }
         return hasArtifact && hasIntent
     }
 
     private func isLikelyLocalActionRequest(_ prompt: String) -> Bool {
         let lower = prompt.lowercased()
-        let signals = [
-            "calendar", "reminder", "reminders", "event", "schedule", "appointment", "meeting",
-            "напомин", "календар", "событи", "встреч", "запланир", "назнач", "поставь напоминание"
+        let actionSignals = [
+            "create", "make", "add", "set", "schedule", "book", "plan", "arrange", "remind",
+            "создай", "добавь", "поставь", "запланир", "назнач", "напомни"
         ]
-        return signals.contains(where: { lower.contains($0) })
+        let localObjectSignals = [
+            "calendar", "reminder", "reminders", "event", "events", "schedule", "appointment", "meeting",
+            "calendar event", "календар", "событи", "встреч", "напомин"
+        ]
+        return actionSignals.contains(where: { lower.contains($0) })
+            && localObjectSignals.contains(where: { lower.contains($0) })
+    }
+
+    private func shouldIncludeToolGuidance(
+        for prompt: String,
+        toolContext: String,
+        promptMode: PromptMode
+    ) -> Bool {
+        let trimmedToolContext = toolContext.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedToolContext.isEmpty {
+            return true
+        }
+
+        if promptMode == .artifact {
+            return false
+        }
+
+        let intent = IntentRouter.classify(prompt)
+        return intent.search || intent.news || intent.weather || intent.health || intent.system || intent.wiki
+            || intent.calendar != .none
+            || !intent.urlAnalysis.isEmpty
+    }
+
+    private func shouldWaitForRuleBasedContext(
+        for prompt: String,
+        promptMode: PromptMode
+    ) -> Bool {
+        guard promptMode != .artifact else { return false }
+
+        if isLikelyLocalActionRequest(prompt) {
+            return true
+        }
+
+        if !explicitURLs(in: prompt).isEmpty {
+            return true
+        }
+
+        let intent = IntentRouter.classify(prompt)
+        return intent.search || intent.news || intent.weather || intent.health || intent.system
+    }
+
+    private func shouldPrimeNewsTools(for prompt: String, promptMode: PromptMode) -> Bool {
+        guard promptMode != .artifact else { return false }
+        let lower = prompt.lowercased()
+        let newsSignals = [
+            "news", "headline", "breaking", "latest", "current events", "what's new",
+            "новости", "свежие", "последние", "что нового", "что случилось"
+        ]
+        return newsSignals.contains(where: { lower.contains($0) })
+    }
+
+    private func shouldBoostMemoryContext(for prompt: String) -> Bool {
+        let lower = prompt.lowercased()
+        let followUpSignals = [
+            "remember", "earlier", "before", "previous", "again", "same", "continue",
+            "you said", "we discussed", "as we said", "my last", "last time",
+            "помни", "раньше", "до этого", "снова", "ещё раз", "мы обсуждали", "ты говорил"
+        ]
+        return followUpSignals.contains(where: { lower.contains($0) })
+    }
+
+    private func buildSmartMemoryContext(
+        for prompt: String,
+        promptMode: PromptMode,
+        budget: LLMService.InferenceBudget,
+        attentionFocus: ConversationAttentionFocus?
+    ) -> String {
+        let topicBreakConfidence = attentionFocus?.topicBreakConfidence ?? 0.0
+        let isTopicBreak = attentionFocus?.indicatesTopicBreak == true
+        let memoryQuery: String = {
+            guard attentionFocus?.isContinuationIntent == true else { return prompt }
+            let anchor = attentionFocus?.summary.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard !anchor.isEmpty else { return prompt }
+            return "\(prompt)\n\(anchor)"
+        }()
+        switch promptMode {
+        case .artifact:
+            return ""
+        case .reflective, .creative, .architecture:
+            let maxChars = {
+                if isTopicBreak {
+                    return budget.profile == .constrained ? 220 : 360
+                }
+                return budget.profile == .constrained ? 320 : 540
+            }()
+            let boosted = shouldBoostMemoryContext(for: prompt)
+            let candidates = isTopicBreak ? 1 : (boosted ? 3 : 2)
+            return memoryService.getLLMContextBlock(
+                maxChars: maxChars,
+                forUserText: memoryQuery,
+                candidateLimit: candidates,
+                contextShift: topicBreakConfidence
+            )
+        case .direct:
+            let boosted = shouldBoostMemoryContext(for: prompt)
+            let maxChars: Int = {
+                if isTopicBreak {
+                    return budget.profile == .constrained ? 120 : 180
+                }
+                if budget.profile == .constrained {
+                    return boosted ? 240 : 160
+                }
+                return boosted ? 360 : 220
+            }()
+            let candidates = isTopicBreak ? 1 : (boosted ? 2 : 1)
+            return memoryService.getLLMContextBlock(
+                maxChars: maxChars,
+                forUserText: memoryQuery,
+                candidateLimit: candidates,
+                contextShift: topicBreakConfidence
+            )
+        case .code:
+            let boosted = shouldBoostMemoryContext(for: prompt)
+            let maxChars: Int = {
+                if isTopicBreak {
+                    return budget.profile == .constrained ? 110 : 160
+                }
+                if budget.profile == .constrained {
+                    return boosted ? 220 : 140
+                }
+                return boosted ? 320 : 180
+            }()
+            let candidates = isTopicBreak ? 1 : (boosted ? 2 : 1)
+            return memoryService.getLLMContextBlock(
+                maxChars: maxChars,
+                forUserText: memoryQuery,
+                candidateLimit: candidates,
+                contextShift: topicBreakConfidence
+            )
+        }
+    }
+
+    private func buildResponseFreshnessContext(
+        userText: String,
+        previousAssistantText: String?,
+        promptMode: PromptMode
+    ) -> String {
+        guard promptMode != .artifact else { return "" }
+
+        let previous = previousAssistantText?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let previous, !previous.isEmpty else { return "" }
+
+        let opening = assistantOpeningSnippet(from: previous, maxChars: 120)
+        guard !opening.isEmpty else { return "" }
+
+        let userPreview = userText
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .prefix(80)
+
+        let block = """
+
+        Response freshness:
+        - Last assistant opening: "\(opening)"
+        - Avoid reusing that lead or the same reassurance.
+        - Start with a fresh first sentence and a different entry point.
+        \(userPreview.isEmpty ? "" : "- User prompt: \"\(userPreview)\"")
+        """
+
+        return block
+    }
+
+    private func assistantOpeningSnippet(from text: String, maxChars: Int) -> String {
+        let normalized = text.replacingOccurrences(of: "\r\n", with: "\n")
+        let firstLine = normalized
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first(where: { !$0.isEmpty }) ?? normalized.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !firstLine.isEmpty else { return "" }
+
+        let sentenceEnders = CharacterSet(charactersIn: ".!?…")
+        if let endIndex = firstLine.rangeOfCharacter(from: sentenceEnders)?.upperBound,
+           firstLine.distance(from: firstLine.startIndex, to: endIndex) <= maxChars {
+            return String(firstLine[..<endIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        return String(firstLine.prefix(maxChars)).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func directActionCall(for prompt: String) -> ActionService.ActionCall? {
@@ -2136,6 +3010,12 @@ Artifact spec:
         ]
         let isReminder = reminderSignals.contains(where: { lower.contains($0) })
 
+        let createSignals = [
+            "create", "make", "add", "set", "schedule", "book", "plan", "arrange",
+            "создай", "добавь", "поставь", "запланируй", "назначь"
+        ]
+        guard createSignals.contains(where: { lower.contains($0) }) || isReminder else { return nil }
+
         var args: [String: String] = ["op": "create"]
         if isReminder {
             args["type"] = "reminder"
@@ -2146,6 +3026,107 @@ Artifact spec:
             query: prompt,
             args: args
         )
+    }
+
+    private func analyzeExplicitLinksIfNeeded(for prompt: String) async -> String? {
+        let urls = explicitURLs(in: prompt)
+        guard !urls.isEmpty else { return nil }
+
+        var contexts: [String] = []
+        for url in urls.prefix(2) {
+            let call = ActionService.ActionCall(
+                name: "analyze_url",
+                query: url.absoluteString,
+                args: ["url": url.absoluteString]
+            )
+            let context = await actionService.context(for: call)
+            let trimmed = context.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                contexts.append(trimmed)
+            }
+        }
+
+        let merged = contexts.joined(separator: "\n\n")
+        return merged.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : merged
+    }
+
+    private func explicitURLs(in text: String) -> [URL] {
+        let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        let matches = detector?.matches(in: text, options: [], range: range) ?? []
+
+        var unique: [URL] = []
+        var seen = Set<String>()
+        for match in matches {
+            guard let url = match.url else { continue }
+            guard let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme) else { continue }
+            let key = url.absoluteString.lowercased()
+            if seen.insert(key).inserted {
+                unique.append(url)
+            }
+        }
+        return unique
+    }
+
+    private func buildExplicitLinkSystemPrompt() -> String {
+        """
+You are answering from pre-fetched link analysis.
+Use only the provided analysis.
+Do not call tools.
+Do not emit TOOL or ACTION lines.
+Do not mention internal reasoning, link analysis, or that you fetched a page.
+Do not write phrases like "the link analysis indicates", "the page appears to", or "based on the analysis".
+Answer as if you directly understood the linked content.
+Be concise, direct, and helpful.
+"""
+    }
+
+    private func buildSearchAnswerSystemPrompt() -> String {
+        """
+You are answering from pre-fetched search evidence.
+Use only the provided evidence and URLs.
+Do not call tools.
+Do not invent source names, links, or citations that are not present in the evidence.
+If the evidence is weak, conflicting, or incomplete, say that plainly.
+Answer in the user's language.
+Be concise, direct, and factual.
+"""
+    }
+
+    private func bestSearchQuery(for prompt: String) -> String? {
+        let candidates = actionService.searchQueryCandidates(from: prompt)
+        return candidates.first { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    }
+
+    private func buildExplicitLinkAnswerPrompt(userText: String, analysis: String) -> String {
+        """
+User request:
+\(userText)
+
+Use the verified link analysis context already included in this prompt.
+Do not ignore it.
+Do not ask to open the link again.
+Write a concise answer based only on that context.
+Prefer concrete details from the analysis over vague summary wording.
+If the analysis is insufficient, say exactly what is missing.
+"""
+    }
+
+    private func buildExplicitLinkFallbackAnswer(from analysis: String) -> String {
+        let cleaned = analysis.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else {
+            return "I couldn't extract useful content from the link."
+        }
+        return cleaned
+    }
+
+    private func stripToolDirectivesFromOutput(_ text: String) -> String {
+        let lines = text.components(separatedBy: .newlines)
+        let filtered = lines.filter { line in
+            let lower = line.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return !(lower.hasPrefix("action:") || lower.hasPrefix("tool:"))
+        }
+        return filtered.joined(separator: "\n")
     }
 
     private func isGameArtifactRequest(_ prompt: String) -> Bool {
@@ -2305,6 +3286,58 @@ Visual artifact preset:
         let payload = "[self-reflection] \(trimmedReflection)"
         memoryService.addExperienceMemory(payload, importanceOverride: importance)
         lastReflectionHash = reflectionHash
+    }
+
+    private func schedulePostFactumStateUpdate(
+        userPrompt: String,
+        assistantText: String,
+        userMessageId: UUID,
+        assistantMessageId: UUID,
+        previousAssistantText: String?,
+        detail: DetailLevel,
+        userFeedback: Double?
+    ) {
+        let novelty = estimateTurnNovelty(for: userPrompt)
+        Task(priority: .utility) { [weak self] in
+            guard let self else { return }
+
+            let driftSignal = self.responseDriftService.analyze(
+                userPrompt: userPrompt,
+                assistantText: assistantText,
+                previousAssistantText: previousAssistantText
+            )
+
+            await MainActor.run {
+                self.emotionService.updateForAssistantResponse(assistantText)
+                self.storeInternalReflection(
+                    userPrompt: userPrompt,
+                    draft: assistantText,
+                    detail: detail
+                )
+
+                self.motivationService.updateForTurnReward(
+                    userPrompt: userPrompt,
+                    assistantText: assistantText,
+                    userFeedback: userFeedback,
+                    novelty: novelty
+                )
+
+                self.lastDriftSignal = driftSignal
+                self.motivationService.updateForDriftSignal(driftSignal)
+                self.storeDriftSignalIfNeeded(driftSignal, userPrompt: userPrompt, assistantText: assistantText)
+
+                if let experienceSnapshot = self.experienceService.recordExperience(
+                    userMessageId: userMessageId,
+                    assistantMessageId: assistantMessageId,
+                    userText: userPrompt,
+                    assistantText: assistantText
+                ) {
+                    self.experienceService.commitPostFactumSnapshot(experienceSnapshot)
+                }
+
+                self.performSelfReflectionIfNeeded(userPrompt: userPrompt, assistantText: assistantText)
+            }
+        }
     }
 
     private func estimateTurnNovelty(for prompt: String) -> Double {
@@ -2530,7 +3563,9 @@ Previous artifact code:
     private func continueIncompleteArtifactIfNeeded(
         partialText: String,
         userPrompt: String,
-        systemPrompt: String
+        systemPrompt: String,
+        generationId: UUID,
+        assistantMessageId: UUID? = nil
     ) async -> String {
         let knownTitle = rememberedArtifact?.title?.trimmingCharacters(in: .whitespacesAndNewlines)
         let safeTitle = (knownTitle?.isEmpty == false) ? knownTitle! : "Artifact"
@@ -2560,7 +3595,7 @@ Partial artifact output:
             useCache: false,
             useKVInjection: false,
             storeResponseToMemory: false,
-            preferFullRuntimeContext: true,
+            preferFullRuntimeContext: false,
             preserveExtendedOutputBudget: true,
             samplingOverride: SamplingConfig(
                 temperature: 0.45,
@@ -2570,13 +3605,16 @@ Partial artifact output:
             )
         )
 
-        let resumed = await llmService.generateText(
+        let resumed = await streamGeneratedText(
             userPrompt: continuationPrompt,
             systemPrompt: systemPrompt,
-            options: continuationOptions
+            options: continuationOptions,
+            generationId: generationId,
+            assistantMessageId: assistantMessageId,
+            startingVisibleText: partialText
         )
 
-        let cleaned = normalizeCompletedArtifactMarkup(in: cleanFinalAnswer(resumed))
+        let cleaned = normalizeCompletedArtifactMarkup(in: cleanFinalAnswer(resumed.visible))
         if let completed = extractLastHTMLArtifact(from: cleaned) {
             let resumedTitle = (completed.title?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
                 ? (completed.title ?? "Artifact")
@@ -2597,6 +3635,25 @@ Partial artifact output:
         }
 
         return partialText
+    }
+
+    private func ensureHTMLWrappedAsArtifactIfNeeded(_ text: String) -> String {
+        let normalized = normalizeCompletedArtifactMarkup(in: text)
+        if extractLastHTMLArtifact(from: normalized) != nil {
+            return normalized
+        }
+
+        guard let payload = bestEffortArtifactPayload(from: normalized) else { return normalized }
+        let trimmedPayload = payload.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedPayload.isEmpty else { return normalized }
+
+        let title = rememberedArtifact?.title?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let safeTitle = (title?.isEmpty == false) ? title! : "Artifact"
+        return """
+<artifact type="html" title="\(safeTitle)">
+\(trimmedPayload)
+</artifact>
+"""
     }
 
     private func shouldAttemptTextContinuation(for text: String) -> Bool {
@@ -2635,7 +3692,9 @@ Partial artifact output:
         partialText: String,
         userPrompt: String,
         systemPrompt: String,
-        promptMode: PromptMode
+        promptMode: PromptMode,
+        generationId: UUID,
+        assistantMessageId: UUID? = nil
     ) async -> String {
         let continuationPrompt = """
 The previous answer was cut off before it finished.
@@ -2671,18 +3730,22 @@ Cut-off answer:
             useCache: false,
             useKVInjection: false,
             storeResponseToMemory: false,
-            preferFullRuntimeContext: true,
+            preferFullRuntimeContext: false,
             preserveExtendedOutputBudget: true,
-            samplingOverride: continuationSampling
+            samplingOverride: continuationSampling,
+            managesActiveGenerationState: false
         )
 
-        let resumed = await llmService.generateText(
+        let resumed = await streamGeneratedText(
             userPrompt: continuationPrompt,
             systemPrompt: systemPrompt,
-            options: continuationOptions
+            options: continuationOptions,
+            generationId: generationId,
+            assistantMessageId: assistantMessageId,
+            startingVisibleText: partialText
         )
 
-        let cleanedContinuation = cleanFinalAnswer(resumed).trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanedContinuation = cleanFinalAnswer(resumed.visible)
         guard !cleanedContinuation.isEmpty else { return partialText }
 
         let partialTrimmed = partialText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2700,7 +3763,9 @@ Cut-off answer:
     private func recoverFinalFromInterruptedThinking(
         userPrompt: String,
         systemPrompt: String,
-        promptMode: PromptMode
+        promptMode: PromptMode,
+        generationId: UUID,
+        assistantMessageId: UUID? = nil
     ) async -> String {
         let recoveryPrompt = """
 The previous attempt used up its reasoning budget before reaching the final answer.
@@ -2733,18 +3798,21 @@ Original user request:
             useCache: false,
             useKVInjection: false,
             storeResponseToMemory: false,
-            preferFullRuntimeContext: true,
+            preferFullRuntimeContext: false,
             preserveExtendedOutputBudget: true,
-            samplingOverride: recoverySampling
+            samplingOverride: recoverySampling,
+            managesActiveGenerationState: false
         )
 
-        let resumed = await llmService.generateText(
+        let resumed = await streamGeneratedText(
             userPrompt: recoveryPrompt,
             systemPrompt: systemPrompt,
-            options: recoveryOptions
+            options: recoveryOptions,
+            generationId: generationId,
+            assistantMessageId: assistantMessageId
         )
 
-        return cleanFinalAnswer(resumed).trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleanFinalAnswer(resumed.visible)
     }
 
     private func mergeContinuation(partial: String, continuation: String) -> String {
@@ -2798,7 +3866,7 @@ Original user request:
 
             let reviewOutput = await self.llmService.generateText(
                 userPrompt: reviewPrompt,
-                systemPrompt: self.identityService.systemPrompt,
+                systemPrompt: self.identityService.systemPrompt(for: LLMModelStorage.load()),
                 options: reviewOptions
             )
 
@@ -2816,14 +3884,17 @@ Original user request:
             guard self.chatStore.currentChatID == chatID else { return }
             guard let index = self.messages.firstIndex(where: { $0.id == assistantMessageId }) else { return }
             guard let improved = self.extractLastHTMLArtifact(from: reviewOutput) else { return }
-            guard !self.isLikelyArtifactRewrite(draft: draftArtifact.payload, candidate: improved.payload) else { return }
 
             let improvedTitle = (improved.title?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
                 ? (improved.title ?? title)
                 : title
+            let mergedPayload = self.mergeArtifactRevision(
+                base: draftArtifact.payload,
+                revision: improved.payload
+            )
             let polishedText = """
 <artifact type="html" title="\(improvedTitle)">
-\(improved.payload)
+\(mergedPayload)
 </artifact>
 """
 
@@ -2832,6 +3903,77 @@ Original user request:
             self.rememberArtifactIfPresent(in: polishedText)
             self.persistCurrentChatState()
         }
+    }
+
+    private func mergeArtifactRevision(base: String, revision: String) -> String {
+        let baseTrimmed = base.trimmingCharacters(in: .whitespacesAndNewlines)
+        let revisionTrimmed = revision.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !revisionTrimmed.isEmpty else { return baseTrimmed }
+        guard baseTrimmed != revisionTrimmed else { return revisionTrimmed }
+
+        if let idMerged = mergeArtifactElementsByID(base: baseTrimmed, revision: revisionTrimmed) {
+            return idMerged
+        }
+
+        if let bodyMerged = replaceArtifactBodyContent(base: baseTrimmed, revision: revisionTrimmed) {
+            return bodyMerged
+        }
+
+        return revisionTrimmed
+    }
+
+    private func mergeArtifactElementsByID(base: String, revision: String) -> String? {
+        let pattern = #"(?is)<([A-Za-z][A-Za-z0-9:-]*)\b([^>]*)\bid\s*=\s*(['"])([^'"]+)\3([^>]*)>(.*?)</\1>"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+
+        let revisionRange = NSRange(revision.startIndex..<revision.endIndex, in: revision)
+        let matches = regex.matches(in: revision, range: revisionRange).reversed()
+        guard !matches.isEmpty else { return nil }
+
+        var merged = base
+        var didReplace = false
+
+        for match in matches {
+            guard let fullRange = Range(match.range(at: 0), in: revision),
+                  let tagRange = Range(match.range(at: 1), in: revision),
+                  let idRange = Range(match.range(at: 4), in: revision) else { continue }
+
+            let tag = String(revision[tagRange])
+            let identifier = String(revision[idRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !identifier.isEmpty else { continue }
+
+            let escapedIdentifier = NSRegularExpression.escapedPattern(for: identifier)
+            let tagPattern = #"(?is)<\#(tag)\b[^>]*\bid\s*=\s*(['"])\#(escapedIdentifier)\2[^>]*>.*?</\#(tag)>"#
+            guard let tagRegex = try? NSRegularExpression(pattern: tagPattern) else { continue }
+
+            let mergedRange = NSRange(merged.startIndex..<merged.endIndex, in: merged)
+            guard let baseMatch = tagRegex.firstMatch(in: merged, range: mergedRange),
+                  let baseRange = Range(baseMatch.range(at: 0), in: merged) else { continue }
+
+            merged.replaceSubrange(baseRange, with: String(revision[fullRange]))
+            didReplace = true
+        }
+
+        return didReplace ? merged : nil
+    }
+
+    private func replaceArtifactBodyContent(base: String, revision: String) -> String? {
+        let pattern = #"(?is)(<body\b[^>]*>)(.*?)(</body>)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+
+        let baseRange = NSRange(base.startIndex..<base.endIndex, in: base)
+        let revisionRange = NSRange(revision.startIndex..<revision.endIndex, in: revision)
+        guard let baseMatch = regex.firstMatch(in: base, range: baseRange),
+              let revisionMatch = regex.firstMatch(in: revision, range: revisionRange),
+              let baseContentRange = Range(baseMatch.range(at: 2), in: base),
+              let revisionContentRange = Range(revisionMatch.range(at: 2), in: revision) else { return nil }
+
+        let revisionContent = String(revision[revisionContentRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !revisionContent.isEmpty else { return nil }
+
+        var merged = base
+        merged.replaceSubrange(baseContentRange, with: revisionContent)
+        return merged
     }
 
     private func cancelArtifactPolishTasks() {
@@ -3000,15 +4142,22 @@ Draft code:
 private struct ThinkStreamParser {
     private let openTag = "<think>"
     private let closeTag = "</think>"
+    private let assumeImplicitThinking: Bool
     private var mode: Mode = .awaitThink
     private var pending = ""
     private var awaitBuffer = ""
     private(set) var didCloseThink: Bool = false
+    private(set) var sawThinkTag: Bool = false
+    private(set) var emittedImplicitThinking: Bool = false
     
     private enum Mode {
         case awaitThink
         case think
         case final
+    }
+
+    init(assumeImplicitThinking: Bool = false) {
+        self.assumeImplicitThinking = assumeImplicitThinking
     }
     
     mutating func feed(_ chunk: String) -> (visible: String, think: String) {
@@ -3020,20 +4169,35 @@ private struct ThinkStreamParser {
             switch mode {
             case .awaitThink:
                 if let openRange = pending.range(of: openTag) {
-                    thinkOut += String(pending[..<openRange.lowerBound])
+                    let prefix = String(pending[..<openRange.lowerBound])
+                    let buffered = awaitBuffer + prefix
+                    if !buffered.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        visibleOut += buffered
+                    }
+                    awaitBuffer = ""
                     pending.removeSubrange(..<openRange.upperBound)
                     mode = .think
+                    sawThinkTag = true
                 } else if let closeRange = pending.range(of: closeTag) {
                     thinkOut += String(pending[..<closeRange.lowerBound])
                     pending.removeSubrange(..<closeRange.upperBound)
                     mode = .final
                     didCloseThink = true
+                    sawThinkTag = true
                 } else {
                     let keep = min(pending.count, max(openTag.count, closeTag.count) - 1)
+                    if pending.count <= keep {
+                        awaitBuffer += pending
+                        pending.removeAll()
+                        return (visibleOut, thinkOut)
+                    }
                     let cutIndex = pending.index(pending.endIndex, offsetBy: -keep)
                     let chunk = String(pending[..<cutIndex])
                     awaitBuffer += chunk
-                    thinkOut += chunk
+                    if assumeImplicitThinking {
+                        thinkOut += chunk
+                        emittedImplicitThinking = true
+                    }
                     pending = String(pending[cutIndex...])
                     return (visibleOut, thinkOut)
                 }
@@ -3077,13 +4241,25 @@ private struct ThinkStreamParser {
         if !pending.isEmpty {
             if mode == .think {
                 think += pending
+            } else if mode == .awaitThink {
+                if assumeImplicitThinking {
+                    think += pending
+                    emittedImplicitThinking = true
+                } else {
+                    visible += pending
+                }
             } else {
                 visible += pending
             }
             pending.removeAll()
         }
         if mode == .awaitThink, !awaitBuffer.isEmpty {
-            think += awaitBuffer
+            if assumeImplicitThinking {
+                think = awaitBuffer + think
+                emittedImplicitThinking = true
+            } else {
+                visible = awaitBuffer + visible
+            }
             awaitBuffer = ""
         }
         return (visible, think)
@@ -3116,6 +4292,7 @@ private func cleanFinalAnswer(_ text: String) -> String {
     cleaned = cleaned.replacingOccurrences(of: "<think>", with: "")
     cleaned = cleaned.replacingOccurrences(of: "</think>", with: "")
     cleaned = cleaned.replacingOccurrences(of: "OpenAGI", with: "0penAGI")
+    cleaned = stripInternalContent(cleaned)
 
     // Remove "Final Answer:" and similar only if they start a line
     let lines = cleaned.split(separator: "\n", omittingEmptySubsequences: false)
@@ -3136,11 +4313,51 @@ private func cleanFinalAnswer(_ text: String) -> String {
         options: .regularExpression
     )
 
-    return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+    // Trim only leading/trailing newlines, preserve internal whitespace/indentation
+    cleaned = cleaned.trimmingCharacters(in: .newlines)
+    return cleaned
+}
+
+func stripInternalContent(_ text: String) -> String {
+    var cleaned = text
+
+    if let regex = try? NSRegularExpression(
+        pattern: #"(?is)<internal\b[^>]*>.*?</internal>"#,
+        options: []
+    ) {
+        let range = NSRange(cleaned.startIndex..<cleaned.endIndex, in: cleaned)
+        cleaned = regex.stringByReplacingMatches(
+            in: cleaned,
+            options: [],
+            range: range,
+            withTemplate: ""
+        )
+    }
+
+    if let tagRegex = try? NSRegularExpression(
+        pattern: #"(?im)^[ \t]*</?internal[^>\n]*>[ \t]*\n?"#,
+        options: []
+    ) {
+        let range = NSRange(cleaned.startIndex..<cleaned.endIndex, in: cleaned)
+        cleaned = tagRegex.stringByReplacingMatches(
+            in: cleaned,
+            options: [],
+            range: range,
+            withTemplate: ""
+        )
+    }
+
+    cleaned = cleaned.replacingOccurrences(
+        of: "\n{4,}",
+        with: "\n\n\n",
+        options: .regularExpression
+    )
+
+    return cleaned
 }
 
 private func normalizeCompletedArtifactMarkup(in text: String) -> String {
-    let cleaned = stripSurplusArtifactClosers(from: text.trimmingCharacters(in: .whitespacesAndNewlines))
+    let cleaned = stripSurplusArtifactClosers(from: text)
     guard !cleaned.isEmpty else { return cleaned }
     guard cleaned.range(of: "<artifact", options: [.caseInsensitive]) != nil else { return cleaned }
 
@@ -3173,7 +4390,8 @@ private func stripSurplusArtifactClosers(from text: String) -> String {
             options: [.regularExpression, .caseInsensitive]
           ) {
         cleaned.removeSubrange(range)
-        cleaned = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Trim only trailing newlines, preserve internal whitespace/indentation
+        cleaned = cleaned.trimmingCharacters(in: .newlines)
         openCount = artifactTagMatchCount(in: cleaned, pattern: "(?i)<artifact\\b")
         closeCount = artifactTagMatchCount(in: cleaned, pattern: "(?i)</artifact>")
     }
@@ -3255,11 +4473,29 @@ private func bestEffortArtifactPayload(from text: String) -> String? {
         return artifact
     }
 
+    if let fenced = unwrapMarkdownCodeFence(from: cleaned),
+       let recovered = recoverIncompleteArtifactMarkup(from: fenced),
+       let artifact = extractBestEffortArtifact(from: recovered) {
+        return artifact
+    }
+
     if let artifact = extractBestEffortArtifact(from: cleaned) {
         return artifact
     }
 
     return nil
+}
+
+private func unwrapMarkdownCodeFence(from text: String) -> String? {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard trimmed.hasPrefix("```"), let fenceEnd = trimmed.range(of: "\n```", options: .backwards) else {
+        return nil
+    }
+
+    let bodyStart = trimmed.firstIndex(of: "\n").map { trimmed.index(after: $0) } ?? trimmed.startIndex
+    let body = String(trimmed[bodyStart..<fenceEnd.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !body.isEmpty else { return nil }
+    return body
 }
 
 private func extractBestEffortArtifact(from text: String) -> String? {
@@ -3303,8 +4539,46 @@ private func artifactTagMatchCount(in text: String, pattern: String) -> Int {
 }
 
 
-private func splitThinkIntoFinal(_ think: String) -> (think: String, final: String) {
+private func splitThinkIntoFinal(
+    _ think: String,
+    preferImplicitReasoningSplit: Bool = false
+) -> (think: String, final: String) {
     let trimmed = cleanFinalAnswer(think)
+
+    let hasVisibleStructure = trimmed.contains("\n\n")
+        || trimmed.contains("```")
+        || trimmed.contains("\n- ")
+        || trimmed.contains("\n* ")
+        || trimmed.contains("\n• ")
+        || trimmed.contains("\n1. ")
+        || trimmed.contains("\n# ")
+
+    if hasVisibleStructure {
+        let paragraphs = trimmed
+            .components(separatedBy: "\n\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        if paragraphs.count >= 2 {
+            let finalParagraphCount = min(2, paragraphs.count)
+            let final = paragraphs.suffix(finalParagraphCount).joined(separator: "\n\n")
+            let think = paragraphs.dropLast(finalParagraphCount).joined(separator: "\n\n")
+            return (think.trimmingCharacters(in: .whitespacesAndNewlines), final)
+        }
+
+        if preferImplicitReasoningSplit, let only = paragraphs.first, only.count > 120 {
+            let splitPoint = max(40, only.count * 2 / 3)
+            let boundary = only[..<only.index(only.startIndex, offsetBy: min(splitPoint, only.count))]
+            let think = boundary.trimmingCharacters(in: .whitespacesAndNewlines)
+            let final = only.dropFirst(min(splitPoint, only.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !think.isEmpty, !final.isEmpty {
+                return (think, final)
+            }
+        }
+
+        return ("", trimmed)
+    }
+
     let rawSentences = trimmed
         .split(whereSeparator: { $0 == "." || $0 == "?" || $0 == "!" })
         .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -3319,24 +4593,163 @@ private func splitThinkIntoFinal(_ think: String) -> (think: String, final: Stri
         sentences = Array(rawSentences.dropLast())
     }
 
+    // Short direct answers like "Привет" often arrive without terminal punctuation.
+    // In that case, treat the whole text as the final answer instead of dropping it.
+    if sentences.isEmpty {
+        if rawSentences.count == 1 {
+            if preferImplicitReasoningSplit {
+                let raw = cleanFinalAnswer(rawSentences[0]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if raw.count > 120 {
+                    let splitPoint = max(40, raw.count * 2 / 3)
+                    let boundary = raw[..<raw.index(raw.startIndex, offsetBy: min(splitPoint, raw.count))]
+                    let think = boundary.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let final = raw.dropFirst(min(splitPoint, raw.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !think.isEmpty, !final.isEmpty {
+                        return (think, final)
+                    }
+                }
+            }
+            return ("", cleanFinalAnswer(rawSentences[0]))
+        }
+        return ("", cleanFinalAnswer(trimmed))
+    }
+
     if sentences.count >= 3 {
+        if preferImplicitReasoningSplit {
+            let first = sentences.first ?? ""
+            let rest = sentences.dropFirst().joined(separator: ". ")
+            return (first.trimmingCharacters(in: .whitespacesAndNewlines), cleanFinalAnswer(rest))
+        }
         let finalTwo = Array(sentences.suffix(2)).joined(separator: ". ")
         let rest = sentences.dropLast(2).joined(separator: ". ")
         return (rest.trimmingCharacters(in: .whitespacesAndNewlines), cleanFinalAnswer(finalTwo))
     }
 
     if sentences.count >= 2 {
+        if preferImplicitReasoningSplit {
+            let first = sentences.first ?? ""
+            let rest = sentences.dropFirst().joined(separator: ". ")
+            return (first.trimmingCharacters(in: .whitespacesAndNewlines), cleanFinalAnswer(rest))
+        }
         let finalSentence = sentences.last ?? ""
         let rest = sentences.dropLast().joined(separator: ". ")
         return (rest.trimmingCharacters(in: .whitespacesAndNewlines), cleanFinalAnswer(finalSentence))
     }
 
-
     if let only = sentences.first {
+        if preferImplicitReasoningSplit, only.count > 120 {
+            let splitPoint = max(40, only.count * 2 / 3)
+            let boundary = only[..<only.index(only.startIndex, offsetBy: min(splitPoint, only.count))]
+            let think = boundary.trimmingCharacters(in: .whitespacesAndNewlines)
+            let final = only.dropFirst(min(splitPoint, only.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !think.isEmpty, !final.isEmpty {
+                return (think, final)
+            }
+        }
         return ("", cleanFinalAnswer(only))
     }
 
     return ("", cleanFinalAnswer(trimmed))
+}
+
+private func repairReasoningLeakIfNeeded(in text: String, parserSawThinkTag: Bool) -> (think: String?, final: String)? {
+    let cleaned = cleanFinalAnswer(text).trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !cleaned.isEmpty else { return nil }
+    guard !parserSawThinkTag else { return nil }
+    guard looksLikeReasoningLeak(cleaned) else { return nil }
+
+    let split = splitThinkIntoFinal(cleaned)
+    let final = cleanFinalAnswer(split.final).trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !final.isEmpty, final != cleaned else { return nil }
+
+    let think = split.think.trimmingCharacters(in: .whitespacesAndNewlines)
+    return (think.isEmpty ? nil : think, final)
+}
+
+private func looksLikeReasoningLeak(_ text: String) -> Bool {
+    let lower = text.lowercased()
+    let markers = [
+        "user, probably expects",
+        "user likely expects",
+        "judging by the context",
+        "i should answer",
+        "i will answer",
+        "same language as the user",
+        "since the user wrote",
+        "пользователь, вероятно",
+        "судя по контексту",
+        "поскольку пользователь",
+        "мой ответ должен",
+        "я выберу русский",
+        "итак, ответ",
+        "инструкции говорят"
+    ]
+
+    let markerHits = markers.filter { lower.contains($0) }.count
+    if markerHits >= 2 {
+        return true
+    }
+
+    let paragraphCount = text.components(separatedBy: "\n\n").filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.count
+    return paragraphCount >= 3 && lower.contains("пользователь")
+}
+
+func formatAssistantDisplayText(_ text: String) -> String {
+    let normalized = text.replacingOccurrences(of: "\r\n", with: "\n")
+    guard !normalized.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        return normalized.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    let preserved = normalized
+        .replacingOccurrences(of: #"\n{4,}"#, with: "\n\n\n", options: .regularExpression)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+
+    guard !preserved.isEmpty else { return preserved }
+    return preserved
+}
+
+private func assistantDisplayShouldPreserveStructure(in text: String) -> Bool {
+    let markers = [
+        "\n\n",
+        "```",
+        "\n- ",
+        "\n* ",
+        "\n• ",
+        "\n1. ",
+        "\n2. ",
+        "\n3. ",
+        "\n# ",
+        "\n> ",
+        "<artifact",
+        "</artifact>",
+        "<html",
+        "<body"
+    ]
+
+    return markers.contains(where: { text.contains($0) })
+}
+
+private func assistantDisplaySentenceFragments(in text: String) -> [String] {
+    let tokenizer = NLTokenizer(unit: .sentence)
+    tokenizer.string = text
+
+    var fragments: [String] = []
+    tokenizer.enumerateTokens(in: text.startIndex..<text.endIndex) { range, _ in
+        let fragment = text[range].trimmingCharacters(in: .whitespacesAndNewlines)
+        if !fragment.isEmpty {
+            fragments.append(String(fragment))
+        }
+        return true
+    }
+
+    if fragments.isEmpty {
+        let fallback = text
+            .split(separator: " ", omittingEmptySubsequences: true)
+            .map(String.init)
+        return fallback.isEmpty ? [text] : fallback
+    }
+
+    return fragments
 }
 
 extension Notification.Name {

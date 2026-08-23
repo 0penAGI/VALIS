@@ -8,6 +8,7 @@ enum LanguageRoutingService {
     }
     
     private static let lastDetectedLanguageKey = "lang.lastDetected"
+    private static let englishLocale = Locale(identifier: "en_US")
 
     static func detectLanguage(for text: String) -> DetectionResult? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -31,6 +32,12 @@ enum LanguageRoutingService {
         return DetectionResult(code: code, confidence: Double(confidence))
     }
 
+    static func detectedNormalizedCode(for text: String) -> String? {
+        guard let detected = detectLanguage(for: text) else { return nil }
+        let code = normalize(code: detected.code)
+        return code.isEmpty ? nil : code
+    }
+
     static func languageAnchor(for userText: String) -> String {
         if let result = detectLanguage(for: userText) {
             let code = normalize(code: result.code)
@@ -48,6 +55,11 @@ enum LanguageRoutingService {
         }
 
         return ""
+    }
+
+    static func displayName(forNormalizedCode code: String) -> String? {
+        guard !code.isEmpty else { return nil }
+        return englishLocale.localizedString(forLanguageCode: code)
     }
 
     private static func normalize(code: String) -> String {
@@ -86,6 +98,12 @@ enum LanguageRoutingService {
             return "\n\nLanguage:\n- Відповідай українською.\n- Думай українською.\n- Код залишай кодом."
         case "th":
             return "\n\nLanguage:\n- ตอบเป็นภาษาไทย.\n- คิดเป็นภาษาไทย.\n- โค้ดให้คงรูปแบบโค้ด."
+        case "zh":
+            return "\n\nLanguage:\n- 用中文回答。\n- 用中文思考。\n- 保持代码原样。"
+        case "ja":
+            return "\n\nLanguage:\n- 日本語で答えてください。\n- 日本語で考えてください。\n- コードはそのままにしてください。"
+        case "ko":
+            return "\n\nLanguage:\n- 한국어로 답변하세요.\n- 한국어로 생각하세요.\n- 코드는 그대로 유지하세요."
         default:
             // For English/unknown, rely on the base system prompt ("Answer in the user's language").
             // We only force when we have a strong signal; other languages can be added here.

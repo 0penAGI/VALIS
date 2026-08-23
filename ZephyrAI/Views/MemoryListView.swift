@@ -65,24 +65,41 @@ struct MemoryListView: View {
         .toolbarColorScheme(colorScheme == .dark ? .dark : .light, for: .navigationBar)
         .onAppear { isGlassActive = true }
         .onDisappear { isGlassActive = false }
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 20)
+                .onEnded { value in
+                    let translation = value.translation
+                    
+                    // swipe right to go back
+                    guard translation.width > 80,
+                          abs(translation.height) < 50 else { return }
+                    
+                    dismiss()
+                }
+        )
+    }
+
+    private var glassBaseLayer: some View {
+        GlassDistortionLayer(
+            baseOpacity: colorScheme == .dark ? glassOpacityDark : glassOpacityLight,
+            blurRadius: glassBlurRadius,
+            maxOffset: glassMaxOffset,
+            isActive: isGlassActive
+        )
+        .ignoresSafeArea()
+    }
+
+    private var glassOverlayLayer: some View {
+        Rectangle()
+            .fill(.ultraThinMaterial)
+            .opacity(colorScheme == .dark ? glassOverlayOpacityDark : glassOverlayOpacityLight)
+            .ignoresSafeArea()
     }
 
     private var glassBackground: some View {
-        let baseOpacity = colorScheme == .dark ? glassOpacityDark : glassOpacityLight
-        let overlayOpacity = colorScheme == .dark ? glassOverlayOpacityDark : glassOverlayOpacityLight
-        return ZStack {
-            GlassDistortionLayer(
-                baseOpacity: baseOpacity,
-                blurRadius: glassBlurRadius,
-                maxOffset: glassMaxOffset,
-                isActive: isGlassActive
-            )
-            .ignoresSafeArea()
-
-            Rectangle()
-                .fill(.ultraThinMaterial)
-                .opacity(overlayOpacity)
-                .ignoresSafeArea()
+        ZStack {
+            glassBaseLayer
+            glassOverlayLayer
         }
     }
 
@@ -92,11 +109,8 @@ struct MemoryListView: View {
             memoryRows
         }
         .scrollContentBackground(.hidden)
+        .listStyle(.insetGrouped)
         .background(Color.clear)
-        .listStyle(.plain)
-        .listRowBackground(Color.clear)
-        .background(Color.clear)
-        .background(.ultraThinMaterial.opacity(0.35))
     }
 
     private var headerSection: some View {
@@ -134,7 +148,7 @@ struct MemoryListView: View {
             if mem.isPinned {
                 Image(systemName: "pin.fill")
                     .font(.system(size: 12, weight: .semibold))
-                    .foregroundColor(colorScheme == .dark ? .white : .primary)
+                    .foregroundColor(.yellow)
                     .padding(.top, 2)
             }
 
@@ -182,7 +196,7 @@ struct MemoryListView: View {
             Label(mem.isPinned ? "Unpin" : "Pin",
                   systemImage: mem.isPinned ? "pin.slash" : "pin")
         }
-        .tint(.black)
+        .foregroundColor(colorScheme == .dark ? .white : .black)
     }
 
     private func deleteButton(_ mem: Memory) -> some View {
@@ -200,40 +214,42 @@ struct MemoryListView: View {
             Button {
                 dismiss()
             } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: "chevron.left")
-                }
-                .foregroundColor(colorScheme == .dark ? .white : .black)
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 13, weight: .semibold))
+                    .padding(10)
+                    .background(Color.clear, in: Circle())
             }
+            .foregroundStyle(colorScheme == .dark ? Color.white : Color.primary)
         }
 
-        ToolbarItemGroup(placement: .navigationBarTrailing) {
-            Button {
-                isShowingClearConfirm = true
-            } label: {
-                Text("Clear")
-            }
-            .foregroundColor(colorScheme == .dark ? .white : .black)
-
-            Button {
-                if editMode?.wrappedValue.isEditing == true {
-                    editMode?.wrappedValue = .inactive
-                } else {
-                    editMode?.wrappedValue = .active
+        ToolbarItem(placement: .navigationBarTrailing) {
+            HStack(spacing: 10) {
+                Button {
+                    isShowingClearConfirm = true
+                } label: {
+                    Image(systemName: "trash")
                 }
-            } label: {
-                Text(editMode?.wrappedValue.isEditing == true ? "Done" : "Edit")
-            }
-            .foregroundColor(colorScheme == .dark ? .white : .black)
 
-            Button {
-                editingMemory = nil
-                draftContent = ""
-                isPresentingEditor = true
-            } label: {
-                Image(systemName: "plus")
+                Button {
+                    let isEditing = editMode?.wrappedValue.isEditing == true
+                    editMode?.wrappedValue = isEditing ? .inactive : .active
+                } label: {
+                    let isEditing = editMode?.wrappedValue.isEditing == true
+                    Image(systemName: isEditing ? "checkmark" : "square.and.pencil")
+                }
+
+                Button {
+                    editingMemory = nil
+                    draftContent = ""
+                    isPresentingEditor = true
+                } label: {
+                    Image(systemName: "plus")
+                }
             }
-            .foregroundColor(colorScheme == .dark ? .white : .black)
+            .font(.system(size: 13, weight: .semibold))
+            .padding(8)
+            .background(Color.clear)
+            .foregroundStyle(colorScheme == .dark ? Color.white : Color.primary)
         }
 
         ToolbarItem(placement: .bottomBar) {
@@ -247,8 +263,7 @@ struct MemoryListView: View {
                     Text("Pin Selected")
                         .padding(.vertical, 8)
                         .padding(.horizontal, 14)
-                        .background(.ultraThinMaterial)
-                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                        .background(Color.clear)
                 }
                 .buttonStyle(.plain)
             }
@@ -257,12 +272,12 @@ struct MemoryListView: View {
 
     @ViewBuilder
     private var clearDialogButtons: some View {
-        Button("Clear All (keep identity & pinned)", role: .destructive) {
-            memoryService.clearAllMemories(keepIdentity: true, keepPinned: true)
+        Button("Clear All", role: .destructive) {
+            memoryService.clearAllMemories(keepIdentity: false, keepPinned: false)
         }
 
-        Button("Clear All (everything)", role: .destructive) {
-            memoryService.clearAllMemories(keepIdentity: false, keepPinned: false)
+        Button("Clear All Except Pinned", role: .destructive) {
+            memoryService.clearAllMemories(keepIdentity: false, keepPinned: true)
         }
 
         Button("Cancel", role: .cancel) {}
@@ -324,6 +339,9 @@ struct ChatListView: View {
     @State private var isPresentingRenameSheet = false
     @State private var editingChat: ChatSession?
     @State private var draftTitle: String = ""
+    @State private var selection = Set<UUID>()
+    @State private var isShowingClearConfirm = false
+    @Environment(\.editMode) private var editMode
 
     private let glassOpacityDark: Double = 0.32
     private let glassOpacityLight: Double = 0.24
@@ -361,51 +379,143 @@ struct ChatListView: View {
                     dismiss()
                 } label: {
                     Image(systemName: "chevron.left")
-                        .foregroundColor(colorScheme == .dark ? .white : .black)
+                        .font(.system(size: 13, weight: .semibold))
+                        .padding(10)
+                        .background(Color.clear, in: Circle())
                 }
+                .foregroundStyle(colorScheme == .dark ? Color.white : Color.primary)
+            }
+            ToolbarItem(placement: .navigationBarTrailing) {
+                trailingToolbar
             }
 
-            ToolbarItemGroup(placement: .navigationBarTrailing) {
-                Button {
-                    ChatViewModel.shared.createNewChat()
-                    dismiss()
-                } label: {
-                    Image(systemName: "plus")
-                }
-                .foregroundColor(colorScheme == .dark ? .white : .black)
+            ToolbarItem(placement: .bottomBar) {
+                bottomSelectionBar
             }
         }
         .sheet(isPresented: $isPresentingRenameSheet) {
             renameSheet
+        }
+        .confirmationDialog("Clear all chats?", isPresented: $isShowingClearConfirm, titleVisibility: .visible) {
+            Button("Clear All", role: .destructive) {
+                for chat in chatStore.chats {
+                    ChatViewModel.shared.deleteChat(chat.id)
+                }
+            }
+
+            Button("Clear All Except Pinned", role: .destructive) {
+                for chat in chatStore.chats where !chat.isPinned {
+                    ChatViewModel.shared.deleteChat(chat.id)
+                }
+            }
+
+            Button("Cancel", role: .cancel) {}
         }
         .toolbarBackground(.hidden, for: .navigationBar)
         .toolbarBackground(Color.clear, for: .navigationBar)
         .toolbarColorScheme(colorScheme == .dark ? .dark : .light, for: .navigationBar)
         .onAppear { isGlassActive = true }
         .onDisappear { isGlassActive = false }
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 20)
+                .onEnded { value in
+                    let translation = value.translation
+                    
+                    // swipe right to go back
+                    guard translation.width > 80,
+                          abs(translation.height) < 50 else { return }
+                    
+                    dismiss()
+                }
+        )
+    }
+
+    private var trailingToolbar: some View {
+        HStack(spacing: 10) {
+            Button {
+                isShowingClearConfirm = true
+            } label: {
+                Image(systemName: "trash")
+            }
+
+            Button {
+                if editMode?.wrappedValue.isEditing == true {
+                    editMode?.wrappedValue = .inactive
+                } else {
+                    editMode?.wrappedValue = .active
+                }
+            } label: {
+                Image(systemName: editMode?.wrappedValue.isEditing == true ? "checkmark" : "square.and.pencil")
+            }
+
+            Button {
+                ChatViewModel.shared.createNewChat()
+                dismiss()
+            } label: {
+                Image(systemName: "plus")
+            }
+        }
+        .font(.system(size: 13, weight: .semibold))
+        .padding(8)
+        .background(Color.clear)
+        .foregroundStyle(colorScheme == .dark ? Color.white : Color.primary)
+    }
+
+    @ViewBuilder
+    private var bottomSelectionBar: some View {
+        if !selection.isEmpty {
+            HStack(spacing: 10) {
+                Button {
+                    for id in selection {
+                        ChatViewModel.shared.togglePinnedChat(id)
+                    }
+                    selection.removeAll()
+                } label: {
+                    Text("Pin Selected")
+                }
+
+                Button(role: .destructive) {
+                    for id in selection {
+                        ChatViewModel.shared.deleteChat(id)
+                    }
+                    selection.removeAll()
+                } label: {
+                    Text("Delete")
+                }
+            }
+            .font(.system(size: 13, weight: .semibold))
+            .padding(8)
+            .background(Color.clear)
+            .foregroundStyle(colorScheme == .dark ? Color.white : Color.primary)
+        }
+    }
+
+    private var glassBaseLayer: some View {
+        GlassDistortionLayer(
+            baseOpacity: colorScheme == .dark ? glassOpacityDark : glassOpacityLight,
+            blurRadius: glassBlurRadius,
+            maxOffset: glassMaxOffset,
+            isActive: isGlassActive
+        )
+        .ignoresSafeArea()
+    }
+
+    private var glassOverlayLayer: some View {
+        Rectangle()
+            .fill(.ultraThinMaterial)
+            .opacity(colorScheme == .dark ? glassOverlayOpacityDark : glassOverlayOpacityLight)
+            .ignoresSafeArea()
     }
 
     private var glassBackground: some View {
-        let baseOpacity = colorScheme == .dark ? glassOpacityDark : glassOpacityLight
-        let overlayOpacity = colorScheme == .dark ? glassOverlayOpacityDark : glassOverlayOpacityLight
-        return ZStack {
-            GlassDistortionLayer(
-                baseOpacity: baseOpacity,
-                blurRadius: glassBlurRadius,
-                maxOffset: glassMaxOffset,
-                isActive: isGlassActive
-            )
-            .ignoresSafeArea()
-
-            Rectangle()
-                .fill(.ultraThinMaterial)
-                .opacity(overlayOpacity)
-                .ignoresSafeArea()
+        ZStack {
+            glassBaseLayer
+            glassOverlayLayer
         }
     }
 
     private var chatListView: some View {
-        List {
+        List(selection: $selection) {
             Section {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Chats")
@@ -427,10 +537,8 @@ struct ChatListView: View {
             }
         }
         .scrollContentBackground(.hidden)
+        .listStyle(.insetGrouped)
         .background(Color.clear)
-        .listStyle(.plain)
-        .listRowBackground(Color.clear)
-        .background(.ultraThinMaterial.opacity(0.35))
     }
 
     @ViewBuilder
@@ -609,8 +717,11 @@ struct PersonaListView: View {
                     dismiss()
                 } label: {
                     Image(systemName: "chevron.left")
-                        .foregroundColor(colorScheme == .dark ? .white : .black)
+                        .font(.system(size: 13, weight: .semibold))
+                        .padding(10)
+                        .background(Color.clear, in: Circle())
                 }
+                .foregroundStyle(colorScheme == .dark ? Color.white : Color.primary)
             }
         }
         .toolbarBackground(.hidden, for: .navigationBar)
@@ -624,11 +735,24 @@ struct PersonaListView: View {
             identityService.updateUserPrompt(masterPrompt)
             isGlassActive = false
         }
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 20)
+                .onEnded { value in
+                    let translation = value.translation
+                    
+                    // swipe right to go back
+                    guard translation.width > 80,
+                          abs(translation.height) < 50 else { return }
+                    
+                    dismiss()
+                }
+        )
     }
 
     private var glassBackground: some View {
         let baseOpacity = colorScheme == .dark ? glassOpacityDark : glassOpacityLight
         let overlayOpacity = colorScheme == .dark ? glassOverlayOpacityDark : glassOverlayOpacityLight
+
         return ZStack {
             GlassDistortionLayer(
                 baseOpacity: baseOpacity,
@@ -700,10 +824,8 @@ struct PersonaListView: View {
             .listRowBackground(Color.clear)
         }
         .scrollContentBackground(.hidden)
+        .listStyle(.insetGrouped)
         .background(Color.clear)
-        .listStyle(.plain)
-        .listRowBackground(Color.clear)
-        .background(.ultraThinMaterial.opacity(0.35))
     }
 }
 

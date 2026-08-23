@@ -17,12 +17,22 @@ struct WikipediaSource: AutonomousMemorySource {
         guard let url = URL(string: urlString) else { return [] }
 
         do {
-            let (data, _) = try await URLSession.shared.data(from: url)
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 5
+            request.setValue("VALISAI/1.0", forHTTPHeaderField: "User-Agent")
+
+            let (data, response) = try await URLSession.shared.data(for: request)
+
+            guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+                return []
+            }
+
             let decoded = try JSONDecoder().decode(WikipediaSummary.self, from: data)
             let summary = decoded.extract?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             if summary.isEmpty { return [] }
             return [summary]
         } catch {
+            print("❌ \(name) fetch error:", error)
             return []
         }
     }
@@ -52,7 +62,16 @@ struct DuckDuckGoSource: AutonomousMemorySource {
         guard let url = components.url else { return [] }
 
         do {
-            let (data, _) = try await URLSession.shared.data(from: url)
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 5
+            request.setValue("VALISAI/1.0", forHTTPHeaderField: "User-Agent")
+
+            let (data, response) = try await URLSession.shared.data(for: request)
+
+            guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+                return []
+            }
+
             let decoded = try JSONDecoder().decode(DuckDuckGoResponse.self, from: data)
 
             var parts: [String] = []
@@ -63,7 +82,12 @@ struct DuckDuckGoSource: AutonomousMemorySource {
             }
 
             let relatedTexts = (decoded.RelatedTopics ?? [])
-                .compactMap { $0.Text }
+                .flatMap { topic -> [String] in
+                    if let text = topic.Text {
+                        return [text]
+                    }
+                    return topic.Topics?.compactMap { $0.Text } ?? []
+                }
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .filter { !$0.isEmpty }
                 .prefix(2)
@@ -74,6 +98,7 @@ struct DuckDuckGoSource: AutonomousMemorySource {
 
             return parts
         } catch {
+            print("❌ \(name) fetch error:", error)
             return []
         }
     }
@@ -85,6 +110,7 @@ struct DuckDuckGoSource: AutonomousMemorySource {
 
         struct RelatedTopic: Decodable {
             let Text: String?
+            let Topics: [RelatedTopic]?
         }
     }
 }

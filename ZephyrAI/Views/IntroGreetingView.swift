@@ -18,18 +18,18 @@ enum IntroGreetingCopy {
 
         if isRU {
             switch band {
-            case 0: return "Доброй ночи.\n"
-            case 1: return "Доброе утро.\nКакие планы?"
-            case 2: return "Добрый день.\n"
-            default: return "Добрый вечер.\n"
+            case 0: return "Доброй ночи\n"
+            case 1: return "Доброе утро\nКакие планы?"
+            case 2: return "Добрый день\n"
+            default: return "Добрый вечер\n"
             }
         }
 
         switch band {
-        case 0: return "Good night.\n"
-        case 1: return "Good morning.\nWhat's the plan?"
-        case 2: return "Good afternoon.\nWhat matters today?"
-        default: return "Good evening.\n"
+        case 0: return "Good night\n"
+        case 1: return "Good morning\nWhat's the plan?"
+        case 2: return "Good afternoon\nWhat matters today?"
+        default: return "Good evening\n"
         }
     }
 }
@@ -40,15 +40,29 @@ struct IntroGreetingView: View {
 
     @Environment(\.colorScheme) private var colorScheme
     @StateObject private var motion = IntroMotionController()
+    @State private var taps: [TapWave] = []
+    @State private var currentTime: TimeInterval = 0
+    @State private var keyboardHeight: CGFloat = 0
 
     private var isDayMode: Bool {
         colorScheme != .dark
+    }
+
+    struct TapWave {
+        var point: CGPoint
+        var start: TimeInterval
     }
 
     var body: some View {
         GeometryReader { geo in
             TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: false)) { timeline in
                 ZStack {
+                    let now = timeline.date.timeIntervalSinceReferenceDate
+                    Color.clear
+                        .onChange(of: now) { _, newValue in
+                            currentTime = newValue
+                            taps.removeAll { newValue - $0.start > 1.2 }
+                        }
                     if isDayMode {
                         IntroDaylightField(
                             size: geo.size,
@@ -56,7 +70,8 @@ struct IntroGreetingView: View {
                             motionOffset: CGSize(
                                 width: motion.roll * 34,
                                 height: motion.pitch * 24
-                            )
+                            ),
+                            taps: taps
                         )
                     } else {
                         IntroStarField(
@@ -65,12 +80,13 @@ struct IntroGreetingView: View {
                             motionOffset: CGSize(
                                 width: motion.roll * 38,
                                 height: motion.pitch * 32
-                            )
+                            ),
+                            taps: taps
                         )
                     }
 
                     VStack {
-                        Spacer(minLength: max(120, geo.safeAreaInsets.top + 120))
+                        Spacer(minLength: max(120, geo.safeAreaInsets.top + 120) + (keyboardHeight > 0 ? 20 : 0))
 
                         Text(text)
                             .font(.system(size: 34, weight: .ultraLight, design: .rounded))
@@ -79,19 +95,41 @@ struct IntroGreetingView: View {
                             .lineSpacing(4)
                             .padding(.horizontal, 30)
                             .blur(radius: isTyping ? 12 : 0)
-                            .scaleEffect(isTyping ? 0.97 : 1.0)
+                            .scaleEffect((isTyping ? 0.97 : 1.0) * (keyboardHeight > 0 ? 0.92 : 1.0))
+                            .offset(y: keyboardHeight > 0 ? -keyboardHeight * 0.25 : 0)
                             .opacity(isTyping ? 0 : 1)
-                            .animation(.easeOut(duration: 0.22), value: isTyping)
+                            .animation(.easeOut(duration: 0.25), value: isTyping)
+                            .animation(.easeOut(duration: 0.3), value: keyboardHeight)
 
                         Spacer()
                     }
                 }
-                .opacity(isTyping ? 0.35 : 1.0)
+                .contentShape(Rectangle())
+                .gesture(
+                    DragGesture(minimumDistance: 0)
+                        .onEnded { value in
+                            taps.append(
+                                TapWave(
+                                    point: value.location,
+                                    start: currentTime
+                                )
+                            )
+                        }
+                )
+                .opacity(isTyping ? (isDayMode ? 0.88 : 0.78) : 1.0)
                 .animation(.easeOut(duration: 0.22), value: isTyping)
                 .frame(width: geo.size.width, height: geo.size.height)
             }
             .frame(width: geo.size.width, height: geo.size.height + 120)
             .offset(y: -40)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { notif in
+            if let frame = notif.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect {
+                keyboardHeight = frame.height
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
+            keyboardHeight = 0
         }
     }
 }
@@ -100,22 +138,30 @@ private struct IntroStarField: View {
     let size: CGSize
     let time: TimeInterval
     let motionOffset: CGSize
+    let taps: [IntroGreetingView.TapWave]
 
     var body: some View {
         Canvas { context, canvasSize in
+            // 🌌 Base night gradient replaced with pure black
+            let baseRect = CGRect(origin: .zero, size: canvasSize)
+            context.fill(
+                Path(baseRect),
+                with: .color(Color.black)
+            )
+
             for star in IntroStarSeed.samples {
-                let driftX = CGFloat(sin(time * star.speed + star.driftPhaseX)) * (8 + star.depth * 10)
-                let driftY = CGFloat(cos(time * (star.speed * 0.82) + star.driftPhaseY)) * (6 + star.depth * 8)
+                let driftX = CGFloat(sin(time * star.speed + star.driftPhaseX)) * 4
+                let driftY = CGFloat(cos(time * (star.speed * 0.82) + star.driftPhaseY)) * 3
 
                 let x = star.x * canvasSize.width + motionOffset.width * star.depth + driftX
                 let adjustedY = star.y * canvasSize.height + motionOffset.height * star.depth + driftY
                 let twinkle = 0.72 + 0.28 * sin(time * star.twinkleSpeed + star.twinklePhase)
-                let radius = star.radius * (star.depth > 0.7 ? 1.18 : 1.0) * CGFloat(0.96 + twinkle * 0.14)
-                let haloRadius = radius * (star.depth > 0.72 ? 7.4 : 5.4)
-                let flareLength = radius * (star.depth > 0.75 ? 18 : 11)
-                let coreOpacity = min(1.0, star.opacity * (0.82 + twinkle * 0.42))
-                let haloOpacity = star.opacity * (star.depth > 0.72 ? 0.22 : 0.14) * twinkle
-                let flareOpacity = star.opacity * (star.depth > 0.7 ? 0.26 : 0.12) * twinkle
+                let radius = star.radius * 0.75
+                let haloRadius = radius * 4.0
+                let flareLength = radius * 10
+                let coreOpacity = min(1.0, star.opacity * (0.6 + twinkle * 0.28))
+                let haloOpacity = star.opacity * 0.06
+                let flareOpacity = star.opacity * 0.08
 
                 let haloRect = CGRect(x: x - haloRadius, y: adjustedY - haloRadius, width: haloRadius * 2, height: haloRadius * 2)
                 let rect = CGRect(x: x - radius, y: adjustedY - radius, width: radius * 2, height: radius * 2)
@@ -139,7 +185,7 @@ private struct IntroStarField: View {
                     with: .color(Color.white.opacity(coreOpacity))
                 )
 
-                if star.depth > 0.58 {
+                if star.depth > 0.85 {
                     let verticalRect = CGRect(x: x - 0.65, y: adjustedY - flareLength, width: 1.3, height: flareLength * 2)
                     let horizontalRect = CGRect(x: x - flareLength, y: adjustedY - 0.65, width: flareLength * 2, height: 1.3)
 
@@ -161,9 +207,28 @@ private struct IntroStarField: View {
                     )
                 }
             }
+            // Ripples
+            for tap in taps {
+                let t = time - tap.start
+                let radius = CGFloat(t * 160)
+                let alpha = max(0, 1 - t * 1.4)
+
+                let rect = CGRect(
+                    x: tap.point.x - radius,
+                    y: tap.point.y - radius,
+                    width: radius * 2,
+                    height: radius * 2
+                )
+
+                context.addFilter(.blur(radius: 10))
+                context.stroke(
+                    Path(ellipseIn: rect),
+                    with: .color(Color.white.opacity(alpha * 0.2)),
+                    lineWidth: 1.5
+                )
+            }
         }
         .frame(width: size.width, height: size.height)
-        .drawingGroup()
     }
 }
 
@@ -236,10 +301,34 @@ private struct IntroDaylightField: View {
     let size: CGSize
     let time: TimeInterval
     let motionOffset: CGSize
+    let taps: [IntroGreetingView.TapWave]
 
     var body: some View {
         Canvas { context, canvasSize in
             let baseRect = CGRect(origin: .zero, size: canvasSize)
+
+            // --- subtle displacement feedback layer ---
+            context.drawLayer { layer in
+                let dx = sin(time * 0.35) * 6 + motionOffset.width * 0.15
+                let dy = cos(time * 0.28) * 6 + motionOffset.height * 0.15
+
+                layer.translateBy(x: dx, y: dy)
+                layer.addFilter(.blur(radius: 6))
+                layer.opacity = 0.12
+
+                layer.fill(
+                    Path(baseRect),
+                    with: .linearGradient(
+                        Gradient(colors: [
+                            Color.white.opacity(0.04),
+                            Color.clear
+                        ]),
+                        startPoint: CGPoint(x: 0, y: 0),
+                        endPoint: CGPoint(x: baseRect.maxX, y: baseRect.maxY)
+                    )
+                )
+            }
+
             context.fill(
                 Path(baseRect),
                 with: .linearGradient(
@@ -252,6 +341,51 @@ private struct IntroDaylightField: View {
                     endPoint: CGPoint(x: baseRect.maxX, y: baseRect.maxY)
                 )
             )
+
+            // --- advanced flowing shader layer (non-linear, non-looping feel) ---
+            context.drawLayer { layer in
+                let t = time
+
+                // nonlinear drifting field (not simple loop)
+                let flowX = sin(t * 0.23) * 40 + cos(t * 0.11) * 26
+                let flowY = cos(t * 0.19) * 34 + sin(t * 0.07) * 18
+
+                layer.translateBy(
+                    x: flowX + motionOffset.width * 0.4,
+                    y: flowY + motionOffset.height * 0.4
+                )
+
+                // subtle chromatic gradient mix
+                let dynamicGradient = Gradient(colors: [
+                    Color(red: 0.6, green: 0.8, blue: 1.0).opacity(0.10),
+                    Color(red: 1.0, green: 0.85, blue: 0.6).opacity(0.08),
+                    Color(red: 0.7, green: 0.9, blue: 0.9).opacity(0.06),
+                    Color.clear
+                ])
+
+                let rect = CGRect(
+                    x: -canvasSize.width * 0.3,
+                    y: -canvasSize.height * 0.3,
+                    width: canvasSize.width * 1.6,
+                    height: canvasSize.height * 1.6
+                )
+
+                layer.addFilter(.blur(radius: 60))
+                layer.opacity = 0.6
+
+                layer.fill(
+                    Path(rect),
+                    with: .radialGradient(
+                        dynamicGradient,
+                        center: CGPoint(
+                            x: rect.midX + sin(t * 0.31) * 120,
+                            y: rect.midY + cos(t * 0.27) * 90
+                        ),
+                        startRadius: 0,
+                        endRadius: max(rect.width, rect.height)
+                    )
+                )
+            }
 
             for orb in IntroDaylightSeed.orbs {
                 let driftX = CGFloat(sin(time * orb.speed + orb.phaseX)) * orb.travel + motionOffset.width * orb.depth
@@ -283,6 +417,31 @@ private struct IntroDaylightField: View {
                         endRadius: radius
                     )
                 )
+
+                // subtle orb feedback echo
+                let echoOffsetX = sin(time * 0.6 + orb.phaseX) * 10 * orb.depth
+                let echoOffsetY = cos(time * 0.5 + orb.phaseY) * 10 * orb.depth
+
+                let echoRect = CGRect(
+                    x: rect.origin.x + echoOffsetX,
+                    y: rect.origin.y + echoOffsetY,
+                    width: rect.width,
+                    height: rect.height
+                )
+
+                context.addFilter(.blur(radius: 18 * orb.depth))
+                context.fill(
+                    Path(ellipseIn: echoRect),
+                    with: .radialGradient(
+                        Gradient(colors: [
+                            orb.color.opacity(0.08),
+                            Color.clear
+                        ]),
+                        center: CGPoint(x: echoRect.midX, y: echoRect.midY),
+                        startRadius: 0,
+                        endRadius: radius
+                    )
+                )
             }
 
             for ribbon in IntroDaylightSeed.ribbons {
@@ -309,6 +468,33 @@ private struct IntroDaylightField: View {
                 let y = dust.y * canvasSize.height + CGFloat(cos(time * (dust.speed * 0.75) + dust.phase)) * 10 + motionOffset.height * dust.depth
                 let rect = CGRect(x: x, y: y, width: dust.radius, height: dust.radius)
                 context.fill(Path(ellipseIn: rect), with: .color(Color.white.opacity(dust.opacity)))
+            }
+
+            // global subtle shimmer feedback
+            context.drawLayer { layer in
+                let shift = sin(time * 0.2) * 12
+                layer.translateBy(x: shift, y: -shift * 0.5)
+                layer.opacity = 0.05
+            }
+            // Ripples
+            for tap in taps {
+                let t = time - tap.start
+                let radius = CGFloat(t * 180)
+                let alpha = max(0, 1 - t * 1.5)
+
+                let rect = CGRect(
+                    x: tap.point.x - radius,
+                    y: tap.point.y - radius,
+                    width: radius * 2,
+                    height: radius * 2
+                )
+
+                context.addFilter(.blur(radius: 12))
+                context.stroke(
+                    Path(ellipseIn: rect),
+                    with: .color(Color.white.opacity(alpha * 0.25)),
+                    lineWidth: 2
+                )
             }
         }
         .frame(width: size.width, height: size.height)

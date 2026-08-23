@@ -1,5 +1,8 @@
 import Foundation
 import Darwin
+#if canImport(UIKit)
+import UIKit
+#endif
 
 enum LlamaRuntimeError: LocalizedError {
     case modelNotFound(expectedFilename: String)
@@ -58,6 +61,12 @@ struct SamplingConfig: Sendable {
 }
 
 final class LlamaRuntime {
+    private struct PromptPrefixSnapshot {
+        let stateData: Data
+        let tokenCount: Int32
+        let tokens: [llama_token]
+    }
+
     private var model: OpaquePointer?
     private var context: OpaquePointer?
     private var vocab: OpaquePointer?
@@ -66,15 +75,31 @@ final class LlamaRuntime {
     private var samplingTopLogits: [Float] = []
     private var samplingProbs: [Float] = []
     private var samplingOrder: [Int] = []
+    private var promptPrefixCache: [String: PromptPrefixSnapshot] = [:]
+    private var promptPrefixCacheOrder: [String] = []
+    private let promptPrefixCacheLimit = 4
 
     var contextSize: Int32
     private let batchSize: Int32
-    private static let silenceLogs: ggml_log_callback = { _, _, _ in }
+    private let threadCount: Int32
+    private let gpuLayerCount: Int32
+    private static let loadLogs: ggml_log_callback = { level, message, _ in
+        guard let message else { return }
+        let text = String(cString: message)
+        print("[Llama][\(level.rawValue)] \(text)")
+    }
 
-    init(modelPath: String, contextSize: Int32) throws {
+    init(modelPath: String, contextSize: Int32, threads: Int32? = nil, isSmallModel: Bool = false) throws {
         self.contextSize = max(1, contextSize)
+        let gpuLayers = Self.recommendedGPULayerCount(
+            modelPath: modelPath,
+            contextSize: self.contextSize,
+            isSmallModel: isSmallModel
+        )
+        self.gpuLayerCount = gpuLayers
+        self.threadCount = threads ?? Self.recommendedThreadCount(gpuLayers: gpuLayers)
 
-        llama_log_set(LlamaRuntime.silenceLogs, nil)
+        llama_log_set(LlamaRuntime.loadLogs, nil)
         print("[Llama] Initializing backend")
         llama_backend_init()
         if let info = llama_print_system_info() {
@@ -82,7 +107,8 @@ final class LlamaRuntime {
         }
 
         var modelParams = llama_model_default_params()
-        modelParams.n_gpu_layers = 0
+        modelParams.n_gpu_layers = gpuLayers
+        print("[Llama] GPU offload layers: \(gpuLayers)")
 
         print("[Llama] Loading model: \(modelPath)")
         guard let model = llama_model_load_from_file(modelPath, modelParams) else {
@@ -98,9 +124,11 @@ final class LlamaRuntime {
             }
         }
 
+        // Для маленькой модели уменьшаем batch size (A15 не тянет 256)
+        let maxBatch = isSmallModel ? 128 : 256
         var ctxParams = llama_context_default_params()
         ctxParams.n_ctx = UInt32(max(1, self.contextSize))
-        ctxParams.n_batch = UInt32(min(256, Int(self.contextSize)))
+        ctxParams.n_batch = UInt32(min(maxBatch, Int(self.contextSize)))
 
         print("[Llama] Creating context (n_ctx=\(ctxParams.n_ctx), n_batch=\(ctxParams.n_batch))")
         guard let ctx = llama_init_from_model(model, ctxParams) else {
@@ -117,9 +145,168 @@ final class LlamaRuntime {
             self.vocab = nil
         }
 
-        let threads = max(1, ProcessInfo.processInfo.activeProcessorCount - 1)
-        print("[Llama] Using threads: \(threads)")
-        llama_set_n_threads(ctx, Int32(threads), Int32(threads))
+        print("[Llama] Using threads: \(self.threadCount)")
+        llama_set_n_threads(ctx, self.threadCount, self.threadCount)
+    }
+
+    private static func recommendedGPULayerCount(
+        modelPath: String,
+        contextSize: Int32,
+        isSmallModel: Bool
+    ) -> Int32 {
+        #if targetEnvironment(simulator)
+        return isSmallModel ? 14 : 22
+        #elseif canImport(UIKit)
+        let model = UIDevice.current.modelName.lowercased()
+        let memoryGB = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824.0
+        let modelSizeGB = estimatedModelSizeInGB(at: modelPath)
+        let lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
+        let thermalState = ProcessInfo.processInfo.thermalState
+
+        var layers: Int32
+
+        if model.contains("iphone 13") || model.contains("iphone 14") {
+            layers = isSmallModel ? 8 : 12
+        } else if model.contains("iphone 15") || model.contains("iphone 16") || model.contains("iphone 17") {
+            layers = isSmallModel ? 14 : 20
+        } else if model.contains("ipad") || model.contains("mac") {
+            layers = isSmallModel ? 20 : 28
+        } else {
+            layers = isSmallModel ? 10 : 15
+        }
+
+        if memoryGB >= 8 {
+            layers += 4
+        } else if memoryGB >= 6 {
+            layers += 2
+        } else if memoryGB <= 4.5 {
+            layers -= 3
+        }
+
+        if modelSizeGB >= 10 {
+            layers -= 6
+        } else if modelSizeGB >= 6 {
+            layers -= 3
+        } else if modelSizeGB > 0, modelSizeGB <= 3.5 {
+            layers += 2
+        }
+
+        if contextSize >= 8_192 {
+            layers -= 4
+        } else if contextSize >= 4_096 {
+            layers -= 2
+        }
+
+        if lowPower {
+            layers -= 4
+        }
+
+        switch thermalState {
+        case .serious:
+            layers -= 4
+        case .critical:
+            layers -= 8
+        default:
+            break
+        }
+
+        let minLayers: Int32 = isSmallModel ? 6 : 8
+        let maxLayers: Int32 = model.contains("ipad") || model.contains("mac") ? 34 : 24
+        return max(minLayers, min(maxLayers, layers))
+        #else
+        let memoryGB = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824.0
+        let modelSizeGB = estimatedModelSizeInGB(at: modelPath)
+        let lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
+        let thermalState = ProcessInfo.processInfo.thermalState
+
+        var layers: Int32
+
+        if model.contains("iphone 13") || model.contains("iphone 14") {
+            layers = isSmallModel ? 8 : 12
+        } else if model.contains("iphone 15") || model.contains("iphone 16") || model.contains("iphone 17") {
+            layers = isSmallModel ? 14 : 20
+        } else if model.contains("ipad") || model.contains("mac") {
+            layers = isSmallModel ? 20 : 28
+        } else {
+            layers = isSmallModel ? 10 : 15
+        }
+
+        if memoryGB >= 8 {
+            layers += 4
+        } else if memoryGB >= 6 {
+            layers += 2
+        } else if memoryGB <= 4.5 {
+            layers -= 3
+        }
+
+        if modelSizeGB >= 10 {
+            layers -= 6
+        } else if modelSizeGB >= 6 {
+            layers -= 3
+        } else if modelSizeGB > 0, modelSizeGB <= 3.5 {
+            layers += 2
+        }
+
+        if contextSize >= 8_192 {
+            layers -= 4
+        } else if contextSize >= 4_096 {
+            layers -= 2
+        }
+
+        if lowPower {
+            layers -= 4
+        }
+
+        switch thermalState {
+        case .serious:
+            layers -= 4
+        case .critical:
+            layers -= 8
+        default:
+            break
+        }
+
+        let minLayers: Int32 = isSmallModel ? 6 : 8
+        let maxLayers: Int32 = 34
+        return max(minLayers, min(maxLayers, layers))
+        #endif
+    }
+
+    private static func recommendedThreadCount(gpuLayers: Int32) -> Int32 {
+        let cpuCount = max(1, ProcessInfo.processInfo.activeProcessorCount)
+        var threads = cpuCount - 1
+
+        if gpuLayers >= 24 {
+            threads -= 2
+        } else if gpuLayers >= 16 {
+            threads -= 1
+        }
+
+        if ProcessInfo.processInfo.isLowPowerModeEnabled {
+            threads -= 1
+        }
+
+        switch ProcessInfo.processInfo.thermalState {
+        case .serious:
+            threads -= 1
+        case .critical:
+            threads -= 2
+        default:
+            break
+        }
+
+        return Int32(max(1, threads))
+    }
+
+    private static func estimatedModelSizeInGB(at path: String) -> Double {
+        guard
+            let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+            let fileSize = attributes[.size] as? NSNumber
+        else {
+            return 0
+        }
+
+        return fileSize.doubleValue / 1_073_741_824.0
     }
 
     deinit {
@@ -151,11 +338,33 @@ final class LlamaRuntime {
         self.context = newCtx
         self.tokenCount = 0
 
-        let threads = max(1, ProcessInfo.processInfo.activeProcessorCount - 1)
-        llama_set_n_threads(newCtx, Int32(threads), Int32(threads))
+        let threads = Self.recommendedThreadCount(gpuLayers: gpuLayerCount)
+        llama_set_n_threads(newCtx, threads, threads)
+        promptPrefixCache.removeAll()
+        promptPrefixCacheOrder.removeAll()
     }
 
     func generateStream(
+        prompt: String,
+        maxTokens: Int,
+        kvInjection: KVInjection? = nil,
+        sampling: SamplingConfig = .default,
+        shouldStop: () -> Bool,
+        onToken: (String) -> Void
+    ) throws {
+        try generateStream(
+            promptPrefix: "",
+            prompt: prompt,
+            maxTokens: maxTokens,
+            kvInjection: kvInjection,
+            sampling: sampling,
+            shouldStop: shouldStop,
+            onToken: onToken
+        )
+    }
+
+    func generateStream(
+        promptPrefix: String,
         prompt: String,
         maxTokens: Int,
         kvInjection: KVInjection? = nil,
@@ -169,28 +378,65 @@ final class LlamaRuntime {
 
         if shouldStop() { return }
 
-        // We re-decode the full prompt each request; keep KV cache clean.
-        if tokenCount > 0 {
-            try rebuildContext()
-            guard let refreshed = context else {
-                throw LlamaRuntimeError.contextInitFailed
-            }
-            ctx = refreshed
+        let prefixKey = promptPrefix.isEmpty ? nil : promptPrefix
+        print("[Llama] Tokenizing prompt (prefixLen=\(promptPrefix.count), suffixLen=\(prompt.count))")
+        let cachedPrefix = prefixKey.flatMap { promptPrefixCache[$0] }
+        let prefixTokens: [llama_token]
+        if let cachedPrefix {
+            prefixTokens = cachedPrefix.tokens
+        } else if promptPrefix.isEmpty {
+            prefixTokens = []
+        } else {
+            prefixTokens = try tokenize(promptPrefix, vocab: vocab)
         }
 
-        print("[Llama] Tokenizing prompt (len=\(prompt.count))")
-        let promptTokens = try tokenize(prompt, vocab: vocab)
+        let suffixTokens = try tokenize(prompt, vocab: vocab)
         let maxPromptTokens = max(1, Int(contextSize) - 256)
-        let tokensForDecode: [llama_token]
-        if promptTokens.count > maxPromptTokens {
-            print("[Llama] Prompt too long (\(promptTokens.count) tokens). Trimming to \(maxPromptTokens).")
-            tokensForDecode = Array(promptTokens.suffix(maxPromptTokens))
-            tokenCount = 0
-        } else {
-            tokensForDecode = promptTokens
+        let allPromptTokens = prefixTokens + suffixTokens
+        let promptTooLong = allPromptTokens.count > maxPromptTokens
+        let canReusePrefix = prefixKey != nil && !promptTooLong && cachedPrefix != nil
+
+        if tokenCount > 0 {
+            if !canReusePrefix {
+                try rebuildContext()
+                guard let refreshed = context else {
+                    throw LlamaRuntimeError.contextInitFailed
+                }
+                ctx = refreshed
+            }
         }
-        // Sync tokenCount after (re)building prompt tokens
-        tokenCount = Int32(tokensForDecode.count)
+
+        var didRestorePrefix = false
+        if let cachedPrefix, canReusePrefix {
+            let restored = try restorePromptSnapshot(cachedPrefix, into: &ctx)
+            if restored {
+                tokenCount = cachedPrefix.tokenCount
+                didRestorePrefix = true
+            } else {
+                try rebuildContext()
+                guard let refreshed = context else {
+                    throw LlamaRuntimeError.contextInitFailed
+                }
+                ctx = refreshed
+            }
+        }
+
+        let prefixDecodeTokens: [llama_token]
+        let suffixDecodeTokens: [llama_token]
+        if promptTooLong {
+            print("[Llama] Prompt too long (\(allPromptTokens.count) tokens). Trimming to \(maxPromptTokens).")
+            let decodeTokens = Array(allPromptTokens.suffix(maxPromptTokens))
+            prefixDecodeTokens = []
+            suffixDecodeTokens = decodeTokens
+            tokenCount = 0
+        } else if didRestorePrefix {
+            prefixDecodeTokens = []
+            suffixDecodeTokens = suffixTokens
+        } else {
+            prefixDecodeTokens = prefixTokens
+            suffixDecodeTokens = suffixTokens
+            tokenCount = 0
+        }
 
         func decodeChunk(_ chunk: [llama_token]) throws {
             if chunk.isEmpty { return }
@@ -220,10 +466,26 @@ final class LlamaRuntime {
         }
 
         var index = 0
-        while index < tokensForDecode.count {
+        while index < prefixDecodeTokens.count {
             if shouldStop() { return }
-            let end = min(tokensForDecode.count, index + Int(batchSize))
-            let slice = Array(tokensForDecode[index..<end])
+            let end = min(prefixDecodeTokens.count, index + Int(batchSize))
+            let slice = Array(prefixDecodeTokens[index..<end])
+            try decodeChunk(slice)
+            index = end
+        }
+
+        if let prefixKey,
+           promptPrefix.isEmpty == false,
+           promptPrefixCache[prefixKey] == nil,
+           prefixDecodeTokens.count == prefixTokens.count {
+            cachePromptPrefix(prefixKey, ctx: ctx, tokens: prefixTokens)
+        }
+
+        index = 0
+        while index < suffixDecodeTokens.count {
+            if shouldStop() { return }
+            let end = min(suffixDecodeTokens.count, index + Int(batchSize))
+            let slice = Array(suffixDecodeTokens[index..<end])
             try decodeChunk(slice)
             index = end
         }
@@ -247,42 +509,16 @@ final class LlamaRuntime {
             print("[Llama] Capping maxTokens to \(generationLimit) to fit context.")
         }
 
-        let repeatWindow = max(0, sampling.repeatLastN)
-        var recentRing: [llama_token] = repeatWindow > 0
-            ? [llama_token](repeating: 0, count: repeatWindow)
-            : []
-        var recentCounts: [Int: Int] = [:]
-        if repeatWindow > 0 {
-            recentCounts.reserveCapacity(repeatWindow)
+        let sampler = try buildSamplerChain(sampling: sampling)
+        defer { llama_sampler_free(sampler) }
+
+        for token in prefixDecodeTokens + suffixDecodeTokens {
+            llama_sampler_accept(sampler, token)
         }
-        var recentUsed = 0
-        var recentHead = 0
 
         for _ in 0..<generationLimit {
             if shouldStop() { return }
-            guard let logits = llama_get_logits_ith(ctx, -1) else { break }
-            let nVocab = Int(llama_vocab_n_tokens(vocab))
-
-            let token: llama_token
-            if sampling.temperature <= 0 {
-                var bestToken = 0
-                var bestLogit = -Float.greatestFiniteMagnitude
-                for i in 0..<nVocab {
-                    let v = logits[i]
-                    if v > bestLogit {
-                        bestLogit = v
-                        bestToken = i
-                    }
-                }
-                token = llama_token(bestToken)
-            } else {
-                token = sampleToken(
-                    logits: logits,
-                    nVocab: nVocab,
-                    sampling: sampling,
-                    recentTokenCounts: recentCounts
-                )
-            }
+            let token = llama_sampler_sample(sampler, ctx, -1)
             if llama_vocab_is_eog(vocab, token) { break }
 
             var nextTokens = [token]
@@ -299,30 +535,7 @@ final class LlamaRuntime {
                 throw LlamaRuntimeError.decodeFailed(code: decodeResult)
             }
 
-            if repeatWindow > 0 {
-                if recentUsed < repeatWindow {
-                    recentRing[recentUsed] = token
-                    recentUsed += 1
-                } else {
-                    let oldToken = recentRing[recentHead]
-                    let oldIndex = Int(oldToken)
-                    if let oldCount = recentCounts[oldIndex] {
-                        if oldCount <= 1 {
-                            recentCounts.removeValue(forKey: oldIndex)
-                        } else {
-                            recentCounts[oldIndex] = oldCount - 1
-                        }
-                    }
-                    recentRing[recentHead] = token
-                    recentHead += 1
-                    if recentHead == repeatWindow {
-                        recentHead = 0
-                    }
-                }
-
-                let idx = Int(token)
-                recentCounts[idx, default: 0] += 1
-            }
+            llama_sampler_accept(sampler, token)
 
             if let bytes = tokenToPieceBytes(token, vocab: vocab) {
                 utf8Buffer.append(contentsOf: bytes)
@@ -394,11 +607,90 @@ final class LlamaRuntime {
         return Array(tokens.prefix(Int(count)))
     }
 
+    private func cachePromptPrefix(_ key: String, ctx: OpaquePointer, tokens: [llama_token]) {
+        let stateSize = llama_state_get_size(ctx)
+        guard stateSize > 0 else { return }
+
+        var bytes = [UInt8](repeating: 0, count: Int(stateSize))
+        let copied = bytes.withUnsafeMutableBytes { buffer -> size_t in
+            guard let base = buffer.baseAddress else { return 0 }
+            return llama_state_get_data(ctx, base.assumingMemoryBound(to: UInt8.self), stateSize)
+        }
+        guard copied > 0 else { return }
+
+        let snapshot = PromptPrefixSnapshot(
+            stateData: Data(bytes: bytes),
+            tokenCount: tokenCount,
+            tokens: tokens
+        )
+        promptPrefixCache[key] = snapshot
+        promptPrefixCacheOrder.removeAll { $0 == key }
+        promptPrefixCacheOrder.append(key)
+        if promptPrefixCacheOrder.count > promptPrefixCacheLimit,
+           let evicted = promptPrefixCacheOrder.first {
+            promptPrefixCache.removeValue(forKey: evicted)
+            promptPrefixCacheOrder.removeFirst()
+        }
+    }
+
+    private func restorePromptSnapshot(_ snapshot: PromptPrefixSnapshot, into ctx: inout OpaquePointer) throws -> Bool {
+        guard !snapshot.stateData.isEmpty else { return false }
+        let restored = snapshot.stateData.withUnsafeBytes { raw -> size_t in
+            guard let base = raw.baseAddress else { return 0 }
+            return llama_state_set_data(ctx, base.assumingMemoryBound(to: UInt8.self), snapshot.stateData.count)
+        }
+        return restored > 0
+    }
+
     private func tokenToPieceBytes(_ token: llama_token, vocab: OpaquePointer) -> [UInt8]? {
         var buffer = [Int8](repeating: 0, count: 4096)
         let length = llama_token_to_piece(vocab, token, &buffer, Int32(buffer.count), 0, false)
         if length <= 0 { return nil }
         return buffer.prefix(Int(length)).map { UInt8(bitPattern: $0) }
+    }
+
+    private func buildSamplerChain(
+        sampling: SamplingConfig
+    ) throws -> UnsafeMutablePointer<llama_sampler> {
+        var params = llama_sampler_chain_default_params()
+        params.no_perf = true
+
+        guard let chain = llama_sampler_chain_init(params) else {
+            throw LlamaRuntimeError.contextInitFailed
+        }
+
+        let repeatLastN = max(0, sampling.repeatLastN)
+        let penaltyRepeat = max(1.0, sampling.repetitionPenalty)
+        let penaltyFreq: Float = penaltyRepeat > 1.03 ? 0.04 : 0.0
+        let penaltyPresent: Float = penaltyRepeat > 1.03 ? 0.02 : 0.0
+
+        if let penalties = llama_sampler_init_penalties(
+            repeatLastN == 0 ? -1 : Int32(repeatLastN),
+            penaltyRepeat,
+            penaltyFreq,
+            penaltyPresent
+        ) {
+            llama_sampler_chain_add(chain, penalties)
+        }
+
+        if let sampler = llama_sampler_init_top_k(Int32(max(1, sampling.topK))) {
+            llama_sampler_chain_add(chain, sampler)
+        }
+
+        if let sampler = llama_sampler_init_top_p(max(0.05, min(1.0, sampling.topP)), 1) {
+            llama_sampler_chain_add(chain, sampler)
+        }
+
+        if let sampler = llama_sampler_init_temp(max(0.0, sampling.temperature)) {
+            llama_sampler_chain_add(chain, sampler)
+        }
+
+        let seed = UInt32.random(in: UInt32.min...UInt32.max)
+        if let sampler = llama_sampler_init_dist(seed) {
+            llama_sampler_chain_add(chain, sampler)
+        }
+
+        return chain
     }
     
     private func utf8DecodableCutoffIndex(_ bytes: [UInt8]) -> Int {
@@ -572,25 +864,6 @@ private extension LlamaRuntime {
 
 private extension LlamaRuntime {
     func projectFieldVector(_ field: [Double], targetCount: Int) -> [Float] {
-        guard !field.isEmpty else { return [] }
-        let target = max(1, targetCount)
-        if field.count == target {
-            return field.map { Float($0) }
-        }
-        var out: [Float] = []
-        out.reserveCapacity(target)
-        let chunkSize = Double(field.count) / Double(target)
-        for i in 0..<target {
-            let start = Int(Double(i) * chunkSize)
-            let end = min(field.count, Int(Double(i + 1) * chunkSize))
-            if start >= end {
-                out.append(0)
-                continue
-            }
-            let slice = field[start..<end]
-            let avg = slice.reduce(0.0, +) / Double(slice.count)
-            out.append(Float(avg))
-        }
-        return out
+        TurboQuantCodec.compressedVector(for: field, targetCount: targetCount)
     }
 }

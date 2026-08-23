@@ -3,6 +3,7 @@ import Foundation
 enum QuantumFeatures {
     static let memorySearchEnabledKey = "quantum.memorySearch.enabled"
     static let snippetParserEnabledKey = "quantum.snippetParser.enabled"
+    static let turboQuantEnabledKey = "quantum.turboQuant.enabled"
 
     static func isMemorySearchEnabled(defaults: UserDefaults = .standard) -> Bool {
         defaults.object(forKey: memorySearchEnabledKey) as? Bool ?? true
@@ -10,5 +11,9 @@ enum QuantumFeatures {
 
     static func isSnippetParserEnabled(defaults: UserDefaults = .standard) -> Bool {
         defaults.object(forKey: snippetParserEnabledKey) as? Bool ?? true
+    }
+
+    static func isTurboQuantEnabled(defaults: UserDefaults = .standard) -> Bool {
+        defaults.object(forKey: turboQuantEnabledKey) as? Bool ?? true
     }
 }

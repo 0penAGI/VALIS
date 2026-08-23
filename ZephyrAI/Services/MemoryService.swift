@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(UIKit)
 import UIKit
+#endif
 
 struct Memory: Identifiable, Codable {
     let id: UUID
@@ -131,6 +133,7 @@ class MemoryService: ObservableObject {
     @Published private(set) var echoGraph: CognitiveEchoGraph = CognitiveEchoGraph()
     @Published private(set) var conversationSummary: String = ""
     @Published private(set) var userProfile: UserProfile = UserProfile()
+    private var memoryIndex = ApproximateMemoryIndex()
 
     private var spontaneousTask: Task<Void, Never>?
     private var lastAutonomousAt: Date?
@@ -251,13 +254,29 @@ class MemoryService: ObservableObject {
         return vector
     }
 
+    // Most internal VALIS embeddings are already unit-normalized, so a dot
+    // product gives us cosine similarity without repeated norm calculations.
+    private func normalizedSimilarity(a: [Double], b: [Double]) -> Double {
+        guard a.count == b.count else { return 0 }
+        var dot = 0.0
+        for i in 0..<a.count {
+            dot += a[i] * b[i]
+        }
+        return dot
+    }
+
     private func findRelatedMemories(embedding: [Double]) -> [UUID] {
         guard !embedding.isEmpty else { return [] }
 
         var result: [UUID] = []
 
-        for mem in memories {
-            let sim = cosineSimilarity(a: embedding, b: mem.embedding)
+        let candidateIds = memoryIndex.candidates(for: embedding, limit: 64)
+        let candidateMemories: [Memory] = candidateIds.isEmpty
+            ? memories
+            : candidateIds.compactMap { id in memories.first(where: { $0.id == id }) }
+
+        for mem in candidateMemories {
+            let sim = normalizedSimilarity(a: embedding, b: mem.embedding)
             if sim > 0.85 {
                 result.append(mem.id)
             }
@@ -266,7 +285,7 @@ class MemoryService: ObservableObject {
         return result
     }
 
-    private func cosineSimilarity(a: [Double], b: [Double]) -> Double {
+    func cosineSimilarity(a: [Double], b: [Double]) -> Double {
         guard a.count == b.count else { return 0 }
 
         var dot = 0.0
@@ -456,7 +475,7 @@ class MemoryService: ObservableObject {
         let lastIndex = memories.indices.last!
         let m = memories[lastIndex]
         let userEmbedding = generateEmbedding(from: text)
-        let score = cosineSimilarity(a: m.embedding, b: userEmbedding)
+        let score = normalizedSimilarity(a: m.embedding, b: userEmbedding)
         let instantaneousError = max(0.0, 1.0 - score)
         let accumulatedError = min(2.5, (m.predictionError * 0.9) + (instantaneousError * 1.1))
         let errorBoost = instantaneousError * 0.22
@@ -488,6 +507,38 @@ class MemoryService: ObservableObject {
         saveMemories()
         rebuildGraph()
     }
+
+    func applyUserCorrection() {
+        guard !memories.isEmpty else { return }
+        markUserSignal()
+        let lastIndex = memories.indices.last!
+        let m = memories[lastIndex]
+        
+        // Дискретный удар по predictionError и importance
+        let newPredictionError = min(2.5, m.predictionError + 0.4)
+        let newImportance = max(0.1, m.importance * 0.85)
+        
+        memories[lastIndex] = Memory(
+            id: m.id,
+            content: m.content,
+            timestamp: m.timestamp,
+            emotion: m.emotion,
+            emotionValence: m.emotionValence,
+            emotionIntensity: m.emotionIntensity,
+            embedding: m.embedding,
+            links: m.links,
+            importance: newImportance,
+            predictionScore: m.predictionScore,
+            predictionError: newPredictionError,
+            isIdentity: m.isIdentity,
+            isPinned: m.isPinned,
+            lastAccess: m.lastAccess,
+            isSelfReflection: m.isSelfReflection,
+            perspective: m.perspective
+        )
+        saveMemories()
+        rebuildGraph()
+    }
     
     func deleteMemory(id: UUID) {
         memories.removeAll { $0.id == id }
@@ -505,12 +556,14 @@ class MemoryService: ObservableObject {
         // 1. Try to load from Documents directory (User generated)
         if let savedMemories = loadFromDocuments() {
             self.memories = savedMemories
+            memoryIndex.rebuild(from: savedMemories)
             return
         }
         
         // 2. Try to load from Bundle (Pre-seeded "we already have a memories")
         if let bundledMemories = loadFromBundle() {
             self.memories = bundledMemories
+            memoryIndex.rebuild(from: bundledMemories)
             // Also save them to documents so we can edit them later
             saveMemories()
         }
@@ -657,7 +710,8 @@ class MemoryService: ObservableObject {
                 try await Task.sleep(nanoseconds: self.echoTickInterval)
                 await MainActor.run {
                     self.echoGraph.resonanceStep()
-                    self.echoGraph.decay()
+                    let contextEmbedding = self.echoGraph.fieldVector()
+                    self.echoGraph.decay(contextEmbedding: contextEmbedding)
                     self.echoGraph.spontaneousActivation()
                 }
             }
@@ -696,6 +750,7 @@ class MemoryService: ObservableObject {
 
         graph = rebuiltGraph
         echoGraph = rebuiltEchoGraph
+        memoryIndex.rebuild(from: memories)
         saveGraph()
         saveEchoGraph()
     }
@@ -750,27 +805,38 @@ class MemoryService: ObservableObject {
         }
     }
 
-    // Compress memory to reduce context noise
-    private func compressMemory(_ text: String, maxWords: Int = 24) -> String {
-        let seps = CharacterSet.alphanumerics.inverted
-        let tokens = text
-            .lowercased()
-            .components(separatedBy: seps)
+    // Keep memory compact without destroying the original language or phrasing.
+    private func compressMemory(_ text: String, maxChars: Int = 160) -> String {
+        let cleaned = text
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else { return "" }
+
+        let fragments = cleaned
+            .split(whereSeparator: { $0 == "." || $0 == "!" || $0 == "?" || $0 == "\n" })
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
 
-        // Remove weak filler words
-        let stop: Set<String> = [
-            "the","and","a","an","to","in","on","for","of","with","at","by","from","or","as",
-            "is","are","was","were","be","been","being","it","this","that","these","those",
-            "i","you","he","she","we","they","me","my","your","his","her","our","their"
-        ]
+        var selected: [String] = []
+        var total = 0
 
-        let filtered = tokens.filter { $0.count > 3 && !stop.contains($0) }
+        for fragment in fragments {
+            let addition = selected.isEmpty ? fragment.count : fragment.count + 2
+            if total + addition > maxChars {
+                break
+            }
+            selected.append(fragment)
+            total += addition
+            if selected.count >= 2 {
+                break
+            }
+        }
 
-        // Take most information-dense words
-        let important = filtered.prefix(maxWords)
-
-        return important.joined(separator: " ")
+        let compact = selected.isEmpty ? cleaned : selected.joined(separator: ". ")
+        if compact.count <= maxChars {
+            return compact
+        }
+        return String(compact.prefix(maxChars)).trimmingCharacters(in: .whitespacesAndNewlines) + "…"
     }
     
     func getContextBlock() -> String {
@@ -780,18 +846,25 @@ class MemoryService: ObservableObject {
     /// LLM-facing memory block. This intentionally avoids the full "field snapshot" framing
     /// to reduce templating/stamp effects in answers.
     func getLLMContextBlock(maxChars: Int) -> String {
-        getLLMContextBlock(maxChars: maxChars, forUserText: "", candidateLimit: 3)
+        getLLMContextBlock(maxChars: maxChars, forUserText: "", candidateLimit: 3, contextShift: 0)
     }
 
-    func getLLMContextBlock(maxChars: Int, forUserText userText: String, candidateLimit: Int = 3) -> String {
+    func getLLMContextBlock(maxChars: Int, forUserText userText: String, candidateLimit: Int = 3, contextShift: Double = 0) -> String {
         if memories.isEmpty { return "" }
         if maxChars <= 0 { return "" }
 
         let now = Date()
         let baseField = echoGraph.fieldVector()
-        let field = attendedField(baseField: baseField, queryText: userText, memoryPool: visibleMemories())
+        let normalizedContextShift = max(0.0, min(1.0, contextShift))
+        let field = attendedField(
+            baseField: baseField,
+            queryText: userText,
+            memoryPool: visibleMemories(),
+            contextShift: normalizedContextShift
+        )
         let novelty = recentNoveltySignal(window: noveltyWindowSize)
         let dynamicThreshold = dynamicContextGateThreshold(novelty: novelty)
+        let queryConcepts = Set(extractConcepts(from: userText))
 
         let predicted = MarkovMemoryLayer.shared.predictNextStates(from: userText, topK: 6)
         let predictedSet = Set(predicted)
@@ -810,6 +883,15 @@ class MemoryService: ObservableObject {
                     return nil
                 }
                 var score = relevanceScore(for: mem, field: field, now: now)
+                if normalizedContextShift > 0.35, !queryConcepts.isEmpty {
+                    let memoryConcepts = Set(extractConcepts(from: mem.content))
+                    let overlap = queryConcepts.intersection(memoryConcepts).count
+                    let overlapScore = Double(overlap) / Double(max(1, queryConcepts.count))
+                    score += overlapScore * 0.34
+                    if overlap == 0 {
+                        score -= 0.22 * normalizedContextShift
+                    }
+                }
                 if !predictedSet.isEmpty {
                     let concepts = Set(extractConcepts(from: mem.content))
                     if !concepts.isDisjoint(with: predictedSet) {
@@ -819,15 +901,15 @@ class MemoryService: ObservableObject {
                 return QuantumMemoryService.Candidate(memory: mem, activation: activation, score: score)
             }
 
-        let sorted = candidates.sorted { $0.score > $1.score }
-        guard !sorted.isEmpty else { return "" }
+        guard !candidates.isEmpty else { return "" }
 
         let selected: [QuantumMemoryService.Candidate] = {
-            let selectionCount = max(1, candidateLimit)
-            let pinned = sorted.filter { $0.memory.isPinned }
-            let reservedPinned = Array(pinned.prefix(min(2, selectionCount)))
+            let narrowedLimit = normalizedContextShift > 0.60 ? max(1, candidateLimit - 1) : candidateLimit
+            let selectionCount = max(1, narrowedLimit)
+            let pinned = candidates.filter { $0.memory.isPinned }
+            let reservedPinned = topK(pinned, count: min(2, selectionCount), by: { $0.score > $1.score })
             let remainingSlots = max(0, selectionCount - reservedPinned.count)
-            let pool = sorted.filter { candidate in
+            let poolCandidates = candidates.filter { candidate in
                 !reservedPinned.contains(where: { $0.memory.id == candidate.memory.id })
             }
             if remainingSlots == 0 {
@@ -835,18 +917,19 @@ class MemoryService: ObservableObject {
             }
             guard QuantumFeatures.isMemorySearchEnabled(),
                   QuantumMemoryService.shared.isEnabled(),
-                  pool.count > 1 else {
-                return reservedPinned + Array(pool.prefix(remainingSlots))
+                  poolCandidates.count > 1 else {
+                return reservedPinned + topK(poolCandidates, count: remainingSlots, by: { $0.score > $1.score })
             }
+            let seedCandidates = topK(poolCandidates, count: min(32, poolCandidates.count), by: { $0.score > $1.score })
             let motivators = MotivationService.shared.state
             let enableTrace = QuantumMemoryService.shared.isTraceEnabled()
             let seed: UInt64? = {
                 if let configured = QuantumMemoryService.shared.configuredSeed() { return configured }
                 guard QuantumMemoryService.shared.isDeterministic() else { return nil }
-                return deterministicSeed(candidates: pool, motivators: motivators, userText: userText)
+                return deterministicSeed(candidates: seedCandidates, motivators: motivators, userText: userText)
             }()
             let result = QuantumMemoryService.shared.collapse(
-                candidates: pool,
+                candidates: poolCandidates,
                 k: remainingSlots,
                 motivators: motivators,
                 seed: seed,
@@ -878,15 +961,15 @@ class MemoryService: ObservableObject {
                 if node.memory.isPinned { return "[pinned] " }
                 return ""
             }()
-            let compressed = compressMemory(node.memory.content, maxWords: 24)
+            let compressed = compressMemory(node.memory.content, maxChars: 160)
             let text = (prefix + compressed).trimmingCharacters(in: .whitespacesAndNewlines)
             if text.isEmpty { continue }
             lines.append("- \(text)")
             referencedIds.append(node.memory.id)
         }
 
-        for memory in episodicSelected {
-            let cleaned = compressMemory(cleanHiddenMemoryContent(memory.content), maxWords: 18)
+        for memory in episodicSelected.prefix(normalizedContextShift > 0.60 ? 1 : episodicCandidateLimit) {
+            let cleaned = compressMemory(cleanHiddenMemoryContent(memory.content), maxChars: 120)
             guard !cleaned.isEmpty else { continue }
             lines.append("- [recent lived] \(cleaned)")
             referencedIds.append(memory.id)
@@ -956,7 +1039,12 @@ class MemoryService: ObservableObject {
         let avgValence = affectSample.map { $0.emotionValence }.reduce(0.0, +) / Double(max(1, affectSample.count))
         let avgIntensity = affectSample.map { $0.emotionIntensity }.reduce(0.0, +) / Double(max(1, affectSample.count))
 
-        let candidates = visibleMemories
+        let approxIds = memoryIndex.candidates(for: field, limit: 96)
+        let approxVisible = approxIds.isEmpty
+            ? visibleMemories
+            : approxIds.compactMap { id in visibleMemories.first(where: { $0.id == id }) }
+
+        let candidates = approxVisible
             .compactMap { mem -> QuantumMemoryService.Candidate? in
                 let activation = echoGraph.activation(for: mem.id)
                 guard contextGatePass(
@@ -1010,11 +1098,11 @@ class MemoryService: ObservableObject {
         recordAccess(for: nodeIds)
 
         let topText: String? = {
-            guard let top = selectedNodes.first else { return nil }
+            guard let top = selectedNodes.first else { return String?.none }
             let includeText = activationLevel >= dynamicThreshold || novelty > 0.7
-            guard includeText else { return nil }
-            let compressed = compressMemory(top.memory.content, maxWords: 18)
-            return compressed.isEmpty ? nil : "T: \(compressed)"
+            guard includeText else { return String?.none }
+            let compressed = compressMemory(top.memory.content, maxChars: 120)
+            return compressed.isEmpty ? String?.none : "T: \(compressed)"
         }()
 
         let meanActivation = echoGraph.averageActivation(excludingPersistent: false)
@@ -1026,6 +1114,11 @@ class MemoryService: ObservableObject {
         }
         parts.append("A: mean=\(fmt(meanActivation)), gate=\(fmt(dynamicThreshold)), nov=\(fmt(novelty))")
         parts.append("E: v=\(fmt(avgValence)), i=\(fmt(avgIntensity))")
+        
+        // ECHO строка: эмоция + identity summary для синхронизации тона
+        let emotionLabel = EmotionService.shared.state.label
+        let identitySummary = IdentityProfileService.shared.current.summary
+        parts.append("ECHO: \(emotionLabel) \(identitySummary)")
 
         if !nodeLines.isEmpty {
             parts.append("L1:")
@@ -1081,7 +1174,7 @@ class MemoryService: ObservableObject {
         motivators: MotivatorState,
         preferences: UserPreferenceProfile
     ) -> String {
-        var text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        var text = draft
         text = normalizeWhitespace(text)
         text = removeDuplicateLines(text)
 
@@ -1089,7 +1182,7 @@ class MemoryService: ObservableObject {
             text = ensureReadableParagraphs(text)
         }
 
-        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return text
     }
 
     private func isSensitiveHighRiskPrompt(_ prompt: String) -> Bool {
@@ -1144,9 +1237,9 @@ class MemoryService: ObservableObject {
             while out.contains("  ") {
                 out = out.replacingOccurrences(of: "  ", with: " ")
             }
-            return out.trimmingCharacters(in: .whitespaces)
+            return out
         }
-        return normalized.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized.joined(separator: "\n")
     }
 
     private func removeDuplicateLines(_ text: String) -> String {
@@ -1162,10 +1255,10 @@ class MemoryService: ObservableObject {
             if let last = lastNonEmpty, last == trimmed {
                 continue
             }
-            out.append(trimmed)
+            out.append(line)
             lastNonEmpty = trimmed
         }
-        return out.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        return out.joined(separator: "\n")
     }
 
     private func ensureReadableParagraphs(_ text: String) -> String {
@@ -1213,12 +1306,12 @@ class MemoryService: ObservableObject {
         if !field.isEmpty,
            !memory.embedding.isEmpty,
            memory.embedding.count == field.count {
-            score += cosineSimilarity(a: memory.embedding, b: field)
+            score += normalizedSimilarity(a: memory.embedding, b: field)
         }
         return score
     }
 
-    private func attendedField(baseField: [Double], queryText: String, memoryPool: [Memory]) -> [Double] {
+    private func attendedField(baseField: [Double], queryText: String, memoryPool: [Memory], contextShift: Double = 0) -> [Double] {
         guard !baseField.isEmpty else { return [] }
         let queryEmbedding = generateEmbedding(from: queryText)
         let anchors = memoryPool.filter { $0.embedding.count == baseField.count && !$0.embedding.isEmpty }
@@ -1226,9 +1319,9 @@ class MemoryService: ObservableObject {
 
         let scored = anchors.map { memory -> (memory: Memory, score: Double) in
             let querySim = queryEmbedding.count == memory.embedding.count
-                ? max(0.0, cosineSimilarity(a: queryEmbedding, b: memory.embedding))
+                ? max(0.0, normalizedSimilarity(a: queryEmbedding, b: memory.embedding))
                 : 0.0
-            let latentSim = max(0.0, cosineSimilarity(a: baseField, b: memory.embedding))
+            let latentSim = max(0.0, normalizedSimilarity(a: baseField, b: memory.embedding))
             let pinBias = memory.isPinned ? 0.25 : 0.0
             let identityBias = memory.isIdentity ? 0.18 : 0.0
             let activationBias = min(1.0, echoGraph.activation(for: memory.id)) * 0.22
@@ -1251,7 +1344,10 @@ class MemoryService: ObservableObject {
             }
         }
 
-        let blend = queryText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? 0.32 : 0.48
+        let shift = max(0.0, min(1.0, contextShift))
+        let blend = queryText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? 0.32
+            : min(0.74, 0.48 + (shift * 0.22))
         var merged = Array(repeating: 0.0, count: baseField.count)
         for dim in merged.indices {
             merged[dim] = (baseField[dim] * (1.0 - blend)) + (attended[dim] * blend)
@@ -1360,14 +1456,15 @@ class MemoryService: ObservableObject {
             let score = episodicScore(for: memory, field: field, now: now, queryText: userText)
             return (memory, score)
         }
-        .sorted { lhs, rhs in
+        
+        let ranked = topK(scored, count: episodicCandidateLimit, by: { lhs, rhs in
             if lhs.score == rhs.score {
                 return lhs.memory.timestamp > rhs.memory.timestamp
             }
             return lhs.score > rhs.score
-        }
+        })
 
-        return Array(scored.prefix(episodicCandidateLimit).map(\.memory))
+        return ranked.map(\.memory)
     }
 
     private func formatFieldVector(_ field: [Double], targetCount: Int) -> String {
@@ -1472,7 +1569,7 @@ class MemoryService: ObservableObject {
     func updateConversationSummary(fromUserText text: String) {
         Task { @MainActor in
             self.markUserSignal()
-            let compressed = compressMemory(text, maxWords: 18)
+            let compressed = compressMemory(text, maxChars: 120)
             let next = conversationSummary.isEmpty
                 ? "U: \(compressed)"
                 : conversationSummary + " | U: \(compressed)"
@@ -1569,6 +1666,11 @@ class MemoryService: ObservableObject {
     }
 
     private func fetchAutonomousSnippets(for topic: String) async -> [String] {
+        let autonomousModuleSnippets = await ActionService.shared.autonomousSnippets(for: topic)
+        if !autonomousModuleSnippets.isEmpty {
+            return autonomousModuleSnippets
+        }
+
         let sources: [any AutonomousMemorySource] = [
             WikipediaSource(),
             DuckDuckGoSource()
@@ -1643,10 +1745,10 @@ class MemoryService: ObservableObject {
         let candidates = memories
             .filter { !$0.isIdentity && !$0.isPinned }
             .filter { !$0.embedding.isEmpty && $0.content.count >= 24 }
-            .sorted { $0.timestamp > $1.timestamp }
-        guard candidates.count >= 4 else { return }
+        let sorted = topK(candidates, count: 72, by: { $0.timestamp > $1.timestamp })
+        guard sorted.count >= 4 else { return }
 
-        let window = Array(candidates.prefix(72))
+        let window = sorted
         var bestPair: (Memory, Memory, Double)?
 
         for i in 0..<window.count {
@@ -1655,7 +1757,7 @@ class MemoryService: ObservableObject {
                 let rhs = window[j]
                 guard lhs.embedding.count == rhs.embedding.count else { continue }
 
-                let similarity = cosineSimilarity(a: lhs.embedding, b: rhs.embedding)
+                let similarity = normalizedSimilarity(a: lhs.embedding, b: rhs.embedding)
                 guard similarity >= 0.9 else { continue }
 
                 let lhsConcepts = Set(extractConcepts(from: lhs.content))
@@ -1733,12 +1835,12 @@ class MemoryService: ObservableObject {
             let quality = rating.confidence * rating.relevance
             return (snippet, rating.confidence, rating.relevance, quality)
         }
-        .sorted { $0.quality > $1.quality }
 
         let selected: [(snippet: String, confidence: Double, relevance: Double, quality: Double)]
         if QuantumMemoryService.shared.isEnabled(), scored.count > maxCount {
             let motivators = MotivationService.shared.state
-            let candidates = scored.map { item in
+            let candidateScored = topK(scored, count: maxCount, by: { $0.quality > $1.quality })
+            let candidates = candidateScored.map { item in
                 QuantumMemoryService.Candidate(
                     memory: buildCognitiveLayer(
                         for: "[external:\(source)] \(item.snippet)",
@@ -1756,9 +1858,9 @@ class MemoryService: ObservableObject {
                 enableTrace: QuantumMemoryService.shared.isTraceEnabled()
             )
             let selectedKeys = Set(result.selected.map { normalizeForDedup($0.memory.content) })
-            selected = scored.filter { selectedKeys.contains(normalizeForDedup("[external:\(source)] \($0.snippet)")) }
+            selected = candidateScored.filter { selectedKeys.contains(normalizeForDedup("[external:\(source)] \($0.snippet)")) }
         } else {
-            selected = Array(scored.prefix(maxCount))
+            selected = topK(scored, count: maxCount, by: { $0.quality > $1.quality })
         }
 
         for item in selected {
@@ -1794,7 +1896,7 @@ class MemoryService: ObservableObject {
         let trimmed = snippet.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [] }
 
-        let keywords = compressMemory(trimmed, maxWords: 28)
+        let keywords = compressMemory(trimmed, maxChars: 180)
         let concepts = extractConcepts(from: trimmed)
         let conceptLine = concepts.isEmpty ? "" : concepts.prefix(14).joined(separator: " ")
 
@@ -1824,7 +1926,7 @@ class MemoryService: ObservableObject {
     func rateExternalSnippet(snippet: String, query: String) -> (confidence: Double, relevance: Double) {
         let snippetEmbedding = generateEmbedding(from: snippet)
         let queryEmbedding = generateEmbedding(from: query)
-        let relevance = cosineSimilarity(a: snippetEmbedding, b: queryEmbedding)
+        let relevance = normalizedSimilarity(a: snippetEmbedding, b: queryEmbedding)
 
         let length = Double(snippet.count)
         var confidence = min(1.0, max(0.2, length / 360.0))
@@ -1876,9 +1978,14 @@ class MemoryService: ObservableObject {
 
         let embedding = generateEmbedding(from: normalized)
         guard !embedding.isEmpty else { return false }
-        for memory in recent {
+        let approxIds = memoryIndex.candidates(for: embedding, limit: 48)
+        let approxRecent: [Memory] = approxIds.isEmpty
+            ? Array(recent)
+            : approxIds.compactMap { id in recent.first(where: { $0.id == id }) }
+
+        for memory in approxRecent {
             guard memory.embedding.count == embedding.count else { continue }
-            let sim = cosineSimilarity(a: embedding, b: memory.embedding)
+            let sim = normalizedSimilarity(a: embedding, b: memory.embedding)
             if sim >= duplicateEmbeddingThreshold {
                 return true
             }
@@ -1914,7 +2021,7 @@ class MemoryService: ObservableObject {
         let overlap = recentEmbeddings.map { recentEmbedding in
             historyEmbeddings
                 .filter { $0.count == recentEmbedding.count }
-                .map { cosineSimilarity(a: recentEmbedding, b: $0) }
+                .map { normalizedSimilarity(a: recentEmbedding, b: $0) }
                 .max() ?? 0.0
         }
         guard !overlap.isEmpty else { return 0.7 }
@@ -1943,7 +2050,7 @@ class MemoryService: ObservableObject {
         if !field.isEmpty,
            !memory.embedding.isEmpty,
            field.count == memory.embedding.count {
-            semanticBoost = max(0.0, cosineSimilarity(a: memory.embedding, b: field)) * 0.2
+            semanticBoost = max(0.0, normalizedSimilarity(a: memory.embedding, b: field)) * 0.2
         }
         let surpriseBoost = surpriseRetention(for: memory) * 0.08
         let noveltyRelief = novelty * 0.05
@@ -1959,8 +2066,8 @@ class MemoryService: ObservableObject {
         guard shared.count >= 2 else { return nil }
 
         let topicLine = shared.prefix(6).joined(separator: ", ")
-        let lhsCompressed = compressMemory(lhs.content, maxWords: 14)
-        let rhsCompressed = compressMemory(rhs.content, maxWords: 14)
+        let lhsCompressed = compressMemory(lhs.content, maxChars: 96)
+        let rhsCompressed = compressMemory(rhs.content, maxChars: 96)
         guard !lhsCompressed.isEmpty, !rhsCompressed.isEmpty else { return nil }
 
         return "[rest-consolidated] pattern=\(topicLine)\nA: \(lhsCompressed)\nB: \(rhsCompressed)"
@@ -1989,7 +2096,7 @@ private enum MemoryProfile {
     static func detect() -> MemoryProfile {
         #if targetEnvironment(simulator)
         return .godmode
-        #else
+        #elseif canImport(UIKit)
         let model = UIDevice.current.modelName.lowercased()
         if model.contains("iphone13") || model.contains("iphone 13") {
             return .eco
@@ -2000,6 +2107,8 @@ private enum MemoryProfile {
         } else {
             return .beast
         }
+        #else
+        return .godmode
         #endif
     }
 
@@ -2127,6 +2236,7 @@ struct CognitiveNode: Identifiable, Codable {
     var isPersistent: Bool
     var phase: Double
     var omega: Double
+    var reinforcement: Double
 
     init(
         id: UUID,
@@ -2137,7 +2247,8 @@ struct CognitiveNode: Identifiable, Codable {
         importance: Double,
         isPersistent: Bool = false,
         phase: Double = Double.random(in: 0..<(Double.pi * 2)),
-        omega: Double = Double.random(in: 0.05...0.15)
+        omega: Double = Double.random(in: 0.05...0.15),
+        reinforcement: Double = 0.0
     ) {
         self.id = id
         self.embedding = embedding
@@ -2148,6 +2259,7 @@ struct CognitiveNode: Identifiable, Codable {
         self.isPersistent = isPersistent
         self.phase = phase
         self.omega = omega
+        self.reinforcement = reinforcement
     }
 
     init(from decoder: Decoder) throws {
@@ -2161,6 +2273,7 @@ struct CognitiveNode: Identifiable, Codable {
         isPersistent = (try? container.decode(Bool.self, forKey: .isPersistent)) ?? false
         phase = (try? container.decode(Double.self, forKey: .phase)) ?? Double.random(in: 0..<(Double.pi * 2))
         omega = (try? container.decode(Double.self, forKey: .omega)) ?? Double.random(in: 0.05...0.15)
+        reinforcement = (try? container.decode(Double.self, forKey: .reinforcement)) ?? 0.0
     }
 
     func encode(to encoder: Encoder) throws {
@@ -2174,6 +2287,7 @@ struct CognitiveNode: Identifiable, Codable {
         try container.encode(isPersistent, forKey: .isPersistent)
         try container.encode(phase, forKey: .phase)
         try container.encode(omega, forKey: .omega)
+        try container.encode(reinforcement, forKey: .reinforcement)
     }
 
     enum CodingKeys: String, CodingKey {
@@ -2186,6 +2300,7 @@ struct CognitiveNode: Identifiable, Codable {
         case isPersistent
         case phase
         case omega
+        case reinforcement
     }
 }
 
@@ -2223,6 +2338,9 @@ final class CognitiveEchoGraph {
     private let powerLawExponent: Double = 1.25
     private let associativeImmunityThreshold: Int = 3
     private let associativeImmunityMultiplier: Double = 0.62
+    private let semanticRelevanceBase: Double = 0.6
+    private let identityGrowthRate: Double = 0.02
+    private let identityGrowthCap: Double = 0.5
 
     var isEmpty: Bool {
         nodes.isEmpty
@@ -2301,7 +2419,7 @@ final class CognitiveEchoGraph {
         }
     }
     
-    func decay(now: TimeInterval = Date().timeIntervalSince1970) {
+    func decay(now: TimeInterval = Date().timeIntervalSince1970, contextEmbedding: [Double]? = nil) {
         for (id, var node) in nodes {
             let dt = max(0.0, now - node.lastUpdate)
             let baseRate = node.isPersistent ? persistentDecayRate : standardDecayRate
@@ -2309,13 +2427,44 @@ final class CognitiveEchoGraph {
             let immunity = linkCount > associativeImmunityThreshold ? associativeImmunityMultiplier : 1.0
             let effectiveRate = baseRate * immunity
 
-            // Power-law decay: sharp initial drop, then long plateau.
-            let factor = pow(1.0 + (effectiveRate * dt), -powerLawExponent)
+            // Identity growth: reinforcement снижает decay
+            let growthShield = 1.0 - min(identityGrowthCap, node.reinforcement)
+            
+            // Semantic decay: релевантное контексту живёт дольше
+            let semanticFactor: Double = {
+                guard let contextEmbedding = contextEmbedding, !contextEmbedding.isEmpty, !node.embedding.isEmpty else {
+                    return 1.0
+                }
+                let relevance = cosine(a: node.embedding, b: contextEmbedding)
+                return semanticRelevanceBase + (1.0 - semanticRelevanceBase) * relevance
+            }()
+
+            // Power-law decay с множителями
+            let factor = pow(1.0 + (effectiveRate * dt), -powerLawExponent) * growthShield * semanticFactor
             let decayed = node.activation * factor
+            
             node.activation = node.isPersistent ? max(persistentActivationFloor, decayed) : decayed
             node.lastUpdate = now
+            
+            // Identity growth: активация накапливает reinforcement
+            if node.isPersistent && node.activation > 0.3 {
+                node.reinforcement = min(identityGrowthCap, node.reinforcement + identityGrowthRate * node.activation)
+            }
+            
             nodes[id] = node
         }
+    }
+    
+    private func cosine(a: [Double], b: [Double]) -> Double {
+        guard a.count == b.count else { return 0 }
+        var dot = 0.0, na = 0.0, nb = 0.0
+        for i in 0..<a.count {
+            dot += a[i] * b[i]
+            na += a[i] * a[i]
+            nb += b[i] * b[i]
+        }
+        if na == 0 || nb == 0 { return 0 }
+        return dot / (sqrt(na) * sqrt(nb))
     }
 
     private func associativeLinkCount(for id: UUID) -> Int {

@@ -9,6 +9,8 @@
 /* Begin PBXBuildFile section */
 		1D807FB3836D443BA2513451 /* llama.xcframework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = C71D50483A9D4DABB68E3F9F /* llama.xcframework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		84AE8F7610B34E2486B8008D /* llama.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = C71D50483A9D4DABB68E3F9F /* llama.xcframework */; };
+		AA6516322F758BDA00F95401 /* onnxruntime in Frameworks */ = {isa = PBXBuildFile; productRef = AA6516312F758BDA00F95401 /* onnxruntime */; };
+		AA6516342F758BDA00F95401 /* onnxruntime_extensions in Frameworks */ = {isa = PBXBuildFile; productRef = AA6516332F758BDA00F95401 /* onnxruntime_extensions */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -72,7 +74,9 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				AA6516322F758BDA00F95401 /* onnxruntime in Frameworks */,
 				84AE8F7610B34E2486B8008D /* llama.xcframework in Frameworks */,
+				AA6516342F758BDA00F95401 /* onnxruntime_extensions in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -135,6 +139,8 @@
 			);
 			name = ZephyrAI;
 			packageProductDependencies = (
+				AA6516312F758BDA00F95401 /* onnxruntime */,
+				AA6516332F758BDA00F95401 /* onnxruntime_extensions */,
 			);
 			productName = ZephyrAI;
 			productReference = AAA0282F2F28F30E00192683 /* ZephyrAI.app */;
@@ -194,7 +200,7 @@
 			attributes = {
 				BuildIndependentTargetsInParallel = 1;
 				LastSwiftUpdateCheck = 1640;
-				LastUpgradeCheck = 1640;
+				LastUpgradeCheck = 2640;
 				TargetAttributes = {
 					AAA0282E2F28F30E00192683 = {
 						CreatedOnToolsVersion = 16.4;
@@ -219,6 +225,7 @@
 			mainGroup = AAA028262F28F30E00192683;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
+				AA6516302F758BDA00F95401 /* XCRemoteSwiftPackageReference "onnxruntime-swift-package-manager" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = AAA028302F28F30E00192683 /* Products */;
@@ -328,6 +335,7 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
+				DEAD_CODE_STRIPPING = YES;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
@@ -350,6 +358,7 @@
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 			};
@@ -389,6 +398,7 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
+				DEAD_CODE_STRIPPING = YES;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
@@ -404,6 +414,7 @@
 				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_COMPILATION_MODE = wholemodule;
 			};
 			name = Release;
@@ -416,7 +427,9 @@
 				CODE_SIGN_ENTITLEMENTS = ZephyrAI/ZephyrAI.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_TEAM = W3V5PHBB63;
+				DRIVERKIT_DEPLOYMENT_TARGET = 24.0;
 				ENABLE_PREVIEWS = YES;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
@@ -430,6 +443,7 @@
 				INFOPLIST_KEY_CFBundleDisplayName = VALIS;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.entertainment";
 				INFOPLIST_KEY_NSCalendarsUsageDescription = "VALIS uses your calendar to create and list events when you ask.";
+				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "VALIS uses your location to provide weather and location-aware responses.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "VALIS needs access to your microphone for voice messages.";
 				INFOPLIST_KEY_NSRemindersFullAccessUsageDescription = "VALIS uses Reminders to create reminders when you ask.";
 				INFOPLIST_KEY_NSRemindersUsageDescription = "VALIS uses Reminders to create reminders when you ask.";
@@ -444,10 +458,10 @@
 				"INFOPLIST_KEY_UIStatusBarStyle[sdk=iphonesimulator*]" = UIStatusBarStyleDefault;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
-				IPHONEOS_DEPLOYMENT_TARGET = 18.5;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.6;
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
-				MACOSX_DEPLOYMENT_TARGET = 15.5;
+				MACOSX_DEPLOYMENT_TARGET = 15.6;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = "-penAGI.ZephyrAI";
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -458,7 +472,7 @@
 				SWIFT_OBJC_BRIDGING_HEADER = "ZephyrAI/ZephyrAI-Bridging-Header.h";
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2,7";
-				XROS_DEPLOYMENT_TARGET = 2.5;
+				XROS_DEPLOYMENT_TARGET = 2.6;
 			};
 			name = Debug;
 		};
@@ -470,7 +484,9 @@
 				CODE_SIGN_ENTITLEMENTS = ZephyrAI/ZephyrAI.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_TEAM = W3V5PHBB63;
+				DRIVERKIT_DEPLOYMENT_TARGET = 24.0;
 				ENABLE_PREVIEWS = YES;
 				FRAMEWORK_SEARCH_PATHS = (
 					"$(inherited)",
@@ -484,6 +500,7 @@
 				INFOPLIST_KEY_CFBundleDisplayName = VALIS;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.entertainment";
 				INFOPLIST_KEY_NSCalendarsUsageDescription = "VALIS uses your calendar to create and list events when you ask.";
+				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "VALIS uses your location to provide weather and location-aware responses.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "VALIS needs access to your microphone for voice messages.";
 				INFOPLIST_KEY_NSRemindersFullAccessUsageDescription = "VALIS uses Reminders to create reminders when you ask.";
 				INFOPLIST_KEY_NSRemindersUsageDescription = "VALIS uses Reminders to create reminders when you ask.";
@@ -498,10 +515,10 @@
 				"INFOPLIST_KEY_UIStatusBarStyle[sdk=iphonesimulator*]" = UIStatusBarStyleDefault;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
-				IPHONEOS_DEPLOYMENT_TARGET = 18.5;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.6;
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
-				MACOSX_DEPLOYMENT_TARGET = 15.5;
+				MACOSX_DEPLOYMENT_TARGET = 15.6;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = "-penAGI.ZephyrAI";
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -512,7 +529,7 @@
 				SWIFT_OBJC_BRIDGING_HEADER = "ZephyrAI/ZephyrAI-Bridging-Header.h";
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2,7";
-				XROS_DEPLOYMENT_TARGET = 2.5;
+				XROS_DEPLOYMENT_TARGET = 2.6;
 			};
 			name = Release;
 		};
@@ -522,6 +539,7 @@
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEAD_CODE_STRIPPING = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.5;
 				MACOSX_DEPLOYMENT_TARGET = 15.5;
@@ -544,6 +562,7 @@
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEAD_CODE_STRIPPING = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.5;
 				MACOSX_DEPLOYMENT_TARGET = 15.5;
@@ -565,6 +584,7 @@
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEAD_CODE_STRIPPING = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.5;
 				MACOSX_DEPLOYMENT_TARGET = 15.5;
@@ -586,6 +606,7 @@
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEAD_CODE_STRIPPING = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.5;
 				MACOSX_DEPLOYMENT_TARGET = 15.5;
@@ -642,6 +663,30 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		AA6516302F758BDA00F95401 /* XCRemoteSwiftPackageReference "onnxruntime-swift-package-manager" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/microsoft/onnxruntime-swift-package-manager";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.24.2;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		AA6516312F758BDA00F95401 /* onnxruntime */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = AA6516302F758BDA00F95401 /* XCRemoteSwiftPackageReference "onnxruntime-swift-package-manager" */;
+			productName = onnxruntime;
+		};
+		AA6516332F758BDA00F95401 /* onnxruntime_extensions */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = AA6516302F758BDA00F95401 /* XCRemoteSwiftPackageReference "onnxruntime-swift-package-manager" */;
+			productName = onnxruntime_extensions;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = AAA028272F28F30E00192683 /* Project object */;
 }

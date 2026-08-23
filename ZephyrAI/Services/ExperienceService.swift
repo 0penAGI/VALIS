@@ -83,11 +83,33 @@ struct UserPreferenceProfile: Codable {
     }
 }
 
+struct ExperiencePostFactumSnapshot {
+    let outcome: String
+    let reflection: String
+    let importance: Double
+    let combinedMemoryPayload: String
+}
+
+struct InteractionDynamics: Codable {
+    var verbosity: Double = 0.5
+    var emotionalDepth: Double = 0.5
+    var structureBias: Double = 0.5
+    var directness: Double = 0.5
+
+    mutating func apply(verbosity dv: Double = 0, emotion de: Double = 0, structure ds: Double = 0, directness dd: Double = 0) {
+        verbosity = max(0, min(1, verbosity + dv))
+        emotionalDepth = max(0, min(1, emotionalDepth + de))
+        structureBias = max(0, min(1, structureBias + ds))
+        directness = max(0, min(1, directness + dd))
+    }
+}
+
 final class ExperienceService: ObservableObject {
     static let shared = ExperienceService()
 
     @Published private(set) var experiences: [Experience] = []
     @Published private(set) var preferences: UserPreferenceProfile = UserPreferenceProfile()
+    @Published private(set) var dynamics: InteractionDynamics = InteractionDynamics()
     private var pendingReactionId: UUID?
 
     private init() {
@@ -100,10 +122,10 @@ final class ExperienceService: ObservableObject {
         assistantMessageId: UUID?,
         userText: String,
         assistantText: String
-    ) {
+    ) -> ExperiencePostFactumSnapshot? {
         let trimmedUser = userText.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedAssistant = assistantText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedUser.isEmpty, !trimmedAssistant.isEmpty else { return }
+        guard !trimmedUser.isEmpty, !trimmedAssistant.isEmpty else { return nil }
 
         let outcome = estimateOutcome(userText: trimmedUser, assistantText: trimmedAssistant)
         let reflection = generateReflection(userText: trimmedUser, assistantText: trimmedAssistant, outcome: outcome)
@@ -120,11 +142,20 @@ final class ExperienceService: ObservableObject {
         pendingReactionId = exp.id
         saveExperiences()
 
-        MotivationService.shared.updateForOutcome(outcome)
         let importance = estimateExperienceImportance(outcome: outcome, reflection: reflection, motivators: MotivationService.shared.state)
         let combined = "[experience] outcome: \(outcome) | reflection: \(reflection)"
+        return ExperiencePostFactumSnapshot(
+            outcome: outcome,
+            reflection: reflection,
+            importance: importance,
+            combinedMemoryPayload: combined
+        )
+    }
+
+    func commitPostFactumSnapshot(_ snapshot: ExperiencePostFactumSnapshot) {
+        MotivationService.shared.updateForOutcome(snapshot.outcome)
         Task { @MainActor in
-            MemoryService.shared.addExperienceMemory(combined, importanceOverride: importance)
+            MemoryService.shared.addExperienceMemory(snapshot.combinedMemoryPayload, importanceOverride: snapshot.importance)
         }
     }
 
@@ -155,10 +186,6 @@ final class ExperienceService: ObservableObject {
         guard !experiences.isEmpty, maxChars > 0 else { return "" }
 
         let recent = experiences.suffix(6)
-        let lessons = recent
-            .map { $0.reflection }
-            .filter { !$0.isEmpty }
-            .suffix(3)
 
         let outcomes = recent
             .map { $0.outcome }
@@ -166,10 +193,14 @@ final class ExperienceService: ObservableObject {
             .suffix(2)
 
         var parts: [String] = []
-        if !lessons.isEmpty {
-            let lines = lessons.map { "- \($0)" }.joined(separator: "\n")
-            parts.append("Experience Lessons:\n\(lines)")
-        }
+        let dynamicsBlock = """
+Interaction Dynamics:
+verbosity=\(String(format: "%.2f", dynamics.verbosity))
+emotion=\(String(format: "%.2f", dynamics.emotionalDepth))
+structure=\(String(format: "%.2f", dynamics.structureBias))
+directness=\(String(format: "%.2f", dynamics.directness))
+"""
+        parts.append(dynamicsBlock)
         if !outcomes.isEmpty {
             let lines = outcomes.map { "- \($0)" }.joined(separator: "\n")
             parts.append("Recent Outcomes:\n\(lines)")
@@ -200,7 +231,7 @@ final class ExperienceService: ObservableObject {
             return "Response destabilized; needs better grounding"
         }
         if assistantText.count < 60 {
-            return "Response too thin; likely missing structure"
+            return "Response may have lacked enough substance"
         }
         return "Response carried state and structure with enough substance"
     }
@@ -208,15 +239,15 @@ final class ExperienceService: ObservableObject {
     private func generateReflection(userText: String, assistantText: String, outcome: String) -> String {
         let lower = userText.lowercased()
         if lower.contains("почему") || lower.contains("explain") || lower.contains("why") {
-            return "Stay with the core tension and speak from it without defaulting to guidance, reassurance, or service posture"
+            return "Answer the real tension and follow the user's energy"
         }
         if assistantText.count < 60 {
-            return "Increase structure and density proactively"
+            return "Brevity is acceptable when it carries the point"
         }
         if outcome.contains("uncertain") {
-            return "Stabilize around the strongest available signal and answer directly"
+            return "Stay grounded in the strongest signal and respond naturally"
         }
-        return "Keep response coherent, direct, and alive"
+        return "Stay natural; not structured."
     }
 
     private func estimateValence(for text: String) -> Double {
@@ -248,6 +279,19 @@ final class ExperienceService: ObservableObject {
 
         let topics = extractConcepts(from: current.userText + " " + current.assistantText)
         let delta = max(-0.6, min(0.6, valence * 0.4))
+        // Dynamics adjustment based on reaction text and valence
+        let lowerReaction = reactionText.lowercased()
+        if lowerReaction.contains("сух") || lowerReaction.contains("dry") {
+            dynamics.apply(emotion: 0.12, structure: -0.15)
+        }
+        if lowerReaction.contains("вода") || lowerReaction.contains("too much") {
+            dynamics.apply(verbosity: -0.15, directness: 0.12)
+        }
+        if valence > 0 {
+            dynamics.apply(emotion: 0.03)
+        } else if valence < 0 {
+            dynamics.apply(directness: 0.05)
+        }
         preferences.update(topics: topics, delta: delta)
         MotivationService.shared.updateForReaction(valence: valence)
         IdentityProfileService.shared.recordSignal(
@@ -265,9 +309,6 @@ final class ExperienceService: ObservableObject {
         var score = 0.7
         if outcome.lowercased().contains("uncertain") {
             score -= 0.1
-        }
-        if reflection.lowercased().contains("coherent") || reflection.lowercased().contains("structure") {
-            score += 0.1
         }
         score += (motivators.helpfulness - 0.5) * 0.4
         score += (motivators.caution - 0.5) * 0.2

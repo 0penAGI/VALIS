@@ -1,10 +1,13 @@
 import Foundation
 import Combine
-import UIKit
 import CryptoKit
 import Dispatch
+#if canImport(UIKit)
+import UIKit
+#endif
 
 
+#if canImport(UIKit)
 extension UIDevice {
     var modelName: String {
         var systemInfo = utsname()
@@ -19,6 +22,7 @@ extension UIDevice {
         return identifier
     }
 }
+#endif
 
 @MainActor
 final class LLMService: ObservableObject {
@@ -49,6 +53,7 @@ final class LLMService: ObservableObject {
     @Published var status: String = "Idle"
     @Published var isGenerating: Bool = false
     @Published var progress: Double = 0
+    @Published private(set) var isModelReady: Bool = false
     
     private let cache = NSCache<NSString, NSString>()
     private let generationSemaphore = AsyncSemaphore(1)
@@ -60,9 +65,19 @@ final class LLMService: ObservableObject {
 
     private var runtime: LlamaRuntime?
     private let memoryService = MemoryService.shared
+    private var activeDownloadCoordinator: ModelDownloadCoordinator?
+    private var modelLoadRevision: UInt64 = 0
 
     private var selectedModel: LLMModelChoice {
         LLMModelStorage.load()
+    }
+
+    private var isSelectedModelSmall: Bool {
+        selectedModel == .small
+    }
+
+    fileprivate var prefersThinkTagPrompting: Bool {
+        selectedModel != .small
     }
 
     private var modelFilename: String {
@@ -78,8 +93,11 @@ final class LLMService: ObservableObject {
     private var contextSize: Int32 {
         switch detectProfile() {
         case .eco:
-            return 4200
+            return isSelectedModelSmall ? 3072 : 4200
         case .beast:
+            if selectedModel == .large {
+                return 12_288
+            }
             return 16384
         case .godmode:
             return 24576
@@ -89,13 +107,15 @@ final class LLMService: ObservableObject {
     struct GenerationOptions: Sendable {
         var maxTokensOverride: Int? = nil
         var includeMemoryContext: Bool = true
-        var includeHiddenPrefix: Bool = true
+        var includeHiddenPrefix: Bool = false
         var useCache: Bool = true
         var useKVInjection: Bool = true
         var storeResponseToMemory: Bool = true
         var preferFullRuntimeContext: Bool = false
         var preserveExtendedOutputBudget: Bool = false
         var samplingOverride: SamplingConfig? = nil
+        var useThinkTagPrompting: Bool? = nil
+        var managesActiveGenerationState: Bool = true
     }
 
     enum PerformanceProfile {
@@ -107,7 +127,7 @@ final class LLMService: ObservableObject {
     private func detectProfile() -> PerformanceProfile {
         #if targetEnvironment(simulator)
         return .godmode
-        #else
+        #elseif canImport(UIKit)
         let model = UIDevice.current.modelName.lowercased()
 
         if isEcoPhoneIdentifier(model) {
@@ -119,6 +139,8 @@ final class LLMService: ObservableObject {
         } else {
             return .beast
         }
+        #else
+        return .godmode
         #endif
     }
 
@@ -156,12 +178,14 @@ final class LLMService: ObservableObject {
         source.resume()
         memoryPressureSource = source
 
+        #if canImport(UIKit)
         NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
                 self?.memoryPressureLevel = max(self?.memoryPressureLevel ?? 0, 1)
             }
             .store(in: &cancellables)
+        #endif
     }
 
     func inferenceBudget(forPromptLength promptChars: Int) -> InferenceBudget {
@@ -202,12 +226,12 @@ final class LLMService: ObservableObject {
         switch profile {
         case .relaxed:
             if baseProfile == .eco {
-                return InferenceBudget(profile: profile, contextLimit: min(contextSize, 8192), memoryBudgetRatio: 0.18, memoryCandidateLimit: 3, dialogTurns: 5, dialogCharsPerMessage: 180, maxTokensCap: 896)
+                return InferenceBudget(profile: profile, contextLimit: min(contextSize, 8192), memoryBudgetRatio: 0.18, memoryCandidateLimit: 3, dialogTurns: 5, dialogCharsPerMessage: 180, maxTokensCap: 1024)
             }
             return InferenceBudget(profile: profile, contextLimit: contextSize, memoryBudgetRatio: 0.28, memoryCandidateLimit: 4, dialogTurns: 8, dialogCharsPerMessage: 280, maxTokensCap: baseProfile == .godmode ? 6144 : 3072)
         case .balanced:
             if baseProfile == .eco {
-                return InferenceBudget(profile: profile, contextLimit: min(contextSize, 8192), memoryBudgetRatio: 0.18, memoryCandidateLimit: 3, dialogTurns: 5, dialogCharsPerMessage: 180, maxTokensCap: 896)
+                return InferenceBudget(profile: profile, contextLimit: min(contextSize, 8192), memoryBudgetRatio: 0.18, memoryCandidateLimit: 3, dialogTurns: 5, dialogCharsPerMessage: 180, maxTokensCap: 1024)
             }
             return InferenceBudget(profile: profile, contextLimit: min(contextSize, 12288), memoryBudgetRatio: 0.24, memoryCandidateLimit: 4, dialogTurns: 7, dialogCharsPerMessage: 240, maxTokensCap: 2048)
         case .constrained:
@@ -258,20 +282,34 @@ final class LLMService: ObservableObject {
     // MARK: Load model
 
     func loadModel() async {
+        let modelChoice = selectedModel
+        let revision = nextModelLoadRevision()
+        let modelContextSize = contextSize(for: modelChoice)
+
         status = "Loading..."
+        isModelReady = false
+        await Task.yield()
         startResourceMonitoring()
 
         do {
-            let modelURL = try resolveModelURL()
+            let modelURL = try resolveModelURL(for: modelChoice)
             print("[LLM] Using model at: \(modelURL.path)")
-            runtime = try LlamaRuntime(modelPath: modelURL.path, contextSize: contextSize)
+            let loadedRuntime = try await Self.createRuntime(
+                modelPath: modelURL.path,
+                contextSize: modelContextSize,
+                isSmallModel: modelChoice == .small
+            )
+            guard revision == modelLoadRevision else { return }
+            runtime = loadedRuntime
+            isModelReady = true
             status = ""
         } catch {
+            guard revision == modelLoadRevision else { return }
             if case LlamaRuntimeError.modelNotFound = error {
-                await handleMissingModel()
+                await handleMissingModel(choice: modelChoice, revision: revision, contextSize: modelContextSize)
                 return
             }
-            status = "Load error: \(error.localizedDescription)"
+            status = "\(error.localizedDescription)"
             print(error)
         }
     }
@@ -282,10 +320,40 @@ final class LLMService: ObservableObject {
     }
 
     func reloadModel() async {
+        let revision = nextModelLoadRevision()
         cancelGeneration()
-        runtime = nil
+        activeDownloadCoordinator?.cancel()
+        activeDownloadCoordinator = nil
         cache.removeAllObjects()
-        await loadModel()
+        status = "Reloading..."
+        isModelReady = false
+        runtime = nil
+        await Task.yield()
+
+        let modelChoice = selectedModel
+        let modelContextSize = contextSize(for: modelChoice)
+
+        do {
+            let modelURL = try resolveModelURL(for: modelChoice)
+            print("[LLM] Reloading model at: \(modelURL.path)")
+            let loadedRuntime = try await Self.createRuntime(
+                modelPath: modelURL.path,
+                contextSize: modelContextSize,
+                isSmallModel: modelChoice == .small
+            )
+            guard revision == modelLoadRevision else { return }
+            runtime = loadedRuntime
+            isModelReady = true
+            status = ""
+        } catch {
+            guard revision == modelLoadRevision else { return }
+            if case LlamaRuntimeError.modelNotFound = error {
+                await handleMissingModel(choice: modelChoice, revision: revision, contextSize: modelContextSize)
+                return
+            }
+            status = "\(error.localizedDescription)"
+            print(error)
+        }
     }
 
     func generate(
@@ -302,10 +370,12 @@ final class LLMService: ObservableObject {
     ) async -> AsyncStream<String> {
 
         let token = GenerationCancellationToken()
-        await MainActor.run {
-            self.currentToken?.cancel()
-            self.currentToken = token
-            isGenerating = true
+        if options.managesActiveGenerationState {
+            await MainActor.run {
+                self.currentToken?.cancel()
+                self.currentToken = token
+                isGenerating = true
+            }
         }
 
         let runtimeSnapshot = runtime
@@ -331,12 +401,14 @@ final class LLMService: ObservableObject {
                     generationSemaphore: semaphoreSnapshot
                 )
                 continuation.finish()
-                await MainActor.run {
-                    guard let strongSelf = weakSelf else { return }
-                    if strongSelf.currentToken === token {
-                        strongSelf.currentToken = nil
+                if options.managesActiveGenerationState {
+                    await MainActor.run {
+                        guard let strongSelf = weakSelf else { return }
+                        if strongSelf.currentToken === token {
+                            strongSelf.currentToken = nil
+                        }
+                        strongSelf.isGenerating = false
                     }
-                    strongSelf.isGenerating = false
                 }
             }
         }
@@ -371,13 +443,19 @@ final class LLMService: ObservableObject {
         return output
     }
 
-    private func resolveModelURL() throws -> URL {
-        let name = (modelFilename as NSString).deletingPathExtension
-        let ext = (modelFilename as NSString).pathExtension
+    private func resolveModelURL(for choice: LLMModelChoice) throws -> URL {
+        let filename = choice.filename
+        let name = (filename as NSString).deletingPathExtension
+        let ext = (filename as NSString).pathExtension
 
-        if let supportURL = modelSupportURL(), FileManager.default.fileExists(atPath: supportURL.path) {
-            print("[LLM] Model found in Application Support")
-            return supportURL
+        if let supportURL = modelSupportURL(for: choice), FileManager.default.fileExists(atPath: supportURL.path) {
+            if Self.isValidGGUF(at: supportURL) {
+                print("[LLM] Model found in Application Support")
+                return supportURL
+            } else {
+                print("[LLM] Invalid model file in Application Support, removing stale copy")
+                try? FileManager.default.removeItem(at: supportURL)
+            }
         }
 
         if let url = Bundle.main.url(forResource: name, withExtension: ext) {
@@ -387,7 +465,7 @@ final class LLMService: ObservableObject {
 
         let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
         if let docs = documents {
-            let url = docs.appendingPathComponent(modelFilename)
+            let url = docs.appendingPathComponent(filename)
             if FileManager.default.fileExists(atPath: url.path) {
                 print("[LLM] Model found in Documents")
                 return url
@@ -395,10 +473,10 @@ final class LLMService: ObservableObject {
         }
 
         print("[LLM] Model not found in Application Support, bundle, or Documents")
-        throw LlamaRuntimeError.modelNotFound(expectedFilename: modelFilename)
+        throw LlamaRuntimeError.modelNotFound(expectedFilename: filename)
     }
 
-    private func modelSupportURL() -> URL? {
+    private func modelSupportURL(for choice: LLMModelChoice) -> URL? {
         guard let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
             return nil
         }
@@ -409,88 +487,224 @@ final class LLMService: ObservableObject {
             print("[LLM] Failed to create Application Support dir: \(error)")
             return nil
         }
-        return dir.appendingPathComponent(modelFilename)
+        return dir.appendingPathComponent(choice.filename)
     }
 
-    private func handleMissingModel() async {
-        guard let downloadURL = modelDownloadURL() else {
+    private func handleMissingModel(choice: LLMModelChoice, revision: UInt64, contextSize: Int32) async {
+        guard let downloadURL = modelDownloadURL(for: choice) else {
             status = "Model missing. Set a download URL."
+            isModelReady = false
             return
         }
 
         status = "Model missing. Downloading..."
-        progress = 0
+        isModelReady = false
+        progress = 0.01
 
         do {
-            let modelURL = try await downloadModel(from: downloadURL)
-            runtime = try LlamaRuntime(modelPath: modelURL.path, contextSize: contextSize)
+            let modelURL = try await downloadModel(from: downloadURL, choice: choice)
+            let loadedRuntime = try await Self.createRuntime(
+                modelPath: modelURL.path,
+                contextSize: contextSize,
+                isSmallModel: choice == .small
+            )
+            guard revision == modelLoadRevision else { return }
+            runtime = loadedRuntime
+            isModelReady = true
             status = ""
         } catch {
+            guard revision == modelLoadRevision else { return }
             status = "Download error: \(error.localizedDescription)"
             print(error)
         }
     }
 
-    private func modelDownloadURL() -> URL? {
-        guard let string = modelDownloadURLString, !string.isEmpty else { return nil }
+    private func modelDownloadURL(for choice: LLMModelChoice) -> URL? {
+        guard let string = choice.downloadURLString, !string.isEmpty else { return nil }
         return URL(string: string)
     }
 
-    private func downloadModel(from url: URL) async throws -> URL {
-        guard let destinationURL = modelSupportURL() else {
-            throw LlamaRuntimeError.modelNotFound(expectedFilename: modelFilename)
+    private func downloadModel(from url: URL, choice: LLMModelChoice) async throws -> URL {
+        guard let destinationURL = modelSupportURL(for: choice) else {
+            throw LlamaRuntimeError.modelNotFound(expectedFilename: choice.filename)
         }
 
-        if FileManager.default.fileExists(atPath: destinationURL.path) {
+        if FileManager.default.fileExists(atPath: destinationURL.path),
+           Self.isValidGGUF(at: destinationURL) {
             return destinationURL
+        } else if FileManager.default.fileExists(atPath: destinationURL.path) {
+            try? FileManager.default.removeItem(at: destinationURL)
         }
 
-        let (bytes, response) = try await URLSession.shared.bytes(from: url)
-        let expectedLength = response.expectedContentLength
-
-        if FileManager.default.fileExists(atPath: destinationURL.path) {
-            try FileManager.default.removeItem(at: destinationURL)
+        let tempURL = destinationURL.appendingPathExtension("downloading")
+        if FileManager.default.fileExists(atPath: tempURL.path) {
+            try? FileManager.default.removeItem(at: tempURL)
         }
-        FileManager.default.createFile(atPath: destinationURL.path, contents: nil)
-        let handle = try FileHandle(forWritingTo: destinationURL)
-        defer { try? handle.close() }
+        let request = authorizedRequest(for: url)
+        let downloadResult = try await downloadModelFile(request: request, fallbackURL: url, tempURL: tempURL, choice: choice)
+        let sourceURL = downloadResult.responseURL?.absoluteString ?? url.absoluteString
+        print("[LLM] Download response: status=\(downloadResult.statusCode) length=\(downloadResult.expectedLength) source=\(sourceURL)")
 
-        var received: Int64 = 0
-        var buffer = Data()
-        buffer.reserveCapacity(1 << 20)
-
-        for try await byte in bytes {
-            buffer.append(byte)
-            received += 1
-
-            if buffer.count >= 1 << 20 {
-                try handle.write(contentsOf: buffer)
-                buffer.removeAll(keepingCapacity: true)
-            }
-
-            if expectedLength > 0 {
-                let pct = Double(received) / Double(expectedLength)
-                await MainActor.run {
-                    self.progress = pct
-                    let percent = Int(pct * 100)
-                    self.status = "Downloading model \(percent)%"
-                }
-            }
-        }
-
-        if !buffer.isEmpty {
-            try handle.write(contentsOf: buffer)
+        await MainActor.run {
+            self.progress = 0.99
+            self.status = "Finalizing model..."
         }
 
         if let expectedHash = modelSHA256 {
-            let actual = try sha256(of: destinationURL)
+            let actual = try sha256(of: tempURL)
             if actual.lowercased() != expectedHash.lowercased() {
-                try FileManager.default.removeItem(at: destinationURL)
+                try? FileManager.default.removeItem(at: tempURL)
                 throw LlamaRuntimeError.modelLoadFailed(path: "SHA256 mismatch")
             }
         }
 
+        if Self.isValidGGUF(at: tempURL) {
+            if FileManager.default.fileExists(atPath: destinationURL.path) {
+                try? FileManager.default.removeItem(at: destinationURL)
+            }
+            try FileManager.default.moveItem(at: tempURL, to: destinationURL)
+        } else {
+            try? FileManager.default.removeItem(at: tempURL)
+            throw LlamaRuntimeError.modelLoadFailed(path: "Invalid GGUF header")
+        }
+
+        await MainActor.run {
+            self.progress = 1
+        }
+
         return destinationURL
+    }
+
+    private func downloadModelFile(
+        request: URLRequest,
+        fallbackURL: URL,
+        tempURL: URL,
+        choice: LLMModelChoice
+    ) async throws -> (statusCode: Int, expectedLength: Int64, responseURL: URL?) {
+        let retryCount = 2
+        var lastError: Error?
+
+        for attempt in 0...retryCount {
+            do {
+                return try await downloadModelFileOnce(
+                    request: request,
+                    fallbackURL: fallbackURL,
+                    tempURL: tempURL,
+                    choice: choice
+                )
+            } catch {
+                lastError = error
+                print("[LLM] Download attempt \(attempt + 1) failed: \(error)")
+                try? FileManager.default.removeItem(at: tempURL)
+                if attempt < retryCount {
+                    try? await Task.sleep(nanoseconds: UInt64(1_000_000_000 * (attempt + 1)))
+                }
+            }
+        }
+
+        throw lastError ?? LlamaRuntimeError.modelLoadFailed(path: tempURL.path)
+    }
+
+    private func downloadModelFileOnce(
+        request: URLRequest,
+        fallbackURL: URL,
+        tempURL: URL,
+        choice: LLMModelChoice
+    ) async throws -> (statusCode: Int, expectedLength: Int64, responseURL: URL?) {
+        let delegate = ModelDownloadDelegate(
+            tempURL: tempURL,
+            fallbackLength: choice.approximateDownloadSizeBytes,
+            progressHandler: { [weak self] received, expectedLength, response in
+                guard let self else { return }
+                let totalLength = expectedLength > 0 ? expectedLength : choice.approximateDownloadSizeBytes
+                let pct = min(Double(received) / Double(max(1, totalLength)), 0.99)
+                Task { @MainActor in
+                    self.progress = pct
+                    let percent = Int((pct * 100).rounded(.down))
+                    let downloadedMB = Double(received) / 1_048_576.0
+                    if expectedLength > 0 {
+                        self.status = "Downloading model \(percent)%"
+                    } else {
+                        self.status = String(format: "Downloading model %.0f MB", downloadedMB)
+                    }
+                }
+                if let response {
+                    print("[LLM] Download progress: received=\(received) expected=\(expectedLength) status=\(response.statusCode)")
+                }
+            }
+        )
+
+        let downloadSession = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
+        let coordinator = ModelDownloadCoordinator(session: downloadSession, delegate: delegate)
+        activeDownloadCoordinator = coordinator
+
+        return try await withCheckedThrowingContinuation { continuation in
+            delegate.completion = { result in
+                Task { @MainActor in
+                    if self.activeDownloadCoordinator === coordinator {
+                        self.activeDownloadCoordinator = nil
+                    }
+                }
+                continuation.resume(with: result)
+            }
+            let task = downloadSession.downloadTask(with: request)
+            coordinator.task = task
+            task.resume()
+        }
+    }
+
+    private func contextSize(for choice: LLMModelChoice) -> Int32 {
+        switch detectProfile() {
+        case .eco:
+            return choice == .small ? 3072 : 4200
+        case .beast:
+            return 16384
+        case .godmode:
+            return 24576
+        }
+    }
+
+    private func nextModelLoadRevision() -> UInt64 {
+        modelLoadRevision &+= 1
+        return modelLoadRevision
+    }
+
+    private static func createRuntime(
+        modelPath: String,
+        contextSize: Int32,
+        isSmallModel: Bool
+    ) async throws -> LlamaRuntime {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    let runtime = try LlamaRuntime(
+                        modelPath: modelPath,
+                        contextSize: contextSize,
+                        isSmallModel: isSmallModel
+                    )
+                    continuation.resume(returning: runtime)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    private static func isValidGGUF(at url: URL) -> Bool {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? handle.close() }
+        guard let data = try? handle.read(upToCount: 4), data.count == 4 else { return false }
+        let magic = data.map { Character(UnicodeScalar($0)) }
+        return magic == ["G", "G", "U", "F"]
+    }
+
+    private func authorizedRequest(for url: URL) -> URLRequest {
+        var request = URLRequest(url: url)
+        if let token = HuggingFaceTokenStore.load()?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !token.isEmpty {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        return request
     }
 
     private func sha256(of url: URL) throws -> String {
@@ -505,6 +719,90 @@ final class LLMService: ObservableObject {
         }
         let digest = hasher.finalize()
         return digest.map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+final class ModelDownloadDelegate: NSObject, URLSessionDownloadDelegate {
+    let tempURL: URL
+    let fallbackLength: Int64
+    let progressHandler: (Int64, Int64, HTTPURLResponse?) -> Void
+    var completion: ((Result<(statusCode: Int, expectedLength: Int64, responseURL: URL?), Error>) -> Void)?
+
+    private var received: Int64 = 0
+    private var expectedLength: Int64 = -1
+    private var responseURL: URL?
+    private var statusCode: Int = -1
+
+    init(
+        tempURL: URL,
+        fallbackLength: Int64,
+        progressHandler: @escaping (Int64, Int64, HTTPURLResponse?) -> Void
+    ) {
+        self.tempURL = tempURL
+        self.fallbackLength = fallbackLength
+        self.progressHandler = progressHandler
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didWriteData bytesWritten: Int64,
+        totalBytesWritten: Int64,
+        totalBytesExpectedToWrite: Int64
+    ) {
+        received = totalBytesWritten
+        expectedLength = totalBytesExpectedToWrite > 0 ? totalBytesExpectedToWrite : fallbackLength
+        if let httpResponse = downloadTask.response as? HTTPURLResponse {
+            responseURL = httpResponse.url
+            statusCode = httpResponse.statusCode
+            progressHandler(received, expectedLength, httpResponse)
+        } else {
+            progressHandler(received, expectedLength, nil)
+        }
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didFinishDownloadingTo location: URL
+    ) {
+        do {
+            if FileManager.default.fileExists(atPath: tempURL.path) {
+                try FileManager.default.removeItem(at: tempURL)
+            }
+            try FileManager.default.moveItem(at: location, to: tempURL)
+        } catch {
+            completion?(.failure(error))
+        }
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didCompleteWithError error: Error?
+    ) {
+        if let error {
+            completion?(.failure(error))
+            return
+        }
+        completion?(.success((statusCode: statusCode, expectedLength: expectedLength, responseURL: responseURL)))
+    }
+}
+
+@MainActor
+final class ModelDownloadCoordinator {
+    let session: URLSession
+    let delegate: ModelDownloadDelegate
+    var task: URLSessionDownloadTask?
+
+    init(session: URLSession, delegate: ModelDownloadDelegate) {
+        self.session = session
+        self.delegate = delegate
+    }
+
+    func cancel() {
+        task?.cancel()
+        session.invalidateAndCancel()
     }
 }
 
@@ -603,22 +901,28 @@ private enum LLMGenerationRunner {
             : min(runtime.contextSize, budget?.contextLimit ?? runtime.contextSize)
         let maxPromptChars = Int(effectiveContextSize) * approxCharsPerToken
 
-        let assistantIdentityAnchor = "\n\nAssistant (you):\nName: VALIS\nRule: Your name is VALIS. Never adopt the user's name as your own."
+        let assistantIdentityAnchor = "\n\n(You) \nRule: Never adopt the user's name as your own."
         let languageAnchor = LanguageRoutingService.languageAnchor(for: userPrompt)
         let userIdentityContext = UserIdentityService.shared.contextBlock()
         let systemAndUserChars = systemPrompt.count + userPrompt.count + assistantIdentityAnchor.count + languageAnchor.count + userIdentityContext.count + 260
         let memoryBudget = max(0, maxPromptChars - systemAndUserChars)
 
-        let fieldState = await MemoryService.shared.fieldStateSnapshot()
         let includeMemory = options.includeMemoryContext
         let memoryHardCap = max(0, min(memoryBudget, Int(Double(maxPromptChars) * (budget?.memoryBudgetRatio ?? 0.22))))
-        var memoryContext = includeMemory
-            ? await MemoryService.shared.getLLMContextBlock(
+        // FAST PATH: skip memory retrieval for short prompts (reduces latency)
+        let shouldUseMemory = includeMemory && userPrompt.count > 600
+
+        async let fieldStateTask = MemoryService.shared.fieldStateSnapshot()
+        async let memoryContextTask: String = shouldUseMemory
+            ? MemoryService.shared.getLLMContextBlock(
                 maxChars: memoryHardCap,
                 forUserText: userPrompt,
                 candidateLimit: budget?.memoryCandidateLimit ?? 3
             )
             : ""
+
+        let fieldState = await fieldStateTask
+        var memoryContext = shouldUseMemory ? await memoryContextTask : ""
 
         let hiddenPrefix: String = {
             guard options.includeHiddenPrefix else { return "" }
@@ -630,7 +934,7 @@ private enum LLMGenerationRunner {
             return samplingConfig(from: fieldState)
         }()
 
-        let cacheKey = "\(systemPrompt)|\(userPrompt)" as NSString
+        let cacheKey = "\(systemPrompt)|\(userPrompt)|\(sampling.temperature)|\(sampling.topK)|\(sampling.topP)" as NSString
         let canUseCache = options.useCache && sampling.temperature <= 0.0
         if canUseCache, let cached = cache.object(forKey: cacheKey) {
             if !token.isCancelled {
@@ -643,8 +947,20 @@ private enum LLMGenerationRunner {
             ? KVInjection(fieldVector: fieldState.fieldVector, beta: 0.03)
             : nil
 
-        func buildPrompt(system: String, memory: String) -> String {
-            """
+        let defaultThinkTagPrompting = await MainActor.run {
+            service?.prefersThinkTagPrompting ?? true
+        }
+
+        let _: Bool = {
+            if let override = options.useThinkTagPrompting {
+                return override
+            }
+            return defaultThinkTagPrompting
+        }()
+
+        func buildPromptParts(system: String, memory: String) -> (prefix: String, suffix: String, full: String) {
+            let userPrefix = ""
+            let prefix = """
 <|im_start|>system
 \(system)
 \(hiddenPrefix.isEmpty ? "" : hiddenPrefix)
@@ -654,18 +970,26 @@ private enum LLMGenerationRunner {
 \(userIdentityContext)
 <|im_end|>
 <|im_start|>user
+\(userPrefix)
+"""
+            let suffix = """
 \(userPrompt)
 <|im_end|>
 <|im_start|>assistant
-<think>
 """
+            return (prefix: prefix, suffix: suffix, full: prefix + suffix)
         }
 
         var systemPromptEffective = systemPrompt
-        var prompt = buildPrompt(system: systemPromptEffective, memory: memoryContext)
+        var promptParts = buildPromptParts(system: systemPromptEffective, memory: memoryContext)
+        var prompt = promptParts.full
         let generationStartedAt = Date()
         var firstTokenAt: Date?
         var emittedTokens = 0
+        var promptEchoDetected = false
+        let normalizedUserPrompt = userPrompt
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
 
         var systemWasTrimmed = false
         var memoryWasTrimmed = false
@@ -675,7 +999,8 @@ private enum LLMGenerationRunner {
                 let newLen = max(0, memoryContext.count - overflow)
                 memoryContext = String(memoryContext.prefix(newLen))
                 memoryWasTrimmed = true
-                prompt = buildPrompt(system: systemPromptEffective, memory: memoryContext)
+                promptParts = buildPromptParts(system: systemPromptEffective, memory: memoryContext)
+                prompt = promptParts.full
             }
         }
         if prompt.count > maxPromptChars {
@@ -684,7 +1009,8 @@ private enum LLMGenerationRunner {
                 let newLen = max(0, systemPromptEffective.count - overflow)
                 systemPromptEffective = String(systemPromptEffective.prefix(newLen))
                 systemWasTrimmed = true
-                prompt = buildPrompt(system: systemPromptEffective, memory: memoryContext)
+                promptParts = buildPromptParts(system: systemPromptEffective, memory: memoryContext)
+                prompt = promptParts.full
             }
         }
 
@@ -692,12 +1018,13 @@ private enum LLMGenerationRunner {
             let memoryIncluded = !memoryContext.isEmpty
             let userIdentityIncluded = !userIdentityContext.isEmpty
             let languageIncluded = !languageAnchor.isEmpty
-            print("[Prompt] ctxChars=\(maxPromptChars) promptChars=\(prompt.count) sys=\(systemPromptEffective.count) mem=\(memoryContext.count) hidden=\(hiddenPrefix.count) userId=\(userIdentityContext.count) lang=\(languageAnchor.count) memIncluded=\(memoryIncluded) userIdIncluded=\(userIdentityIncluded) langIncluded=\(languageIncluded) sysTrim=\(systemWasTrimmed) memTrim=\(memoryWasTrimmed)")
+            print("[Prompt] ctxChars=\(maxPromptChars) promptChars=\(prompt.count) prefix=\(promptParts.prefix.count) suffix=\(promptParts.suffix.count) sys=\(systemPromptEffective.count) mem=\(memoryContext.count) hidden=\(hiddenPrefix.count) userId=\(userIdentityContext.count) lang=\(languageAnchor.count) memIncluded=\(memoryIncluded) userIdIncluded=\(userIdentityIncluded) langIncluded=\(languageIncluded) sysTrim=\(systemWasTrimmed) memTrim=\(memoryWasTrimmed)")
         }
 
         do {
             try runtime.generateStream(
-                prompt: prompt,
+                promptPrefix: promptParts.prefix,
+                prompt: promptParts.suffix,
                 maxTokens: maxTokens,
                 kvInjection: kvInjection,
                 sampling: sampling,
@@ -707,9 +1034,28 @@ private enum LLMGenerationRunner {
                     if firstTokenAt == nil {
                         firstTokenAt = Date()
                     }
+
                     emittedTokens += 1
-                    fullResponse.reserveCapacity(4096)
                     fullResponse += chunk
+
+                    if !promptEchoDetected {
+                        let probe = fullResponse
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                            .lowercased()
+
+                        if !normalizedUserPrompt.isEmpty,
+                           normalizedUserPrompt.count > 8,
+                           (probe == normalizedUserPrompt ||
+                            normalizedUserPrompt.hasPrefix(probe) ||
+                            probe.hasPrefix(normalizedUserPrompt)) {
+                            if fullResponse.count < max(256, userPrompt.count * 2) {
+                                return
+                            }
+                        }
+
+                        promptEchoDetected = true
+                    }
+
                     continuation.yield(chunk)
                 }
             )
@@ -739,11 +1085,10 @@ private enum LLMGenerationRunner {
             }
         }
 
-        let finalText = fullResponse.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+        let finalText = fullResponse.trimmingCharacters(in: .whitespacesAndNewlines)
         let sentences = finalText
-            .replacingOccurrences(of: "\n", with: " ")
             .split(whereSeparator: { ".!?".contains($0) })
-            .map { $0.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines) }
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
 
         let scored = sentences.map { sentence -> (String, Int) in
             let lower = sentence.lowercased()
@@ -765,8 +1110,7 @@ private enum LLMGenerationRunner {
 
         let best = scored
             .filter { $0.0.count > 20 }
-            .sorted { $0.1 > $1.1 }
-            .first
+            .max(by: { $0.1 < $1.1 })
 
         if options.storeResponseToMemory, let (raw, _) = best {
             let compressed = raw
@@ -796,7 +1140,7 @@ private enum LLMGenerationRunner {
     private static func detectProfile() -> PerformanceProfile {
         #if targetEnvironment(simulator)
         return .godmode
-        #else
+        #elseif canImport(UIKit)
         let model = UIDevice.current.modelName.lowercased()
         if model.contains("iphone13") || model.contains("iphone 13") {
             return .eco
@@ -807,45 +1151,13 @@ private enum LLMGenerationRunner {
         } else {
             return .beast
         }
+        #else
+        return .godmode
         #endif
     }
 
     private static func buildHiddenPrefix(from state: FieldStateSnapshot) -> String {
-        let field = serializeFieldVector(state.fieldVector, targetCount: 10)
-        let v = String(format: "%.2f", state.avgValence)
-        let i = String(format: "%.2f", state.avgIntensity)
-        let a = String(format: "%.2f", state.activationLevel)
-        let lines = [
-            "<internal>",
-            "F:\(field)",
-            "E:v=\(v),i=\(i)",
-            "A:mean=\(a)",
-            "</internal>"
-        ]
-        return lines.joined(separator: "\n")
-    }
-
-    private static func serializeFieldVector(_ field: [Double], targetCount: Int) -> String {
-        guard !field.isEmpty else { return "" }
-        let target = min(max(1, targetCount), field.count)
-        if field.count <= target {
-            return field.map { String(format: "%.2f", $0) }.joined(separator: ",")
-        }
-        let chunkSize = Double(field.count) / Double(target)
-        var out: [String] = []
-        out.reserveCapacity(target)
-        for i in 0..<target {
-            let start = Int(Double(i) * chunkSize)
-            let end = min(field.count, Int(Double(i + 1) * chunkSize))
-            if start >= end {
-                out.append("0.00")
-                continue
-            }
-            let slice = field[start..<end]
-            let avg = slice.reduce(0.0, +) / Double(slice.count)
-            out.append(String(format: "%.2f", avg))
-        }
-        return out.joined(separator: ",")
+        ""
     }
 
     private static func samplingConfig(from state: FieldStateSnapshot) -> SamplingConfig {

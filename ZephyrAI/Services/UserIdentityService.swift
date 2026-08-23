@@ -28,7 +28,7 @@ final class UserIdentityService: ObservableObject {
         if !cleanedName.isEmpty { parts.append("name=\(cleanedName)") }
         if !cleanedGender.isEmpty { parts.append("gender=\(cleanedGender)") }
         parts.append("These facts refer to the human user and persist across messages.")
-        parts.append("Your name is VALIS, not the user's name.")
+        parts.append("You have your own name, not the user's name.")
 
         var block = "\n\n" + parts.joined(separator: "\n")
         if block.count > maxChars {

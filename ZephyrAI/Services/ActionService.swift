@@ -1,6 +1,12 @@
 import Foundation
-import UIKit
 import EventKit
+import WeatherKit
+import CoreMotion
+import CoreLocation
+@preconcurrency import Network
+#if canImport(UIKit)
+import UIKit
+#endif
 
 @MainActor
 final class ActionService {
@@ -13,9 +19,107 @@ final class ActionService {
         let sourcePageURL: URL?
     }
 
-    private struct WebSearchResult {
-        let title: String
-        let url: URL
+    private struct PreparedSearchCandidate {
+        let query: String
+        let summary: String
+        let wikipediaSummary: String
+        let results: [SearchResult]
+        let trustedEvidence: [String]
+        let reliability: SearchReliability
+        let numericConflict: Bool
+        let sourceDisagreement: Bool
+
+        var score: Int {
+            var total = 0
+
+            // stronger reliability weighting
+            switch reliability {
+            case .high: total += 40
+            case .medium: total += 20
+            case .low: total += 5
+            }
+
+            // more sources = better (bounded)
+            total += min(results.count, 5) * 4
+
+            // trusted sources are critical
+            total += min(trustedEvidence.count, 4) * 10
+
+            let hasWiki = !wikipediaSummary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            let hasDDG = !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+
+            // consensus priority
+            if hasWiki && hasDDG {
+                total += 20
+            } else if hasWiki {
+                total += 10
+            } else if hasDDG {
+                total += 5
+            }
+
+            // hard penalties for conflicts
+            if sourceDisagreement { total -= 10 }
+            if numericConflict { total -= 12 }
+
+            return total
+        }
+    }
+
+    private enum SearchReliability: String {
+        case high
+        case medium
+        case low
+    }
+
+    struct ContextBlock {
+        let kind: Kind
+        let text: String
+
+        enum Kind {
+            case date
+            case search
+            case news
+            case url
+            case wiki
+            case weather
+            case health
+            case system
+            case error
+        }
+    }
+
+    struct PreparedContext {
+        let blocks: [ContextBlock]
+
+        var isEmpty: Bool {
+            blocks.allSatisfy { $0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        }
+
+        var rendered: String {
+            blocks
+                .filter { $0.kind != .error }
+                .map { $0.text }
+                .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                .joined(separator: "\n")
+        }
+
+        func text(for kind: ContextBlock.Kind) -> String? {
+            blocks
+                .first(where: { $0.kind == kind })?
+                .text
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .isEmpty == false
+                ? blocks.first(where: { $0.kind == kind })?.text
+                : nil
+        }
+
+        func hasSuccessBlock(for kind: ContextBlock.Kind) -> Bool {
+            blocks.contains { block in
+                block.kind == kind &&
+                !block.text.lowercased().contains("signal error") &&
+                !block.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
+        }
     }
 
     struct ActionCall {
@@ -32,11 +136,13 @@ final class ActionService {
         }
     }
 
+    private let multiSearchProvider = MultiSearchProvider.makeDefault()
     private let eventStore = EKEventStore()
     private let memoryService = MemoryService.shared
     private var webSummaryCache: [String: (text: String, timestamp: Date)] = [:]
     private var urlAnalysisCache: [String: (text: String, timestamp: Date)] = [:]
     private var urlValidationCache: [String: (isValid: Bool, timestamp: Date)] = [:]
+    private let preparedContextCache = NSCache<NSString, NSString>()
     private let webCacheTTL: TimeInterval = 600
     private let urlCacheTTL: TimeInterval = 900
 
@@ -45,32 +151,30 @@ final class ActionService {
     // MARK: - Public API
 
     func buildToolGuidanceBlock(hasTools: Bool) -> String {
-        return """
-Available actions:
-- `ACTION: calendar | op=create | title=... | start=YYYY-MM-DDTHH:MM:SS | end=YYYY-MM-DDTHH:MM:SS`
-- `ACTION: calendar | op=create | type=reminder | title=... | due=YYYY-MM-DDTHH:MM:SS`
-- `ACTION: calendar | op=open`
-- `ACTION: calendar | op=list | days=7`
-- `ACTION: open_url | url=https://...`
-- `ACTION: web_search | query=...`
-- `ACTION: analyze_url | url=https://...`
-- `ACTION: reddit_news | query=...`
-- `ACTION: date`
-
-When the user asks to create a reminder, event, meeting, appointment, or calendar item, call the calendar action instead of saying you lack access.
-If the request is an action, emit the action call directly.
-Do not answer calendar/reminder requests with HTML, artifacts, iframes, embeds, or web calendar links.
-
+        if hasTools {
+            return """
+Use the provided context to answer. Be direct and specific. Do not emit tool calls.
+Prefer local iPhone sources first: weather, device/system info, health/activity, calendar, reminders, and open_url when the user gave a URL.
+Use web_search only for external facts that local iPhone APIs cannot answer.
 """
+        }
+        return """
+Answer from your knowledge. Be direct and specific.
+Prefer local iPhone sources first when they can answer the request: weather, device/system info, health/activity, calendar, reminders, and open_url for explicit URLs.
+"""
+    }
 
-        + (hasTools ? """
-
-Signal results are available below. Use them directly and do not claim you lack internet access.
-
-""" : "")
+    func buildNewsToolPrimerBlock() -> String {
+        """
+For news, headlines, breaking stories, current events, and "что нового", the system automatically fetches RSS news from BBC, HN, and other sources. Answer from the fetched context. If no context is available, answer from your knowledge. NEVER ask for links.
+"""
     }
 
     func parseCall(from text: String) -> ActionCall? {
+        if let parsed = parseXMLStyleCall(from: text) {
+            return parsed
+        }
+
         let lines = text.components(separatedBy: .newlines)
         for rawLine in lines {
             let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -89,6 +193,31 @@ Signal results are available below. Use them directly and do not claim you lack 
             return nil
         }
         return parseCallPayload(String(text[payloadRange]))
+    }
+
+    private func parseXMLStyleCall(from text: String) -> ActionCall? {
+        let pattern = #"(?is)<\s*(web_search|wikipedia|rss_news|date|analyze_url|open_url|calendar|weather|health|system|tool|action)\s*>(.*?)\s*(?:</\s*\1\s*>)?"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = regex.firstMatch(in: text, range: range),
+              let nameRange = Range(match.range(at: 1), in: text),
+              let bodyRange = Range(match.range(at: 2), in: text) else {
+            return nil
+        }
+
+        let name = normalizeToolName(String(text[nameRange]))
+        let body = String(text[bodyRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return nil }
+
+        if name == "tool" || name == "action" {
+            return parseCallPayload(body)
+        }
+
+        let flattenedBody = body
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+
+        return parseCallPayload("\(name) \(flattenedBody)")
     }
 
     private func parseCallLine(_ line: String) -> ActionCall? {
@@ -148,8 +277,10 @@ Signal results are available below. Use them directly and do not claim you lack 
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
         switch key {
-        case "news", "reddit", "redditnews", "reddit_news":
-            return "reddit_news"
+        case "news", "reddit", "redditnews", "reddit_news", "rss_news", "rss", "feed":
+            return "rss_news"
+        case "wiki", "wikipedia", "wikipedia_search", "wiki_search", "encyclopedia":
+            return "wikipedia"
         case "search", "web", "websearch", "internet_search", "browse", "web_search":
             return "web_search"
         case "analyze_url", "url_analyze", "analyze_link", "link_analyze", "read_url", "summarize_url":
@@ -160,6 +291,12 @@ Signal results are available below. Use them directly and do not claim you lack 
             return "calendar"
         case "date", "time", "today_date":
             return "date"
+        case "weather", "forecast", "погода", "прогноз":
+            return "weather"
+        case "health", "steps", "pedometer", "шаги", "активность":
+            return "health"
+        case "system", "device", "battery", "storage", "устройство", "батарея":
+            return "system"
         default:
             return key
         }
@@ -169,84 +306,147 @@ Signal results are available below. Use them directly and do not claim you lack 
         switch call.name {
         case "date":
             return buildDateContextBlock()
+        case "wikipedia":
+            let topic = call.query.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !topic.isEmpty else {
+                return buildToolErrorBlock(toolName: "wikipedia", message: "Empty query.")
+            }
+            let wikiSummary = await fetchWikipediaSummary(topic: topic)
+            guard !wikiSummary.isEmpty else {
+                return buildToolErrorBlock(toolName: "wikipedia", message: "Wikipedia summary unavailable.")
+            }
+            ingestExternalSnippets(text: wikiSummary, source: "wikipedia", query: topic)
+            return buildWikipediaContextBlock(topic: topic, summary: wikiSummary)
         case "web_search":
             let q = call.query.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !q.isEmpty else {
                 return buildToolErrorBlock(toolName: "web_search", message: "Empty query.")
             }
-            let webContext = await fetchWebSummaryWithFallback(query: q)
+            let webContext = await buildPreparedSearchContext(for: q)
             if !webContext.isEmpty {
-                ingestExternalSnippets(text: webContext, source: "duckduckgo", query: q)
-                return buildToolContextBlock(from: webContext)
+                return webContext
             }
             return buildToolErrorBlock(toolName: "web_search", message: "Web search unavailable (network error).")
         case "analyze_url":
             return await runAnalyzeURLTool(call: call)
-        case "reddit_news":
-            do {
-                let news = try await fetchRedditNews(limit: 6)
-                if !news.isEmpty {
-                    return buildNewsContextBlock(from: news)
-                }
-                return buildToolErrorBlock(toolName: "reddit_news", message: "No news items returned.")
-            } catch {
-                return buildToolErrorBlock(toolName: "reddit_news", message: "Reddit news unavailable (network error).")
+        case "rss_news":
+            let news = await fetchRSSNews(limit: 8, query: call.query)
+            if !news.isEmpty {
+                return buildNewsContextBlock(from: news, query: call.query)
             }
+            return buildToolErrorBlock(toolName: "rss_news", message: "No news items returned from RSS feeds.")
         case "open_url", "url":
             return await runOpenURLAction(call: call)
         case "calendar", "open_calendar":
             return await runCalendarAction(call: call)
+        case "weather":
+            return await runWeatherAction(call: call)
+        case "health":
+            return await runHealthAction(call: call)
+        case "system":
+            return await runSystemAction(call: call)
         default:
             return buildToolErrorBlock(toolName: call.name, message: "Unknown tool.")
         }
     }
 
-    func aggregateRuleBasedContext(for prompt: String) async -> String {
-        var blocks: [String] = []
+    func aggregateRuleBasedContext(for prompt: String) async -> PreparedContext {
+        let intent = IntentRouter.classify(prompt)
+        print("[SearchDiag] prompt=\(prompt.prefix(80)) search=\(intent.search) news=\(intent.news) wiki=\(intent.wiki)")
 
-        // Always provide current date/time context so the model does not drift on relative dates.
-        let dateContext = buildDateContextBlock()
-        if !dateContext.isEmpty {
-            blocks.append(dateContext)
-        }
+        async let dateTask: String = buildDateContextBlock()
+        async let weatherTask: String = {
+            guard intent.weather else { return "" }
+            let location = self.extractWeatherLocationCandidate(from: prompt)
+            let args = location.map { ["location": $0] } ?? [:]
+            return await self.runWeatherAction(call: ActionCall(name: "weather", query: prompt, args: args))
+        }()
+        async let healthTask: String = {
+            guard intent.health else { return "" }
+            return await self.runHealthAction(call: ActionCall(name: "health", query: prompt, args: [:]))
+        }()
+        async let systemTask: String = {
+            guard intent.system else { return "" }
+            return await self.runSystemAction(call: ActionCall(name: "system", query: prompt, args: [:]))
+        }()
+        async let searchTask: String = {
+            guard intent.search || intent.news || intent.wiki else { return "" }
+            let result = await self.buildPreparedSearchContext(for: prompt)
+            if !result.isEmpty { return result }
 
-        if shouldUseWebSearch(for: prompt) {
-            let webContext = await fetchWebSummaryWithFallback(query: prompt)
-            if !webContext.isEmpty {
-                ingestExternalSnippets(text: webContext, source: "duckduckgo", query: prompt)
-                blocks.append(buildToolContextBlock(from: webContext))
+            let topic = prompt
+                .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard topic.count >= 3 else { return "" }
+
+            let titles = await self.fetchWikipediaSearchResults(query: topic, limit: 2)
+            if let first = titles.first {
+                let summary = await self.fetchWikipediaSummary(topic: first)
+                if !summary.isEmpty {
+                    return await self.buildWikipediaContextBlock(topic: first, summary: summary)
+                }
+            }
+            let directSummary = await self.fetchWikipediaSummary(topic: topic)
+            if !directSummary.isEmpty {
+                return await self.buildWikipediaContextBlock(topic: topic, summary: directSummary)
+            }
+            return ""
+        }()
+        async let newsTask: String = {
+            guard intent.news || intent.search else { return "" }
+            let news = await self.fetchRSSNews(limit: 8, query: prompt)
+            if !news.isEmpty {
+                return await self.buildNewsContextBlock(from: news, query: prompt)
+            }
+            return ""
+        }()
+        async let urlFetchResults: [(String, String)] = {
+            guard !intent.urlAnalysis.isEmpty else { return [] }
+            var results: [(String, String)] = []
+            for urlString in intent.urlAnalysis {
+                guard let url = URL(string: urlString) else { continue }
+                let analysis = await self.analyzeURL(url)
+                results.append((url.absoluteString, analysis))
+            }
+            return results
+        }()
+
+        let (dateResult, weatherResult, healthResult, systemResult, searchResult, newsResult, rawUrlResults) = await (dateTask, weatherTask, healthTask, systemTask, searchTask, newsTask, urlFetchResults)
+        print("[SearchDiag] date=\(dateResult.prefix(40)) weather=\(weatherResult.prefix(40)) search=\(searchResult.prefix(60)) news=\(newsResult.prefix(60))")
+
+        var urlBlocks: [ContextBlock] = []
+        for (urlString, analysis) in rawUrlResults {
+            if !analysis.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               let url = URL(string: urlString) {
+                ingestExternalSnippets(text: analysis, source: "url", query: urlString)
+                urlBlocks.append(ContextBlock(kind: .url, text: buildURLContextBlock(url: url, analysis: analysis)))
             } else {
-                blocks.append(buildToolErrorBlock(toolName: "web_search", message: "Web search unavailable (network error)."))
+                urlBlocks.append(ContextBlock(kind: .error, text: buildToolErrorBlock(toolName: "analyze_url", message: "Could not extract meaningful content from \(urlString).")))
             }
         }
 
-        let urls = extractURLs(from: prompt)
-        if !urls.isEmpty {
-            for url in urls.prefix(2) {
-                let analysis = await analyzeURL(url)
-                if !analysis.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    ingestExternalSnippets(text: analysis, source: "url", query: url.absoluteString)
-                    blocks.append(buildURLContextBlock(url: url, analysis: analysis))
-                } else {
-                    blocks.append(buildToolErrorBlock(toolName: "analyze_url", message: "Could not extract meaningful content from \(url.absoluteString)."))
-                }
-            }
+        var blocks: [ContextBlock] = []
+        if !dateResult.isEmpty {
+            blocks.append(ContextBlock(kind: .date, text: dateResult))
         }
-
-        if shouldUseNewsTool(for: prompt) {
-            do {
-                let news = try await fetchRedditNews(limit: 6)
-                if !news.isEmpty {
-                    blocks.append(buildNewsContextBlock(from: news))
-                } else {
-                    blocks.append(buildToolErrorBlock(toolName: "reddit_news", message: "No news items returned."))
-                }
-            } catch {
-                blocks.append(buildToolErrorBlock(toolName: "reddit_news", message: "Reddit news unavailable (network error)."))
-            }
+        if !weatherResult.isEmpty {
+            blocks.append(ContextBlock(kind: .weather, text: weatherResult))
         }
+        if !healthResult.isEmpty {
+            blocks.append(ContextBlock(kind: .health, text: healthResult))
+        }
+        if !systemResult.isEmpty {
+            blocks.append(ContextBlock(kind: .system, text: systemResult))
+        }
+        if !searchResult.isEmpty {
+            blocks.append(ContextBlock(kind: .search, text: searchResult))
+        }
+        if !newsResult.isEmpty {
+            blocks.append(ContextBlock(kind: .news, text: newsResult))
+        }
+        blocks.append(contentsOf: urlBlocks)
 
-        return blocks.joined(separator: "\n")
+        return PreparedContext(blocks: blocks)
     }
 
     func fetchRelevantWebImage(for query: String) async -> WebImageCandidate? {
@@ -271,24 +471,34 @@ Signal results are available below. Use them directly and do not claim you lack 
     }
 
     func autonomousContext(for topic: String) async -> String {
-        let ddg = await fetchWebSummaryWithFallback(query: topic)
-        let wiki = await fetchWikipediaSummary(topic: topic)
+        let trimmedTopic = topic.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTopic.isEmpty else { return buildDateContextBlock() }
 
-        if !ddg.isEmpty {
-            ingestExternalSnippets(text: ddg, source: "duckduckgo", query: topic)
+        var parts: [String] = [buildDateContextBlock()]
+        let searchContext = await buildPreparedSearchContext(for: trimmedTopic)
+        if !searchContext.isEmpty {
+            parts.append(searchContext)
+        } else {
+            let wiki = await fetchWikipediaSummary(topic: trimmedTopic)
+            if !wiki.isEmpty {
+                ingestExternalSnippets(text: wiki, source: "wikipedia", query: trimmedTopic)
+                parts.append(buildWikipediaContextBlock(topic: trimmedTopic, summary: wiki))
+            }
         }
-        if !wiki.isEmpty {
-            ingestExternalSnippets(text: wiki, source: "wikipedia", query: topic)
-        }
+        return parts.joined(separator: "\n")
+    }
 
-        var parts: [String] = []
-        if !ddg.isEmpty {
-            parts.append("DuckDuckGo summary:\n\(ddg)")
-        }
-        if !wiki.isEmpty {
-            parts.append("Wikipedia summary:\n\(wiki)")
-        }
-        return parts.joined(separator: "\n\n")
+    func autonomousSnippets(for topic: String) async -> [String] {
+        let context = await autonomousContext(for: topic)
+        let snippets = context
+            .components(separatedBy: "\n\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .map { snippet -> String in
+                let singleLine = snippet.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+                return singleLine.count > 320 ? String(singleLine.prefix(320)) + "…" : singleLine
+            }
+        return Array(snippets.prefix(4))
     }
 
     // MARK: - Parsing / Blocks
@@ -326,13 +536,139 @@ Signal context (web):
 """
     }
 
-    private func buildNewsContextBlock(from newsContext: String) -> String {
+    private func replyLanguageLine(for query: String) -> String {
+        guard let code = LanguageRoutingService.detectedNormalizedCode(for: query),
+              let name = LanguageRoutingService.displayName(forNormalizedCode: code),
+              !name.isEmpty else {
+            return "Reply language: same as the user's query."
+        }
+        return "Reply language: \(name)."
+    }
+
+    private func buildPreparedSearchContextBlock(
+        query: String,
+        summary: String,
+        wikipediaSummary: String,
+        results: [SearchResult],
+        trustedEvidence: [String]
+    ) -> String {
+        let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedQuery.isEmpty else { return "" }
+
+        let reliability = searchReliability(forSummary: summary, wikipediaSummary: wikipediaSummary, results: results)
+        let numericConflict = detectNumericConflict(summary: summary, wikipediaSummary: wikipediaSummary, trustedEvidence: trustedEvidence)
+        let sourceDisagreement = detectSourceDisagreement(
+            summary: summary,
+            wikipediaSummary: wikipediaSummary,
+            trustedEvidence: trustedEvidence
+        )
+        var lines: [String] = [
+            "Verified tool context:",
+            "Query: \(trimmedQuery)",
+            replyLanguageLine(for: trimmedQuery),
+        ]
+
+        let isLowConfidence = (reliability == .low) || numericConflict
+
+        if isLowConfidence {
+            lines.append("Note: evidence is limited. Answer cautiously.")
+        }
+
+        let compactSummary = compactSearchSummary(summary)
+        if !compactSummary.isEmpty {
+            lines.append("Search summary: \(compactSummary)")
+        }
+
+        let compactWikipedia = compactSearchSummary(wikipediaSummary)
+        if !compactWikipedia.isEmpty {
+            lines.append("Wikipedia summary: \(compactWikipedia)")
+        }
+
+        if sourceDisagreement {
+            lines.append("Source note: different sources describe the topic differently. Present the disagreement instead of collapsing it into one claim.")
+        }
+
+        if numericConflict {
+            lines.append("Verification note: numeric values differ across sources. Never output a single number without attribution.")
+        }
+
+        if containsPopulationIntent(trimmedQuery) {
+            lines.append("Verification note: population figures may refer to metro area vs city proper. Name the source and scope.")
+        }
+
+        let topResults = results.prefix(3).map { result in
+            let host = result.url.host?.lowercased() ?? result.url.absoluteString
+            let trust = trustedDomainScore(for: result.url)
+            let trustLabel = trust >= 0.85 ? "reference-source" : (trust >= 0.55 ? "reputable-source" : "open-source")
+            return "- \(result.title)\n  \(result.url.absoluteString)\n  domain: \(host) · \(trustLabel)"
+        }
+        if !topResults.isEmpty {
+            lines.append("Top results:\n" + topResults.joined(separator: "\n"))
+        }
+
+        if !trustedEvidence.isEmpty {
+            lines.append("Trusted evidence:\n" + trustedEvidence.joined(separator: "\n"))
+        }
+
+        return "\n" + lines.joined(separator: "\n") + "\n"
+    }
+
+    private func buildStudiedInformationSynthesis(summary: String, wikipediaSummary: String, trustedEvidence: [String]) -> String {
+        var fragments: [String] = []
+
+        let normalizedWikipedia = compactSearchAnswerSeed(from: wikipediaSummary, maxChars: 180)
+        if !normalizedWikipedia.isEmpty {
+            fragments.append("Wikipedia: \(normalizedWikipedia)")
+        }
+
+        let normalizedDDG = compactSearchAnswerSeed(from: summary, maxChars: 180)
+        if !normalizedDDG.isEmpty, normalizedDDG.caseInsensitiveCompare(normalizedWikipedia) != .orderedSame {
+            fragments.append("DDG: \(normalizedDDG)")
+        }
+
+        for evidence in trustedEvidence {
+            let compact = compactSearchSummary(evidence, maxChars: 220)
+            guard !compact.isEmpty else { continue }
+            fragments.append(compact)
+            if fragments.count >= 3 {
+                break
+            }
+        }
+
+        return fragments.joined(separator: " | ")
+    }
+
+    func testBuildPreparedSearchContextBlock(query: String, summary: String, wikipediaSummary: String, results: [(title: String, url: URL)], trustedEvidence: [String] = []) -> String {
+        buildPreparedSearchContextBlock(
+            query: query,
+            summary: summary,
+            wikipediaSummary: wikipediaSummary,
+            results: results.map { SearchResult(title: $0.title, url: $0.url) },
+            trustedEvidence: trustedEvidence
+        )
+    }
+
+    private func buildWikipediaContextBlock(topic: String, summary: String) -> String {
+        let trimmedTopic = topic.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedSummary = compactSearchSummary(summary, maxChars: 420)
+        guard !trimmedTopic.isEmpty, !trimmedSummary.isEmpty else { return "" }
+        return """
+
+Signal context (wikipedia):
+Topic: \(trimmedTopic)
+Summary: \(trimmedSummary)
+
+"""
+    }
+
+    private func buildNewsContextBlock(from newsContext: String, query: String = "") -> String {
         guard !newsContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return ""
         }
         return """
 
 Signal context (news):
+\(query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "" : replyLanguageLine(for: query) + "\n")
 \(newsContext)
 
 """
@@ -381,6 +717,30 @@ ISO‑время: \(iso)
 """
     }
 
+    nonisolated private func extractWeatherLocationCandidate(from prompt: String) -> String? {
+        let text = normalizedRuleTriggerText(prompt)
+        let patterns = [
+            #"(?i)\b(?:weather|forecast|погода|прогноз)\s+(?:in|at|for|в|для)\s+([A-Za-zА-Яа-яЁё0-9\-\s\.,]{2,})$"#,
+            #"(?i)\b(?:weather in|forecast in|погода в|прогноз в)\s+([A-Za-zА-Яа-яЁё0-9\-\s\.,]{2,})$"#,
+            #"(?i)\b(?:in|at|for|в|для)\s+([A-Za-zА-Яа-яЁё0-9\-\s\.,]{2,})$"#
+        ]
+
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            let range = NSRange(text.startIndex..<text.endIndex, in: text)
+            guard let match = regex.firstMatch(in: text, range: range),
+                  let locationRange = Range(match.range(at: 1), in: text) else {
+                continue
+            }
+            let location = String(text[locationRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !location.isEmpty {
+                return location
+            }
+        }
+
+        return nil
+    }
+
     private func actionResultBlock(_ title: String, _ message: String) -> String {
         """
 
@@ -393,12 +753,15 @@ Signal action (\(title)):
     // MARK: - Rule Triggers
 
     private func shouldUseWebSearch(for text: String) -> Bool {
-        let lowercased = text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        let lowercased = normalizedRuleTriggerText(text).lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
         if lowercased.isEmpty { return false }
 
         // Never trigger web search for local action/calendar intents.
         let localActionHints = [
             "calendar", "event", "reminder", "schedule", "appointment",
+            "weather", "forecast", "temperature", "погода", "прогноз", "температура",
+            "health", "steps", "activity", "workout", "fitness", "шаги", "активность",
+            "system", "device", "battery", "storage", "memory", "thermal", "заряд", "память", "система",
             "календар", "событ", "напоминан", "встреч", "расписан",
             "action:", "tool: calendar", "op=create", "op=list", "op=open"
         ]
@@ -413,7 +776,8 @@ Signal action (\(title)):
         // Explicit search intent.
         let directTriggers = [
             "search", "google", "web", "internet", "look up", "lookup", "find online",
-            "найди", "найти", "поиск", "в интернете", "загугли", "поищи", "погугли"
+            "find info", "research", "info", "details", "learn more",
+            "найди", "найти", "узнай", "инфу", "информация", "поиск", "в интернете", "загугли", "поищи", "погугли"
         ]
         if directTriggers.contains(where: { lowercased.contains($0) }) {
             return true
@@ -455,12 +819,37 @@ Signal action (\(title)):
     }
 
     private func shouldUseNewsTool(for text: String) -> Bool {
-        let lowercased = text.lowercased()
+        let lowercased = normalizedRuleTriggerText(text).lowercased()
         let triggers = [
             "news", "latest", "headlines", "breaking",
             "новости", "свежие новости", "последние новости", "что нового"
         ]
         return triggers.contains { lowercased.contains($0) }
+    }
+
+    nonisolated private func normalizedRuleTriggerText(_ text: String) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lines = trimmed
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        guard let first = lines.first else { return trimmed }
+        let prefixes = [
+            "user question:",
+            "question:",
+            "user prompt:",
+            "prompt:",
+            "query:"
+        ]
+        let lowerFirst = first.lowercased()
+        guard let prefix = prefixes.first(where: { lowerFirst.hasPrefix($0) }) else {
+            return trimmed
+        }
+
+        let remainder = first.dropFirst(prefix.count).trimmingCharacters(in: .whitespacesAndNewlines)
+        let tail = lines.dropFirst()
+        return ([remainder] + tail).filter { !$0.isEmpty }.joined(separator: "\n")
     }
 
     // MARK: - Actions
@@ -555,9 +944,16 @@ Signal action (\(title)):
 
     private func openExternalURL(_ url: URL) async -> Bool {
         await withCheckedContinuation { continuation in
+            #if canImport(UIKit)
             UIApplication.shared.open(url, options: [:]) { ok in
                 continuation.resume(returning: ok)
             }
+            #elseif canImport(AppKit)
+            let ok = NSWorkspace.shared.open(url)
+            continuation.resume(returning: ok)
+            #else
+            continuation.resume(returning: false)
+            #endif
         }
     }
 
@@ -767,13 +1163,15 @@ Signal action (\(title)):
         guard !text.isEmpty else { return nil }
 
         let lower = text.lowercased()
-        if lower == "tomorrow" || lower == "завтра" {
+        
+        // tomorrow с опечатками
+        if lower == "tomorrow" || lower == "tommorow" || lower == "завтра" {
             return composeRelativeDate(dayOffset: 1, sourceText: lower)
         }
         if lower == "today" || lower == "сегодня" {
             return composeRelativeDate(dayOffset: 0, sourceText: lower)
         }
-        if lower.contains("tomorrow") || lower.contains("завтра") {
+        if lower.contains("tomorrow") || lower.contains("tommorow") || lower.contains("завтра") {
             return composeRelativeDate(dayOffset: 1, sourceText: lower)
         }
         if lower.contains("today") || lower.contains("сегодня") {
@@ -883,12 +1281,29 @@ Signal action (\(title)):
         var components = Calendar.current.dateComponents([.year, .month, .day], from: target)
         components.timeZone = .current
 
+        // Сначала ищем явное время (9:30)
         if let (h, m) = extractTimeFromText(sourceText) {
             components.hour = h
             components.minute = m
         } else {
-            components.hour = 9
-            components.minute = 0
+            // morning/afternoon/evening по умолчанию
+            let lower = sourceText.lowercased()
+            if lower.contains("morning") || lower.contains("утра") || lower.contains("утром") {
+                components.hour = 9
+                components.minute = 0
+            } else if lower.contains("afternoon") || lower.contains("дня") || lower.contains("днём") {
+                components.hour = 14
+                components.minute = 0
+            } else if lower.contains("evening") || lower.contains("вечера") || lower.contains("вечером") {
+                components.hour = 18
+                components.minute = 0
+            } else if lower.contains("night") || lower.contains("ночи") || lower.contains("ночью") {
+                components.hour = 20
+                components.minute = 0
+            } else {
+                components.hour = 9
+                components.minute = 0
+            }
         }
 
         target = Calendar.current.date(from: components) ?? target
@@ -896,6 +1311,9 @@ Signal action (\(title)):
     }
 
     private func extractTimeFromText(_ text: String) -> (Int, Int)? {
+        let lower = text.lowercased()
+        
+        // Сначала ищем явное время HH:MM
         let pattern = #"(\d{1,2}):(\d{2})"#
         guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
         let range = NSRange(text.startIndex..<text.endIndex, in: text)
@@ -906,6 +1324,19 @@ Signal action (\(title)):
               let minute = Int(text[minuteRange]),
               (0...23).contains(hour),
               (0...59).contains(minute) else {
+            // Если нет явного времени, используем morning/afternoon/evening
+            if lower.contains("morning") || lower.contains("утра") || lower.contains("утром") {
+                return (9, 0)
+            }
+            if lower.contains("afternoon") || lower.contains("дня") || lower.contains("днём") {
+                return (14, 0)
+            }
+            if lower.contains("evening") || lower.contains("вечера") || lower.contains("вечером") {
+                return (18, 0)
+            }
+            if lower.contains("night") || lower.contains("ночи") || lower.contains("ночью") {
+                return (20, 0)
+            }
             return nil
         }
         return (hour, minute)
@@ -931,7 +1362,354 @@ Signal action (\(title)):
         return formatter.string(from: date)
     }
 
+    // MARK: - Weather (WeatherKit)
+
+    private func runWeatherAction(call: ActionCall) async -> String {
+        let rawLocation = call.args["location"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+            ?? extractWeatherLocationCandidate(from: call.query)
+            ?? ""
+        let rawTime = call.args["time"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "now"
+        let rawUnits = call.args["units"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "metric"
+        let includeHourly = parseBoolean(call.args["includeHourly"])
+        let includeDaily: Bool = {
+            if let v = call.args["includeDaily"] { return parseBoolean(v) }
+            return rawTime != "now" && rawTime != "24h"
+        }()
+
+        let location: CLLocation
+        if rawLocation.isEmpty {
+            guard let current = await resolveDeviceLocation() else {
+                return buildToolErrorBlock(toolName: "weather", message: "Location unavailable. Set location param or allow location access.")
+            }
+            location = current
+        } else {
+            guard let geocoded = await geocodeLocation(rawLocation) else {
+                return buildToolErrorBlock(toolName: "weather", message: "Could not resolve location: \(rawLocation)")
+            }
+            location = geocoded
+        }
+
+        let weather: Weather
+        do {
+            weather = try await WeatherService.shared.weather(for: location)
+        } catch {
+            return buildToolErrorBlock(toolName: "weather", message: "Weather fetch failed: \(error.localizedDescription)")
+        }
+
+        let tempUnit: UnitTemperature = rawUnits == "imperial" ? .fahrenheit : .celsius
+        let speedUnit: UnitSpeed = rawUnits == "imperial" ? .milesPerHour : .kilometersPerHour
+
+        let current = weather.currentWeather
+        let temp = current.temperature.converted(to: tempUnit).value
+        let feelsLike = current.apparentTemperature.converted(to: tempUnit).value
+        let condition = current.condition.description
+        let humidity = current.humidity
+        let wind = current.wind.speed.converted(to: speedUnit).value
+        let uvIndex = current.uvIndex.value
+
+        var lines: [String] = [
+            "Signal context (weather):",
+            "Location: \(location.coordinate.latitude), \(location.coordinate.longitude)",
+            "Current: \(String(format: "%.0f", temp))° (\(condition))",
+            "Feels like: \(String(format: "%.0f", feelsLike))°",
+            "Humidity: \(Int(humidity * 100))%",
+            "Wind: \(String(format: "%.0f", wind)) \(rawUnits == "imperial" ? "mph" : "km/h")",
+            "UV index: \(Int(uvIndex))"
+        ]
+
+        let timeWindow = resolveTimeWindow(rawTime)
+
+        if includeHourly {
+            let hourly = weather.hourlyForecast.forecast.prefix(12)
+            let hourLines = hourly.map { h in
+                let t = h.temperature.converted(to: tempUnit).value
+                let hour = Calendar.current.component(.hour, from: h.date)
+                return "  \(hour):00 — \(String(format: "%.0f", t))° \(h.condition.description)"
+            }
+            lines.append("Hourly (next 12h):\n" + hourLines.joined(separator: "\n"))
+        }
+
+        if includeDaily {
+            let daily = weather.dailyForecast.forecast.prefix(timeWindow)
+            let dayLines = daily.map { d in
+                let hi = d.highTemperature.converted(to: tempUnit).value
+                let lo = d.lowTemperature.converted(to: tempUnit).value
+                let df = DateFormatter()
+                df.dateFormat = "EEE"
+                return "  \(df.string(from: d.date)): \(String(format: "%.0f", lo))–\(String(format: "%.0f", hi))° \(d.condition.description)"
+            }
+            lines.append("Daily forecast:\n" + dayLines.joined(separator: "\n"))
+        }
+
+        return lines.joined(separator: "\n") + "\n"
+    }
+
+    private func resolveTimeWindow(_ raw: String) -> Int {
+        switch raw {
+        case "3d": return 3
+        case "7d": return 7
+        case "10d": return 10
+        default: return 1
+        }
+    }
+
+    // MARK: - Health (CoreMotion)
+
+    private func runHealthAction(call: ActionCall) async -> String {
+        let rawStat = call.args["stat"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "summary"
+        let rawRange = call.args["range"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "today"
+
+        guard CMPedometer.isStepCountingAvailable() else {
+            return buildToolErrorBlock(toolName: "health", message: "Step counting not available on this device.")
+        }
+
+        let (start, end) = resolveHealthRange(rawRange)
+
+        let pedometer = CMPedometer()
+        let data = await withCheckedContinuation { (continuation: CheckedContinuation<CMPedometerData?, Never>) in
+            pedometer.queryPedometerData(from: start, to: end) { data, _ in
+                continuation.resume(returning: data)
+            }
+        }
+
+        guard let data else {
+            return buildToolErrorBlock(toolName: "health", message: "No step data available for this range.")
+        }
+
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        let startStr = formatter.string(from: start)
+        let endStr = formatter.string(from: end)
+
+        var lines: [String] = [
+            "Signal context (health):",
+            "Range: \(startStr) — \(endStr)",
+            "Steps: \(data.numberOfSteps.intValue)"
+        ]
+
+        if rawStat == "distance" || rawStat == "summary" {
+            if let dist = data.distance {
+                lines.append("Distance: \(String(format: "%.1f", dist.doubleValue)) m")
+            }
+        }
+
+        if rawStat == "floors" || rawStat == "summary" {
+            let up = data.floorsAscended?.intValue ?? 0
+            let down = data.floorsDescended?.intValue ?? 0
+            lines.append("Floors: ↑\(up) ↓\(down)")
+        }
+
+        if rawStat == "summary" {
+            let hours = Calendar.current.dateComponents([.hour], from: start, to: end).hour ?? 1
+            let pace = hours > 0 ? Double(data.numberOfSteps.intValue) / Double(hours) : 0
+            lines.append("Avg steps/hour: \(Int(pace))")
+        }
+
+        return lines.joined(separator: "\n") + "\n"
+    }
+
+    private func resolveHealthRange(_ raw: String) -> (start: Date, end: Date) {
+        let cal = Calendar.current
+        let now = Date()
+        switch raw {
+        case "yesterday":
+            let yesterday = cal.date(byAdding: .day, value: -1, to: cal.startOfDay(for: now)) ?? now
+            return (yesterday, cal.startOfDay(for: now))
+        case "week":
+            let weekAgo = cal.date(byAdding: .day, value: -7, to: cal.startOfDay(for: now)) ?? now
+            return (weekAgo, now)
+        case "month":
+            let monthAgo = cal.date(byAdding: .month, value: -1, to: cal.startOfDay(for: now)) ?? now
+            return (monthAgo, now)
+        default:
+            return (cal.startOfDay(for: now), now)
+        }
+    }
+
+    // MARK: - System (Device Info)
+
+    private func runSystemAction(call: ActionCall) async -> String {
+        let rawInclude = call.args["include"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "general"
+        let parts = Set(rawInclude.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) })
+
+        var lines: [String] = ["Signal context (system):"]
+
+        if parts.contains("general") || parts.isEmpty {
+            lines.append(contentsOf: buildSystemGeneralInfo())
+        }
+        if parts.contains("battery") {
+            lines.append(contentsOf: buildSystemBatteryInfo())
+        }
+        if parts.contains("storage") {
+            lines.append(contentsOf: buildSystemStorageInfo())
+        }
+        if parts.contains("memory") {
+            lines.append(contentsOf: buildSystemMemoryInfo())
+        }
+        if parts.contains("network") {
+            lines.append(contentsOf: buildSystemNetworkInfo())
+        }
+        if parts.contains("thermal") {
+            lines.append(contentsOf: buildSystemThermalInfo())
+        }
+
+        return lines.joined(separator: "\n") + "\n"
+    }
+
+    private func buildSystemGeneralInfo() -> [String] {
+        #if canImport(UIKit)
+        let device = UIDevice.current
+        return [
+            "Model: \(device.model)",
+            "System: \(device.systemName) \(device.systemVersion)",
+            "Name: \(device.name)",
+            "Cores: \(ProcessInfo.processInfo.activeProcessorCount)/\(ProcessInfo.processInfo.processorCount)"
+        ]
+        #else
+        return ["Platform: macOS \(ProcessInfo.processInfo.operatingSystemVersionString)"]
+        #endif
+    }
+
+    private func buildSystemBatteryInfo() -> [String] {
+        #if canImport(UIKit)
+        let device = UIDevice.current
+        device.isBatteryMonitoringEnabled = true
+        let level = device.batteryLevel
+        let state: String
+        switch device.batteryState {
+        case .charging: state = "charging"
+        case .full: state = "full"
+        case .unplugged: state = "unplugged"
+        default: state = "unknown"
+        }
+        let lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
+        return [
+            "Battery: \(level >= 0 ? "\(Int(level * 100))%" : "unknown")",
+            "State: \(state)",
+            "Low Power Mode: \(lowPower ? "on" : "off")"
+        ]
+        #else
+        return ["Battery: N/A"]
+        #endif
+    }
+
+    private func buildSystemStorageInfo() -> [String] {
+        let fm = FileManager.default
+        guard let attrs = try? fm.attributesOfFileSystem(forPath: fm.urls(for: .documentDirectory, in: .userDomainMask).first?.path ?? "/"),
+              let total = attrs[.systemSize] as? Int64,
+              let free = attrs[.systemFreeSize] as? Int64 else {
+            return ["Storage: unavailable"]
+        }
+        let used = total - free
+        return [
+            "Storage: \(formatByteCount(used)) used / \(formatByteCount(total)) total",
+            "Free: \(formatByteCount(free))"
+        ]
+    }
+
+    private func buildSystemMemoryInfo() -> [String] {
+        let total = ProcessInfo.processInfo.physicalMemory
+        var info = mach_task_basic_info()
+        var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size) / 4
+        let result = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else {
+            return ["Memory: \(formatByteCount(Int64(total))) total, usage unavailable"]
+        }
+        let used = info.resident_size
+        return [
+            "Memory: \(formatByteCount(Int64(used))) used / \(formatByteCount(Int64(total))) total"
+        ]
+    }
+
+    private func buildSystemNetworkInfo() -> [String] {
+        let monitor = NWPathMonitor()
+        let path = monitor.currentPath
+        if path.usesInterfaceType(.wifi) {
+            return ["Network: Wi-Fi"]
+        } else if path.usesInterfaceType(.cellular) {
+            return ["Network: Cellular"]
+        } else if path.usesInterfaceType(.wiredEthernet) {
+            return ["Network: Wired"]
+        } else {
+            return ["Network: offline or unknown"]
+        }
+    }
+
+    private func buildSystemThermalInfo() -> [String] {
+        #if canImport(UIKit)
+        let state: String
+        switch ProcessInfo.processInfo.thermalState {
+        case .nominal: state = "nominal"
+        case .fair: state = "fair"
+        case .serious: state = "serious — performance reduced"
+        case .critical: state = "critical — app may be suspended"
+        @unknown default: state = "unknown"
+        }
+        return ["Thermal: \(state)"]
+        #else
+        return ["Thermal: N/A"]
+        #endif
+    }
+
+    private func formatByteCount(_ bytes: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    }
+
+    // MARK: - Location Helpers
+
+    private var cachedLocation: CLLocation?
+    private var locationCacheTime: Date?
+
+    private func resolveDeviceLocation() async -> CLLocation? {
+        if let cached = cachedLocation, let t = locationCacheTime,
+           Date().timeIntervalSince(t) < 300 {
+            return cached
+        }
+        return await withCheckedContinuation { continuation in
+            let manager = CLLocationManager()
+            let helper = LocationHelper(manager: manager) { location in
+                self.cachedLocation = location
+                self.locationCacheTime = Date()
+                continuation.resume(returning: location)
+            }
+            helper.onFailure = {
+                continuation.resume(returning: nil)
+            }
+            helper.request()
+        }
+    }
+
+    private func geocodeLocation(_ query: String) async -> CLLocation? {
+        await withCheckedContinuation { continuation in
+            let geocoder = CLGeocoder()
+            geocoder.geocodeAddressString(query) { placemarks, _ in
+                guard let first = placemarks?.first, let loc = first.location else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                continuation.resume(returning: loc)
+            }
+        }
+    }
+
     // MARK: - External Fetch
+
+    private struct WikipediaSearchResponse: Decodable {
+        let query: Query?
+
+        struct Query: Decodable {
+            let search: [SearchResult]?
+
+            struct SearchResult: Decodable {
+                let title: String?
+                let snippet: String?
+            }
+        }
+    }
 
     private struct DuckDuckGoResponse: Decodable {
         let Abstract: String?
@@ -1016,57 +1794,15 @@ Signal action (\(title)):
         return parts.joined(separator: "\n\n")
     }
 
-    private func fetchDuckDuckGoLiteResults(query: String, limit: Int = 4) async throws -> String {
-        let results = try await fetchDuckDuckGoLiteSearchResults(query: query, limit: limit)
-        return results.map { "- \($0.title)\n  \($0.url.absoluteString)" }.joined(separator: "\n")
-    }
-
-    private func fetchDuckDuckGoLiteSearchResults(query: String, limit: Int = 4) async throws -> [WebSearchResult] {
-        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return [] }
-
-        var components = URLComponents(string: "https://lite.duckduckgo.com/lite/")!
-        components.queryItems = [URLQueryItem(name: "q", value: trimmed)]
-        guard let url = components.url else { return [] }
-
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 12
-        request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile", forHTTPHeaderField: "User-Agent")
-
-        let (data, _) = try await URLSession.shared.data(for: request)
-        guard let html = String(data: data, encoding: .utf8) else { return [] }
-
-        let anchorPattern = "(?is)<a[^>]*href=\"([^\"]+)\"[^>]*>(.*?)</a>"
-        guard let regex = try? NSRegularExpression(pattern: anchorPattern) else { return [] }
-        let range = NSRange(html.startIndex..<html.endIndex, in: html)
-        let matches = regex.matches(in: html, range: range)
-
-        var results: [WebSearchResult] = []
-        for match in matches {
-            guard results.count < limit else { break }
-            guard let hrefRange = Range(match.range(at: 1), in: html),
-                  let titleRange = Range(match.range(at: 2), in: html) else { continue }
-
-            var href = String(html[hrefRange]).trimmingCharacters(in: .whitespacesAndNewlines)
-            var title = String(html[titleRange]).trimmingCharacters(in: .whitespacesAndNewlines)
-
-            title = decodeHTMLEntities(stripHTML(title))
-            if title.isEmpty { continue }
-            if title.lowercased().contains("next page") || title.lowercased().contains("duckduckgo") { continue }
-
-            if href.hasPrefix("//") {
-                href = "https:" + href
-            } else if href.hasPrefix("/") {
-                href = "https://lite.duckduckgo.com" + href
-            }
-
-            if href.isEmpty || href.hasPrefix("javascript:") { continue }
-            guard let candidateURL = URL(string: href), isAllowedWebURL(candidateURL) else { continue }
-            guard await validateReachableWebURL(candidateURL) else { continue }
-            results.append(WebSearchResult(title: title, url: candidateURL))
+    private func fetchSearchResults(query: String) async -> [SearchResult] {
+        guard let response = await multiSearchProvider.search(query) else { return [] }
+        var results = response.results
+        if !response.results.isEmpty {
+            results = response.results
+        } else if let answer = response.answer, !answer.isEmpty {
+            return []
         }
-
-        return quantumRerankWebResults(results, query: trimmed)
+        return quantumRerankWebResults(results, query: query)
     }
 
     private func stripHTML(_ text: String) -> String {
@@ -1096,95 +1832,599 @@ Signal action (\(title)):
             return cached
         }
 
-        let candidates = searchQueryCandidates(from: trimmed)
+        // Try multi-provider chain first (SearXNG → OpenSERP → DDG Instant → Wiki → Lite).
+        if let summary = await multiSearchProvider.searchSummary(trimmed), !summary.isEmpty {
+            storeWebSummaryCache(summary, query: trimmed)
+            return summary
+        }
 
-        for candidate in candidates {
-            // Try DDG twice to smooth over transient mobile connection resets.
-            for _ in 0..<2 {
-                if let ddg = try? await fetchDuckDuckGoSummary(query: candidate),
-                   !ddg.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    storeWebSummaryCache(ddg, query: trimmed)
-                    return ddg
-                }
-            }
-
-            // Fallback: parse lightweight DDG HTML search results.
-            if let lite = try? await fetchDuckDuckGoLiteResults(query: candidate),
-               !lite.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                storeWebSummaryCache(lite, query: trimmed)
-                return lite
-            }
-
-            // Fallback: concise Wikipedia summary.
-            let wiki = await fetchWikipediaSummary(topic: candidate)
-            if !wiki.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                storeWebSummaryCache(wiki, query: trimmed)
-                return wiki
-            }
+        // Fallback: Wikipedia directly (in case multiSearchProvider missed it).
+        let wiki = await fetchWikipediaSummary(topic: trimmed)
+        if !wiki.isEmpty {
+            storeWebSummaryCache(wiki, query: trimmed)
+            return wiki
         }
 
         return ""
     }
 
-    private func searchQueryCandidates(from raw: String) -> [String] {
-        var out: [String] = []
-        out.append(raw)
+    func buildPreparedSearchContext(for query: String) async -> String {
+        let candidates = Array(searchQueryCandidates(from: query).prefix(3))
+        let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        print("[SearchDiag] buildPreparedSearchContext query=\(trimmedQuery.prefix(60)) candidates=\(candidates.map { $0.prefix(40) })")
+        guard trimmedQuery.count >= 4 else {
+            print("[SearchDiag] query too short (\(trimmedQuery.count) chars), skipping")
+            return ""
+        }
 
-        let lower = raw.lowercased()
-        let patterns = [
-            "найди информацию в интернете о",
-            "найди в интернете",
-            "найди информацию о",
-            "информация в интернете о",
-            "search the internet for",
-            "find information about",
-            "find info about",
-            "look up"
-        ]
+        let cacheKey = trimmedQuery.lowercased() as NSString
+        if let cached = preparedContextCache.object(forKey: cacheKey) {
+            print("[SearchDiag] cache hit for \(trimmedQuery.prefix(40))")
+            return String(cached)
+        }
 
-        var topic = raw
-        for p in patterns {
-            if let range = lower.range(of: p) {
-                // Convert the matched lowercased range into offsets
-                let distanceFromStart = lower.distance(from: lower.startIndex, to: range.upperBound)
-                if let rawStart = raw.index(raw.startIndex, offsetBy: distanceFromStart, limitedBy: raw.endIndex) {
-                    topic = String(raw[rawStart...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !candidates.isEmpty else {
+            print("[SearchDiag] no candidates, returning empty")
+            return ""
+        }
+
+        var preparedCandidates: [PreparedSearchCandidate] = []
+        for candidate in candidates {
+            let trimmedCandidate = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedCandidate.isEmpty else { continue }
+
+            let candidateResult = await fetchCandidateEvidence(trimmedCandidate)
+            if let candidateResult {
+                preparedCandidates.append(candidateResult)
+                if preparedCandidates.count >= 2 { break }
+            }
+        }
+
+        print("[SearchDiag] collected \(preparedCandidates.count) candidates")
+
+        guard let bestCandidate =
+            preparedCandidates.max(by: { $0.score < $1.score }) else {
+            print("[SearchDiag] no bestCandidate found, returning empty")
+            return ""
+        }
+
+        print("[SearchDiag] bestCandidate query=\(bestCandidate.query.prefix(40)) score=\(String(format: "%.2f", bestCandidate.score)) summaryLen=\(bestCandidate.summary.count) wikiSummaryLen=\(bestCandidate.wikipediaSummary.count) results=\(bestCandidate.results.count) trusted=\(bestCandidate.trustedEvidence.count)")
+
+        let normalizedSummary = compactSearchSummary(bestCandidate.summary, maxChars: 800)
+        let normalizedWikipedia = compactSearchSummary(bestCandidate.wikipediaSummary, maxChars: 800)
+
+        if !bestCandidate.summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let source = (!normalizedWikipedia.isEmpty && normalizedSummary == normalizedWikipedia) ? "wikipedia" : "duckduckgo"
+            ingestExternalSnippets(text: bestCandidate.summary, source: source, query: bestCandidate.query)
+        }
+        if !bestCandidate.wikipediaSummary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           normalizedSummary != normalizedWikipedia {
+            ingestExternalSnippets(text: bestCandidate.wikipediaSummary, source: "wikipedia", query: bestCandidate.query)
+        }
+
+        let finalContext = buildPreparedSearchContextBlock(
+            query: bestCandidate.query,
+            summary: bestCandidate.summary,
+            wikipediaSummary: bestCandidate.wikipediaSummary,
+            results: bestCandidate.results,
+            trustedEvidence: bestCandidate.trustedEvidence
+        )
+
+        preparedContextCache.setObject(
+            finalContext as NSString,
+            forKey: cacheKey
+        )
+
+        return finalContext
+    }
+
+    private func fetchCandidateEvidence(_ trimmedCandidate: String) async -> PreparedSearchCandidate? {
+        print("[SearchDiag] fetching evidence for: \(trimmedCandidate.prefix(40))")
+
+        // 1. Try full multi-provider search (SearXNG/OpenSERP/DDG/Wiki/Lite).
+        let searchResponse = await multiSearchProvider.search(trimmedCandidate)
+
+        // 2. Always fetch Wikipedia in parallel — it's a reliable structured source.
+        async let wikipediaSummary = fetchWikipediaSummary(topic: trimmedCandidate)
+        async let titles = fetchWikipediaSearchResults(query: trimmedCandidate, limit: 4)
+        let (wikiSummary, wikiTitles) = await (wikipediaSummary, titles)
+
+        let wikiResults = wikiTitles.compactMap { title -> SearchResult? in
+            let encoded = title.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? title
+            guard let url = URL(string: "https://en.wikipedia.org/wiki/\(encoded)") else { return nil }
+            return SearchResult(title: title, url: url, snippet: nil)
+        }
+
+        // 3. Merge: web results from multi-provider + Wikipedia results.
+        let summary: String
+        var allResults: [SearchResult]
+        var seen = Set<URL>()
+
+        if let response = searchResponse {
+            summary = response.answer ?? response.results.first?.snippet ?? ""
+            allResults = response.results
+            for r in response.results { seen.insert(r.url) }
+            // Append Wikipedia results that aren't already in the web results.
+            for w in wikiResults where !seen.contains(w.url) {
+                allResults.append(w)
+                seen.insert(w.url)
+            }
+        } else {
+            summary = ""
+            allResults = wikiResults
+        }
+
+        let combinedSummary = [summary, wikiSummary]
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n\n")
+
+        print("[SearchDiag] candidate=\(trimmedCandidate.prefix(40)) summary=\(combinedSummary.prefix(60)) wikiSummary=\(wikiSummary.prefix(60)) results=\(allResults.map { $0.title })")
+
+        var trustedEvidence: [String] = []
+        if !wikiSummary.isEmpty {
+            trustedEvidence.append(wikiSummary)
+        }
+        for result in wikiResults.prefix(2) {
+            let topic = result.title.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? result.title
+            if let wikiURL = URL(string: "https://en.wikipedia.org/api/rest_v1/page/summary/\(topic)"),
+               let (data, _) = try? await URLSession.shared.data(from: wikiURL),
+               let decoded = try? JSONDecoder().decode(WikipediaSummary.self, from: data),
+               let extract = decoded.extract, !extract.isEmpty {
+                trustedEvidence.append(extract)
+            }
+        }
+
+        if combinedSummary.isEmpty && allResults.isEmpty && trustedEvidence.isEmpty {
+            return nil
+        }
+
+        let reliability = searchReliability(forSummary: combinedSummary, wikipediaSummary: wikiSummary, results: allResults)
+        let numericConflict = detectNumericConflict(summary: combinedSummary, wikipediaSummary: wikiSummary, trustedEvidence: trustedEvidence)
+        let sourceDisagreement = detectSourceDisagreement(summary: combinedSummary, wikipediaSummary: wikiSummary, trustedEvidence: trustedEvidence)
+
+        return PreparedSearchCandidate(
+            query: trimmedCandidate,
+            summary: combinedSummary,
+            wikipediaSummary: wikiSummary,
+            results: allResults,
+            trustedEvidence: trustedEvidence,
+            reliability: reliability,
+            numericConflict: numericConflict,
+            sourceDisagreement: sourceDisagreement
+        )
+    }
+
+    private func buildTrustedSearchEvidence(for results: [SearchResult], query: String) async -> [String] {
+        let selectedResults = selectEvidenceResults(results, query: query)
+
+        return await withTaskGroup(of: String?.self) { group in
+            for result in selectedResults {
+                guard trustedDomainScore(for: result.url) >= 0.55 else { continue }
+
+                group.addTask {
+                    let analysis = await self.analyzeURL(result.url)
+                    let compact = await self.compactSearchSummary(
+                        analysis,
+                        maxChars: 260
+                    )
+
+                    guard !compact.isEmpty else {
+                        return nil
+                    }
+
+                    let host =
+                        result.url.host?.lowercased()
+                        ?? result.url.absoluteString
+
+                    return "- \(result.title) (\(host)): \(compact)"
                 }
+            }
+
+            var evidence: [String] = []
+
+            for await item in group {
+                if let item {
+                    evidence.append(item)
+                }
+            }
+
+            return Array(evidence.prefix(2))
+        }
+    }
+
+    private func selectEvidenceResults(_ results: [SearchResult], query: String) -> [SearchResult] {
+        let trusted = results.filter { trustedDomainScore(for: $0.url) >= 0.55 }
+        guard trusted.count > 2 else { return trusted }
+
+        let useQuantum = QuantumMemoryService.shared.isEnabled()
+        let field = useQuantum
+            ? QuantumMemoryService.shared.collapseDecisionField(prompt: query, motivators: MotivationService.shared.state)
+            : nil
+        let maxCount = (field?.explorationBias ?? 0) > 0.66 ? 3 : 2
+        let queryTerms = Set(query.lowercased().components(separatedBy: CharacterSet.alphanumerics.inverted).filter { $0.count > 2 })
+
+        let scored = trusted.enumerated().map { index, result -> (SearchResult, Double) in
+            let host = result.url.host?.lowercased() ?? ""
+            let titleTerms = Set(result.title.lowercased().components(separatedBy: CharacterSet.alphanumerics.inverted).filter { $0.count > 2 })
+            let overlap = queryTerms.isEmpty ? 0.0 : Double(queryTerms.intersection(titleTerms).count) / Double(max(1, queryTerms.count))
+            let trust = trustedDomainScore(for: result.url)
+            let rankBias = 1.0 - (Double(index) / Double(max(1, trusted.count)))
+            let explorationBoost = (field?.explorationBias ?? 0) * Double((host.hashValue & 0xFF)) / 255.0
+            let score = (trust * 0.50) + (overlap * 0.32) + (rankBias * 0.14) + (explorationBoost * 0.04)
+            return (result, score)
+        }
+
+        let sorted = scored.sorted { $0.1 > $1.1 }.map(\.0)
+        var selected: [SearchResult] = []
+        var usedHosts = Set<String>()
+
+        for result in sorted {
+            let host = result.url.host?.lowercased() ?? result.url.absoluteString
+            if usedHosts.insert(host).inserted || selected.isEmpty {
+                selected.append(result)
+            }
+            if selected.count >= maxCount {
                 break
             }
         }
 
-        let punctuation = CharacterSet(charactersIn: ".,!?;:\"'()[]{}")
-        topic = topic.trimmingCharacters(in: punctuation.union(.whitespacesAndNewlines))
-
-        if !topic.isEmpty, topic.count >= 2, topic != raw {
-            out.append(topic)
+        if selected.count < maxCount {
+            for result in sorted where !selected.contains(where: { $0.url == result.url }) {
+                selected.append(result)
+                if selected.count >= maxCount {
+                    break
+                }
+            }
         }
 
-        return Array(NSOrderedSet(array: out)) as? [String] ?? out
+        return selected
     }
 
-    private func quantumRerankWebResults(_ results: [WebSearchResult], query: String) -> [WebSearchResult] {
-        guard results.count > 2, QuantumMemoryService.shared.isEnabled() else { return results }
+    func searchQueryCandidates(from raw: String) -> [String] {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
 
-        let motivators = MotivationService.shared.state
-        let field = QuantumMemoryService.shared.collapseDecisionField(prompt: query, motivators: motivators)
+        let canonical = canonicalSearchQuery(from: trimmed)
+        let quoted = quotedSearchPhrases(in: trimmed)
+        let keywordQuery = keywordSearchQuery(from: trimmed)
+        let expanded = expandedSearchQueries(from: canonical.isEmpty ? trimmed : canonical)
+
+        var out: [String] = []
+        if !canonical.isEmpty {
+            out.append(canonical)
+        }
+        out.append(contentsOf: quoted)
+        if canonical != trimmed {
+            out.append(trimmed)
+        }
+        if !keywordQuery.isEmpty {
+            out.append(keywordQuery)
+        }
+        out.append(contentsOf: expanded)
+
+        return deduplicateQueries(out)
+    }
+
+    private func expandedSearchQueries(from canonical: String) -> [String] {
+        let trimmed = canonical.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+
+        var variants: [String] = []
+        let lower = trimmed.lowercased()
+
+        if containsPopulationIntent(trimmed) {
+            variants.append("\(trimmed) wikipedia")
+            variants.append("\(trimmed) city population")
+        }
+
+        if containsBiographyIntent(trimmed) {
+            variants.append("\(trimmed) wikipedia")
+            variants.append("\(trimmed) biography")
+        }
+
+        if containsNewsIntent(trimmed) {
+            variants.append("\(trimmed) latest news")
+        }
+
+        if lower.split(separator: " ").count >= 3 {
+            let focused = keywordSearchQuery(from: trimmed)
+            if !focused.isEmpty, focused != lower {
+                variants.append(focused)
+            }
+        }
+
+        return deduplicateQueries(variants)
+    }
+
+    private func containsPopulationIntent(_ text: String) -> Bool {
+        let lower = text.lowercased()
+        let markers = [
+            "population", "population of", "city population", "metro population",
+            "население", "сколько жителей", "сколько человек", "численность населения"
+        ]
+        return markers.contains(where: { lower.contains($0) })
+    }
+
+    private func containsBiographyIntent(_ text: String) -> Bool {
+        let lower = text.lowercased()
+        let markers = [
+            "who is", "biography", "born", "career",
+            "кто такой", "кто такая", "биография", "родился", "родилась"
+        ]
+        return markers.contains(where: { lower.contains($0) })
+    }
+
+    private func containsNewsIntent(_ text: String) -> Bool {
+        let lower = text.lowercased()
+        let markers = [
+            "news", "latest", "headlines", "breaking", "current events",
+            "новости", "последние новости", "свежие новости", "что нового"
+        ]
+        return markers.contains(where: { lower.contains($0) })
+    }
+
+    private func canonicalSearchQuery(from raw: String) -> String {
+        let trimmed = raw
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+
+        let lower = trimmed.lowercased()
+        let prefixes = [
+            "найди информацию в интернете о",
+            "найди в интернете о",
+            "найди информацию о",
+            "найди в интернете",
+            "найди",
+            "найти",
+            "поищи в интернете",
+            "поищи информацию о",
+            "поищи",
+            "расскажи подробнее про",
+            "расскажи подробнее о",
+            "расскажи про",
+            "расскажи о",
+            "tell me more about",
+            "tell me about",
+            "tell me everything about",
+            "search the internet for",
+            "search for",
+            "find information about",
+            "find info about",
+            "find",
+            "look up",
+            "look for",
+            "what is",
+            "who is",
+            "what are",
+            "what was",
+            "кто такой",
+            "кто такая",
+            "кто такие",
+            "что такое",
+            "что за",
+            "какой",
+            "какая",
+            "какие",
+            "сколько"
+        ]
+
+        var topic = trimmed
+        if let prefix = prefixes.first(where: { lower.hasPrefix($0) }) {
+            topic = String(trimmed.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        topic = topic.trimmingCharacters(in: CharacterSet(charactersIn: ".,!?;:\"'()[]{}"))
+        topic = topic.replacingOccurrences(of: #"^(?:о|про|about)\s+"#, with: "", options: [.regularExpression, .caseInsensitive])
+        topic = topic.replacingOccurrences(of: #"(?i)\b(please|пожалуйста|pls|now|сейчас|быстро)\b"#, with: "", options: .regularExpression)
+        topic = topic.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression).trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if topic.count < 2 {
+            return trimmed
+        }
+        return topic
+    }
+
+    private func quotedSearchPhrases(in raw: String) -> [String] {
+        let patterns = [
+            #""([^"]{2,120})""#,
+            #"'([^']{2,120})'"#
+        ]
+        var out: [String] = []
+
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
+            let range = NSRange(raw.startIndex..<raw.endIndex, in: raw)
+            let matches = regex.matches(in: raw, range: range)
+            for match in matches {
+                guard let phraseRange = Range(match.range(at: 1), in: raw) else { continue }
+                let phrase = String(raw[phraseRange]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if phrase.count >= 2 {
+                    out.append(phrase)
+                }
+            }
+        }
+
+        return deduplicateQueries(out)
+    }
+
+    private func keywordSearchQuery(from raw: String) -> String {
+        let lower = canonicalSearchQuery(from: raw).lowercased()
+        let parts = lower.components(separatedBy: CharacterSet.alphanumerics.inverted)
+        let stopWords: Set<String> = [
+            "the", "and", "for", "with", "that", "this", "then", "more", "tell", "show",
+            "what", "which", "when", "where", "who", "how", "why", "is", "are", "was", "were",
+            "это", "как", "что", "когда", "где", "кто", "почему", "зачем", "какой", "какая",
+            "какие", "сколько", "про", "about", "please", "пожалуйста", "найди", "поищи"
+        ]
+
+        let tokens = parts.filter { token in
+            token.count > 2 && !stopWords.contains(token)
+        }
+        guard !tokens.isEmpty else { return "" }
+        return tokens.prefix(8).joined(separator: " ")
+    }
+
+    private func deduplicateQueries(_ queries: [String]) -> [String] {
+        var seen = Set<String>()
+        var out: [String] = []
+        for query in queries {
+            let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            let key = trimmed.lowercased()
+            if seen.insert(key).inserted {
+                out.append(trimmed)
+            }
+        }
+        return out
+    }
+
+    private func compactSearchSummary(_ text: String, maxChars: Int = 320) -> String {
+        let cleaned = text
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else { return "" }
+        return cleaned.count > maxChars ? String(cleaned.prefix(maxChars)) + "…" : cleaned
+    }
+
+    private func compactSearchAnswerSeed(from text: String, maxChars: Int = 180) -> String {
+        let summary = compactSearchSummary(text, maxChars: maxChars * 2)
+        guard !summary.isEmpty else { return "" }
+
+        let sentence = summary
+            .split(whereSeparator: { $0 == "." || $0 == "!" || $0 == "?" })
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first
+            ?? summary
+
+        let compact = sentence.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+        return compact.count > maxChars ? String(compact.prefix(maxChars)) + "…" : compact
+    }
+
+    private func detectNumericConflict(summary: String, wikipediaSummary: String, trustedEvidence: [String]) -> Bool {
+        let texts = [summary, wikipediaSummary] + trustedEvidence
+        let values = texts
+            .flatMap(extractMeaningfulNumbers(from:))
+            .filter { $0 >= 1_000 }
+
+        guard values.count >= 2 else { return false }
+        guard let minValue = values.min(), let maxValue = values.max(), minValue > 0 else { return false }
+        return Double(maxValue - minValue) / Double(minValue) >= 0.18
+    }
+
+    private func normalizeSearchClaim(_ text: String) -> String {
+        text
+            .lowercased()
+            .replacingOccurrences(of: #"[^a-zа-я0-9\s]"#, with: " ", options: .regularExpression)
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func detectSourceDisagreement(summary: String, wikipediaSummary: String, trustedEvidence: [String]) -> Bool {
+        let fragments = ([summary, wikipediaSummary] + trustedEvidence)
+            .map { compactSearchAnswerSeed(from: $0, maxChars: 220) }
+            .map(normalizeSearchClaim)
+            .filter { !$0.isEmpty }
+
+        guard fragments.count >= 2 else { return false }
+        let unique = Array(Set(fragments))
+        guard unique.count >= 2 else { return false }
+
+        for fragment in unique {
+            let compatibleCount = unique.filter { other in
+                other == fragment || other.contains(fragment) || fragment.contains(other)
+            }.count
+            if compatibleCount >= 2 {
+                return false
+            }
+        }
+
+        return true
+    }
+
+    private func extractMeaningfulNumbers(from text: String) -> [Int] {
+        guard let regex = try? NSRegularExpression(pattern: #"\b\d[\d\s,._]{2,}\b"#) else { return [] }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        let matches = regex.matches(in: text, range: range)
+        return matches.compactMap { match in
+            guard let tokenRange = Range(match.range, in: text) else { return nil }
+            let token = String(text[tokenRange]).replacingOccurrences(of: #"[\s,._]"#, with: "", options: .regularExpression)
+            return Int(token)
+        }
+    }
+
+    private func searchReliability(
+        forSummary summary: String,
+        wikipediaSummary: String,
+        results: [SearchResult]
+    ) -> SearchReliability {
+        let trustedCount = results.filter { trustedDomainScore(for: $0.url) >= 0.55 }.count
+        let highTrustCount = results.filter { trustedDomainScore(for: $0.url) >= 0.85 }.count
+        let hasSummary = !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+
+        if highTrustCount >= 1 || trustedCount >= 2 {
+            return .high
+        }
+        if !wikipediaSummary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || hasSummary || trustedCount >= 1 || !results.isEmpty {
+            return .medium
+        }
+        return .low
+    }
+
+    private func quantumRerankWebResults(_ results: [SearchResult], query: String) -> [SearchResult] {
+        guard results.count > 1 else { return results }
         let queryTerms = Set(query.lowercased().components(separatedBy: CharacterSet.alphanumerics.inverted).filter { $0.count > 2 })
+        let useQuantum = QuantumMemoryService.shared.isEnabled()
+        let field = useQuantum
+            ? QuantumMemoryService.shared.collapseDecisionField(prompt: query, motivators: MotivationService.shared.state)
+            : nil
 
-        let scored = results.enumerated().map { index, result -> (WebSearchResult, Double) in
+        let scored = results.enumerated().map { index, result -> (SearchResult, Double) in
             let titleTerms = Set(result.title.lowercased().components(separatedBy: CharacterSet.alphanumerics.inverted).filter { $0.count > 2 })
             let overlap = Double(queryTerms.intersection(titleTerms).count)
             let overlapScore = queryTerms.isEmpty ? 0.0 : overlap / Double(max(1, queryTerms.count))
             let recencyBias = 1.0 - (Double(index) / Double(max(1, results.count)))
-            let explorationJitter = field.explorationBias * Double((result.url.absoluteString.hashValue & 0xFF)) / 255.0
-            let deviationBias = field.deviation * Double((result.title.hashValue & 0x7F)) / 127.0
-            let score = (overlapScore * 0.46) + (recencyBias * 0.34) + (explorationJitter * 0.12) + (deviationBias * 0.08)
+            let domainTrust = trustedDomainScore(for: result.url)
+            let explorationJitter = (field?.explorationBias ?? 0) * Double((result.url.absoluteString.hashValue & 0xFF)) / 255.0
+            let deviationBias = (field?.deviation ?? 0) * Double((result.title.hashValue & 0x7F)) / 127.0
+            let score = (overlapScore * 0.42) + (domainTrust * 0.36) + (recencyBias * 0.18) + (explorationJitter * 0.03) + (deviationBias * 0.01)
             return (result, score)
         }
 
         return scored
             .sorted { $0.1 > $1.1 }
             .map(\.0)
+    }
+
+    private func trustedDomainScore(for url: URL) -> Double {
+        guard let host = url.host?.lowercased() else { return 0.2 }
+
+        let highTrustDomains = [
+            "wikipedia.org", "wikimedia.org", "github.com", "arxiv.org", "nature.com", "science.org",
+            "openai.com", "apple.com", "developer.apple.com", "microsoft.com", "docs.python.org",
+            "python.org", "swift.org", "mozilla.org", "ietf.org", "w3.org", "who.int", "cdc.gov",
+            "nih.gov", "nasa.gov", "europa.eu", "gov",
+            "britannica.com", "data.worldbank.org"
+        ]
+        let mediumTrustDomains = [
+            "reuters.com", "apnews.com", "bbc.com", "nytimes.com", "bloomberg.com",
+            "stackoverflow.com", "huggingface.co", "ollama.com", "reddit.com"
+        ]
+
+        if highTrustDomains.contains(where: { host == $0 || host.hasSuffix("." + $0) }) {
+            return 1.0
+        }
+        if mediumTrustDomains.contains(where: { host == $0 || host.hasSuffix("." + $0) }) {
+            return 0.7
+        }
+        if host.hasSuffix(".gov") || host.hasSuffix(".edu") {
+            return 0.95
+        }
+        if host.hasSuffix(".org") {
+            return 0.55
+        }
+        return 0.3
     }
 
     private func fetchWikipediaSummary(topic: String) async -> String {
@@ -1208,6 +2448,13 @@ Signal action (\(title)):
     private func fetchWikipediaImageCandidate(topic: String) async -> WebImageCandidate? {
         let trimmed = topic.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
+
+        // Try 1: MediaWiki pageimages API (most reliable for thumbnails)
+        if let candidate = await fetchWikipediaPageImage(topic: trimmed) {
+            return candidate
+        }
+
+        // Try 2: REST API summary (sometimes has thumbnail)
         let escaped = trimmed.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? trimmed
         guard let url = URL(string: "https://en.wikipedia.org/api/rest_v1/page/summary/\(escaped)") else { return nil }
 
@@ -1229,21 +2476,47 @@ Signal action (\(title)):
         }
     }
 
-    private func fetchSearchResultImageCandidate(topic: String) async -> WebImageCandidate? {
-        guard let results = try? await fetchDuckDuckGoLiteSearchResults(query: topic, limit: 4),
-              !results.isEmpty else {
-            return nil
-        }
+    private func fetchWikipediaPageImage(topic: String) async -> WebImageCandidate? {
+        let escaped = topic.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? topic
+        let urlString = "https://en.wikipedia.org/w/api.php?action=query&prop=pageimages&titles=\(escaped)&piprop=thumbnail&pithumbsize=800&format=json"
+        guard let url = URL(string: urlString) else { return nil }
 
-        for result in results {
-            if let candidate = await fetchImageCandidate(from: result, query: topic) {
+        do {
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 10
+            request.setValue("VALIS/1.0 (iOS)", forHTTPHeaderField: "User-Agent")
+            let (data, _) = try await URLSession.shared.data(for: request)
+            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let query = json["query"] as? [String: Any],
+                  let pages = query["pages"] as? [String: Any] else { return nil }
+
+            for (_, page) in pages {
+                guard let pageDict = page as? [String: Any],
+                      let title = pageDict["title"] as? String,
+                      let thumbnail = pageDict["thumbnail"] as? [String: Any],
+                      let source = thumbnail["source"] as? String,
+                      let imageURL = URL(string: source) else { continue }
+
+                let pageURL = URL(string: "https://en.wikipedia.org/wiki/\(title.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? title)")
+                return WebImageCandidate(query: topic, imageURL: imageURL, title: title, sourcePageURL: pageURL ?? url)
+            }
+        } catch {}
+        return nil
+    }
+
+    private func fetchSearchResultImageCandidate(topic: String) async -> WebImageCandidate? {
+        let titles = await fetchWikipediaSearchResults(query: topic, limit: 4)
+        guard !titles.isEmpty else { return nil }
+
+        for title in titles {
+            if let candidate = await fetchWikipediaImageCandidate(topic: title) {
                 return candidate
             }
         }
         return nil
     }
 
-    private func fetchImageCandidate(from result: WebSearchResult, query: String) async -> WebImageCandidate? {
+    private func fetchImageCandidate(from result: SearchResult, query: String) async -> WebImageCandidate? {
         guard let html = try? await fetchHTML(url: result.url), !html.isEmpty else { return nil }
 
         let imageCandidates = [
@@ -1275,7 +2548,7 @@ Signal action (\(title)):
         return URL(string: trimmed, relativeTo: baseURL)?.absoluteURL
     }
 
-    private func fetchRedditNews(limit: Int) async throws -> String {
+    private func fetchRedditNews(limit: Int, query: String = "") async throws -> String {
         let clamped = max(1, min(15, limit))
         var components = URLComponents(string: "https://www.reddit.com/r/news/.json")!
         components.queryItems = [
@@ -1293,6 +2566,10 @@ Signal action (\(title)):
         let items = decoded.data.children.map { $0.data }
         let formatter = RelativeDateTimeFormatter()
         formatter.unitsStyle = .abbreviated
+        if let code = LanguageRoutingService.detectedNormalizedCode(for: query), !code.isEmpty {
+            formatter.locale = Locale(identifier: code)
+        }
+        let unknownTime = localizedUnknownTime(for: query)
 
         let lines: [String] = items.prefix(clamped).map { post in
             let title = post.title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1302,7 +2579,7 @@ Signal action (\(title)):
                 let date = Date(timeIntervalSince1970: created)
                 age = formatter.localizedString(for: date, relativeTo: Date())
             } else {
-                age = "unknown time"
+                age = unknownTime
             }
             let url = post.url ?? ""
             if url.isEmpty {
@@ -1312,6 +2589,176 @@ Signal action (\(title)):
         }
 
         return lines.joined(separator: "\n")
+    }
+
+    private struct RSSFeedItem {
+        let title: String
+        let link: String
+        let pubDate: String?
+    }
+
+    private static let rssFeeds = [
+        URL(string: "https://feeds.bbci.co.uk/news/technology/rss.xml")!,
+        URL(string: "https://feeds.bbci.co.uk/news/world/rss.xml")!,
+        URL(string: "https://hnrss.org/frontpage?count=20")!,
+    ]
+
+    private func fetchRSSNews(limit: Int = 10, query: String = "") async -> String {
+        let clamped = max(1, min(20, limit))
+        var allItems: [RSSFeedItem] = []
+
+        await withTaskGroup(of: [RSSFeedItem].self) { group in
+            for feedURL in ActionService.rssFeeds {
+                group.addTask {
+                    await self.fetchSingleRSSFeed(feedURL)
+                }
+            }
+            for await items in group {
+                allItems.append(contentsOf: items)
+            }
+        }
+
+        let queryLower = query.lowercased()
+        let queryTerms = queryLower
+            .components(separatedBy: .whitespaces)
+            .filter { $0.count > 2 }
+
+        if !queryTerms.isEmpty {
+            allItems.sort { a, b in
+                let scoreA = queryTerms.filter { a.title.lowercased().contains($0) }.count
+                let scoreB = queryTerms.filter { b.title.lowercased().contains($0) }.count
+                return scoreA > scoreB
+            }
+        }
+
+        var seen = Set<String>()
+        var unique: [RSSFeedItem] = []
+        for item in allItems {
+            let key = item.title.lowercased()
+            if seen.insert(key).inserted {
+                unique.append(item)
+            }
+        }
+
+        guard !unique.isEmpty else { return "" }
+
+        let lines: [String] = unique.prefix(clamped).map { item in
+            if item.link.isEmpty {
+                return "- \(item.title)"
+            }
+            return "- \(item.title)\n  \(item.link)"
+        }
+
+        return lines.joined(separator: "\n")
+    }
+
+    private func fetchSingleRSSFeed(_ url: URL) async -> [RSSFeedItem] {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 10
+        request.setValue("VALIS/1.0 (iOS)", forHTTPHeaderField: "User-Agent")
+
+        guard let (data, _) = try? await URLSession.shared.data(for: request),
+              let xml = String(data: data, encoding: .utf8) else {
+            return []
+        }
+
+        var items: [RSSFeedItem] = []
+        let itemPattern = "(?s)<item[^>]*>(.*?)</item>"
+        guard let itemRegex = try? NSRegularExpression(pattern: itemPattern) else { return [] }
+        let itemMatches = itemRegex.matches(in: xml, range: NSRange(xml.startIndex..<xml.endIndex, in: xml))
+
+        for match in itemMatches {
+            guard let range = Range(match.range(at: 1), in: xml) else { continue }
+            let itemXML = String(xml[range])
+
+            let title = decodeHTMLEntities(
+                extractXMLTag("title", from: itemXML)
+                    .replacingOccurrences(of: "<!\\[CDATA\\[", with: "", options: .regularExpression)
+                    .replacingOccurrences(of: "\\]\\]>", with: "", options: .regularExpression)
+                    .replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+            let link = decodeHTMLEntities(
+                extractXMLTag("link", from: itemXML)
+                    .replacingOccurrences(of: "<!\\[CDATA\\[", with: "", options: .regularExpression)
+                    .replacingOccurrences(of: "\\]\\]>", with: "", options: .regularExpression)
+                    .replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+            let pubDate = extractXMLTag("pubDate", from: itemXML)
+
+            if !title.isEmpty {
+                items.append(RSSFeedItem(title: title, link: link, pubDate: pubDate))
+            }
+        }
+
+        return items
+    }
+
+    private func extractXMLTag(_ tag: String, from xml: String) -> String {
+        let pattern = "<\(tag)[^>]*>(.*?)</\(tag)>"
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: xml, range: NSRange(xml.startIndex..<xml.endIndex, in: xml)),
+              let range = Range(match.range(at: 1), in: xml) else {
+            return ""
+        }
+        return String(xml[range]).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func fetchWikipediaSearchResults(query: String, limit: Int = 3) async -> [String] {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+
+        var components = URLComponents(string: "https://en.wikipedia.org/w/api.php")!
+        components.queryItems = [
+            URLQueryItem(name: "action", value: "query"),
+            URLQueryItem(name: "list", value: "search"),
+            URLQueryItem(name: "srsearch", value: trimmed),
+            URLQueryItem(name: "format", value: "json"),
+            URLQueryItem(name: "srlimit", value: "\(limit)")
+        ]
+        guard let url = components.url else { return [] }
+
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 10
+        request.setValue("VALIS/1.0 (iOS)", forHTTPHeaderField: "User-Agent")
+
+        guard let (data, _) = try? await URLSession.shared.data(for: request),
+              let decoded = try? JSONDecoder().decode(WikipediaSearchResponse.self, from: data),
+              let results = decoded.query?.search else {
+            return []
+        }
+
+        return results.compactMap { $0.title }.filter { !$0.isEmpty }
+    }
+
+    private func localizedUnknownTime(for query: String) -> String {
+        switch LanguageRoutingService.detectedNormalizedCode(for: query) {
+        case "ru":
+            return "время неизвестно"
+        case "uk":
+            return "час невідомий"
+        case "de":
+            return "Zeit unbekannt"
+        case "fr":
+            return "heure inconnue"
+        case "es":
+            return "hora desconocida"
+        case "it":
+            return "ora sconosciuta"
+        case "pt":
+            return "hora desconhecida"
+        case "ja":
+            return "時刻不明"
+        case "ko":
+            return "시간 불명"
+        case "zh":
+            return "时间未知"
+        case "th":
+            return "ไม่ทราบเวลา"
+        default:
+            return "unknown time"
+        }
     }
 
     private func splitSnippets(_ text: String) -> [String] {
@@ -1463,31 +2910,218 @@ Signal action (\(title)):
             return cached
         }
         guard let html = try? await fetchHTML(url: url) else { return "" }
-        let title = extractFirstMatch(in: html, pattern: "(?is)<title[^>]*>(.*?)</title>")
-            .map { decodeHTMLEntities(stripHTML($0)).trimmingCharacters(in: .whitespacesAndNewlines) } ?? ""
-        let description = extractFirstMatch(
-            in: html,
-            pattern: "(?is)<meta[^>]+name=[\"']description[\"'][^>]+content=[\"']([^\"']+)[\"'][^>]*>"
-        )?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let analysis = if isGitHubRepositoryURL(url) {
+            analyzeGitHubRepositoryPage(url: url, html: html)
+        } else {
+            analyzeGenericWebPage(url: url, html: html)
+        }
+        let output = analysis.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !output.isEmpty {
+            storeURLAnalysisCache(output, key: key)
+        }
+        return output
+    }
 
-        var cleaned = html
+    private func analyzeGenericWebPage(url: URL, html: String) -> String {
+        let title = bestPageTitle(from: html)
+        let description = bestPageDescription(from: html)
+        let headings = extractHeadings(from: html, maxCount: 6)
+        let mainContent = extractPrimaryPageContent(from: html)
+
+        var parts: [String] = []
+        if !title.isEmpty { parts.append("Title: \(title)") }
+        if !description.isEmpty { parts.append("Description: \(description)") }
+        if !headings.isEmpty {
+            parts.append("Key sections: " + headings.joined(separator: " | "))
+        }
+        if !mainContent.isEmpty {
+            parts.append("Main content: \(mainContent)")
+        }
+        return parts.joined(separator: "\n")
+    }
+
+    private func analyzeGitHubRepositoryPage(url: URL, html: String) -> String {
+        let repoPath = repositoryPath(from: url)
+        let title = bestPageTitle(from: html)
+        let description = firstNonEmpty([
+            extractMetaContent(in: html, property: "og:description"),
+            extractMetaContent(in: html, name: "description"),
+            extractFirstMatch(in: html, pattern: #"(?is)<p[^>]*class=["'][^"']*f4[^"']*my-3[^"']*["'][^>]*>(.*?)</p>"#)
+                .map { cleanHTMLFragment($0) }
+        ])
+
+        let readme = firstNonEmpty([
+            extractFirstMatch(in: html, pattern: #"(?is)<article[^>]*markdown-body[^>]*>(.*?)</article>"#)
+                .map { cleanHTMLFragment($0) },
+            extractFirstMatch(in: html, pattern: #"(?is)<div[^>]*id=["']readme["'][^>]*>.*?<article[^>]*>(.*?)</article>"#)
+                .map { cleanHTMLFragment($0) },
+            extractFirstMatch(in: html, pattern: #"(?is)<div[^>]*id=["']readme["'][^>]*>(.*?)</div>"#)
+                .map { cleanHTMLFragment($0) }
+        ])
+
+        let headings = extractHeadings(from: html, maxCount: 8)
+        let topics = extractGitHubTopics(from: html)
+        let stats = extractGitHubRepoStats(from: html)
+
+        var parts: [String] = []
+        if !repoPath.isEmpty { parts.append("Repository: \(repoPath)") }
+        if !title.isEmpty { parts.append("Title: \(title)") }
+        if !description.isEmpty { parts.append("About: \(description)") }
+        if !topics.isEmpty {
+            parts.append("Topics: " + topics.joined(separator: ", "))
+        }
+        if !stats.isEmpty {
+            parts.append("Signals: " + stats.joined(separator: " | "))
+        }
+        if !headings.isEmpty {
+            parts.append("Sections: " + headings.joined(separator: " | "))
+        }
+        if !readme.isEmpty {
+            parts.append("README summary: \(readme)")
+        }
+        return parts.joined(separator: "\n")
+    }
+
+    private func bestPageTitle(from html: String) -> String {
+        firstNonEmpty([
+            extractMetaContent(in: html, property: "og:title"),
+            extractFirstMatch(in: html, pattern: "(?is)<title[^>]*>(.*?)</title>")
+                .map { cleanHTMLFragment($0) }
+        ])
+    }
+
+    private func bestPageDescription(from html: String) -> String {
+        firstNonEmpty([
+            extractMetaContent(in: html, property: "og:description"),
+            extractMetaContent(in: html, name: "description"),
+            extractMetaContent(in: html, name: "twitter:description")
+        ])
+    }
+
+    private func extractPrimaryPageContent(from html: String) -> String {
+        let prioritizedBlocks = [
+            extractFirstMatch(in: html, pattern: #"(?is)<main[^>]*>(.*?)</main>"#),
+            extractFirstMatch(in: html, pattern: #"(?is)<article[^>]*>(.*?)</article>"#),
+            extractFirstMatch(in: html, pattern: #"(?is)<div[^>]*role=["']main["'][^>]*>(.*?)</div>"#)
+        ].compactMap { $0 }
+
+        for block in prioritizedBlocks {
+            let cleaned = cleanHTMLFragment(block, maxChars: 2600)
+            if cleaned.count >= 180 {
+                return cleaned
+            }
+        }
+
+        return cleanHTMLFragment(html, maxChars: 2600)
+    }
+
+    private func extractHeadings(from html: String, maxCount: Int) -> [String] {
+        let patterns = [
+            #"(?is)<h1[^>]*>(.*?)</h1>"#,
+            #"(?is)<h2[^>]*>(.*?)</h2>"#,
+            #"(?is)<h3[^>]*>(.*?)</h3>"#
+        ]
+
+        var headings: [String] = []
+        for pattern in patterns {
+            headings.append(contentsOf: extractAllMatches(in: html, pattern: pattern).map { cleanHTMLFragment($0, maxChars: 120) })
+        }
+
+        return Array(deduplicateQueries(headings.filter { !$0.isEmpty }).prefix(maxCount))
+    }
+
+    private func extractGitHubTopics(from html: String) -> [String] {
+        let patterns = [
+            #"(?is)<a[^>]*data-view-component=["']true["'][^>]*href=["']/topics/[^"']+["'][^>]*>(.*?)</a>"#,
+            #"(?is)<a[^>]*class=["'][^"']*topic-tag[^"']*["'][^>]*>(.*?)</a>"#
+        ]
+
+        var out: [String] = []
+        for pattern in patterns {
+            out.append(contentsOf: extractAllMatches(in: html, pattern: pattern).map { cleanHTMLFragment($0, maxChars: 40) })
+        }
+
+        return Array(deduplicateQueries(out.filter { !$0.isEmpty }).prefix(8))
+    }
+
+    private func extractGitHubRepoStats(from html: String) -> [String] {
+        let labels = [
+            "stars": #"(?is)href=["']/[^"']*/stargazers["'][^>]*>\s*<span[^>]*>(.*?)</span>"#,
+            "forks": #"(?is)href=["']/[^"']*/forks["'][^>]*>\s*<span[^>]*>(.*?)</span>"#,
+            "issues": #"(?is)href=["']/[^"']*/issues["'][^>]*>\s*<span[^>]*>(.*?)</span>"#
+        ]
+
+        var stats: [String] = []
+        for (label, pattern) in labels {
+            if let value = extractFirstMatch(in: html, pattern: pattern).map({ cleanHTMLFragment($0) }),
+               !value.isEmpty {
+                stats.append("\(label): \(value)")
+            }
+        }
+        return stats
+    }
+
+    private func repositoryPath(from url: URL) -> String {
+        let components = url.pathComponents.filter { $0 != "/" && !$0.isEmpty }
+        guard components.count >= 2 else { return "" }
+        return components.prefix(2).joined(separator: "/")
+    }
+
+    private func isGitHubRepositoryURL(_ url: URL) -> Bool {
+        guard let host = url.host?.lowercased(), host == "github.com" || host == "www.github.com" else {
+            return false
+        }
+        let components = url.pathComponents.filter { $0 != "/" && !$0.isEmpty }
+        return components.count >= 2
+    }
+
+    private func extractMetaContent(in html: String, property: String) -> String? {
+        let escaped = NSRegularExpression.escapedPattern(for: property)
+        return extractFirstMatch(
+            in: html,
+            pattern: #"(?is)<meta[^>]+property=["']\#(escaped)["'][^>]+content=["']([^"']+)["'][^>]*>"#
+        )?.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func extractMetaContent(in html: String, name: String) -> String? {
+        let escaped = NSRegularExpression.escapedPattern(for: name)
+        return extractFirstMatch(
+            in: html,
+            pattern: #"(?is)<meta[^>]+name=["']\#(escaped)["'][^>]+content=["']([^"']+)["'][^>]*>"#
+        )?.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func cleanHTMLFragment(_ fragment: String, maxChars: Int = 1800) -> String {
+        var cleaned = fragment
         cleaned = cleaned.replacingOccurrences(of: "(?is)<script\\b[^>]*>.*?</script>", with: " ", options: .regularExpression)
         cleaned = cleaned.replacingOccurrences(of: "(?is)<style\\b[^>]*>.*?</style>", with: " ", options: .regularExpression)
+        cleaned = cleaned.replacingOccurrences(of: "(?is)<svg\\b[^>]*>.*?</svg>", with: " ", options: .regularExpression)
+        cleaned = cleaned.replacingOccurrences(of: "(?is)<nav\\b[^>]*>.*?</nav>", with: " ", options: .regularExpression)
+        cleaned = cleaned.replacingOccurrences(of: "(?is)<footer\\b[^>]*>.*?</footer>", with: " ", options: .regularExpression)
         cleaned = stripHTML(cleaned)
         cleaned = decodeHTMLEntities(cleaned)
         cleaned = cleaned.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-
-        let snippet = String(cleaned.prefix(1200))
-        var parts: [String] = []
-        if !title.isEmpty { parts.append("Title: \(title)") }
-        if !description.isEmpty { parts.append("Description: \(description)") }
-        if !snippet.isEmpty { parts.append("Content summary: \(snippet)") }
-        let output = parts.joined(separator: "\n")
-        if !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            storeURLAnalysisCache(output, key: key)
+        if cleaned.count > maxChars {
+            return String(cleaned.prefix(maxChars)) + "…"
         }
-        return output
+        return cleaned
+    }
+
+    private func extractAllMatches(in text: String, pattern: String) -> [String] {
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        let matches = regex.matches(in: text, range: range)
+        return matches.compactMap { match in
+            guard let resultRange = Range(match.range(at: 1), in: text) else { return nil }
+            return String(text[resultRange])
+        }
+    }
+
+    private func firstNonEmpty(_ candidates: [String?]) -> String {
+        candidates
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first(where: { !$0.isEmpty }) ?? ""
     }
 
     private func fetchHTML(url: URL) async throws -> String {
@@ -1556,5 +3190,69 @@ Signal action (\(title)):
 
     private func storeURLValidationCache(_ isValid: Bool, key: String) {
         urlValidationCache[key] = (isValid, Date())
+    }
+}
+
+// MARK: - LocationHelper (CLLocationManager wrapper)
+
+private final class LocationHelper: NSObject, CLLocationManagerDelegate, @unchecked Sendable {
+    private let manager: CLLocationManager
+    private var didResume = false
+
+    init(manager: CLLocationManager, onLocation: @escaping @Sendable @MainActor (CLLocation) -> Void) {
+        self.manager = manager
+        self.onLocation = onLocation
+        super.init()
+        manager.delegate = self
+        manager.desiredAccuracy = kCLLocationAccuracyThreeKilometers
+    }
+
+    var onLocation: @Sendable @MainActor (CLLocation) -> Void
+    var onFailure: (@Sendable () -> Void)?
+
+    func request() {
+        let status = manager.authorizationStatus
+        switch status {
+        case .notDetermined:
+            manager.requestWhenInUseAuthorization()
+        case .authorizedWhenInUse, .authorizedAlways:
+            manager.requestLocation()
+        default:
+            guard !didResume else { return }
+            didResume = true
+            onFailure?()
+        }
+    }
+
+    nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        guard let loc = locations.first else { return }
+        Task { @MainActor in
+            guard !didResume else { return }
+            didResume = true
+            onLocation(loc)
+        }
+    }
+
+    nonisolated func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+        Task { @MainActor in
+            guard !didResume else { return }
+            didResume = true
+            onFailure?()
+        }
+    }
+
+    nonisolated func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        Task { @MainActor in
+            switch manager.authorizationStatus {
+            case .authorizedWhenInUse, .authorizedAlways:
+                manager.requestLocation()
+            case .denied, .restricted:
+                guard !didResume else { return }
+                didResume = true
+                onFailure?()
+            default:
+                break
+            }
+        }
     }
 }

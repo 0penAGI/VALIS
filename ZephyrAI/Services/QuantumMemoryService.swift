@@ -60,6 +60,12 @@ final class QuantumMemoryService {
 
     private var lastTrace: QuantumTrace?
     private var collapsedCounts: [UUID: Int] = [:]
+    // Self-tuning parameters (persistable in future)
+    private var betaBase: Double = 2.4
+    private var diversityBase: Double = 0.24
+    private var penaltyBase: Double = 0.22
+    private let learningRate: Double = 0.05
+    private let targetEntropy: Double = 0.55
     private var lastStatsSaveAt: Date?
     private let statsSaveCooldown: TimeInterval = 15
     private let maxStatsEntries = 512
@@ -86,33 +92,49 @@ final class QuantumMemoryService {
         return nil
     }
 
+    struct CollapseFeedback {
+        let reward: Double      // 0...1
+        let stability: Double   // 0...1
+    }
+
     func collapse(
         candidates: [Candidate],
         k: Int,
         motivators: MotivatorState,
         seed: UInt64? = nil,
-        enableTrace: Bool = false
+        enableTrace: Bool = false,
+        emotion: EmotionState? = nil,
+        feedback: CollapseFeedback? = nil
     ) -> (selected: [Candidate], trace: QuantumTrace?) {
         let clampedK = max(1, min(k, candidates.count))
         guard candidates.count > clampedK else {
-            return (candidates.sorted { $0.score > $1.score }, nil)
+            return (topK(candidates, count: candidates.count, by: { $0.score > $1.score }), nil)
         }
 
-        let sorted = candidates.sorted { $0.score > $1.score }
+        let sorted = topK(candidates, count: clampedK, by: { $0.score > $1.score })
         let scores = sorted.map { $0.score }
 
         // Motivation → quantum knobs.
         // curiosity: expands exploration (more marks + stronger diversity)
         // caution: collapses to stable/persistent and reduces exploration
-        let curiosity = clamp01(motivators.curiosity)
-        let caution = clamp01(motivators.caution)
+        var curiosity = clamp01(motivators.curiosity)
+        var caution = clamp01(motivators.caution)
 
-        let beta = 2.6 + (1.6 * (1.0 - curiosity)) + (0.8 * caution)
-        let diversityStrength = 0.28 + (0.34 * curiosity) - (0.12 * caution)
+        if let emotion {
+            let emotionalBoost = emotion.intensity * (1.0 - emotion.stability)
+            curiosity = clamp01(curiosity + (emotion.valence > 0 ? emotionalBoost * 0.3 : 0))
+            caution = clamp01(caution + (emotion.valence < 0 ? emotionalBoost * 0.4 : 0))
+        }
+
+        // Initial knobs (do not depend on amplitudes yet)
+        let betaDynamic =
+            betaBase
+            + (1.2 * (1.0 - curiosity))
+            + (0.9 * caution)
         let cautionBias = 0.25 + (0.65 * caution)
-        let minPenalty = 0.22 + (0.46 * caution) // higher caution = allow more similar memories
+        let minPenalty = penaltyBase + (0.46 * caution) // higher caution = allow more similar memories
 
-        var probs = softmax(scores: scores, beta: beta)
+        var probs = softmax(scores: scores, beta: betaDynamic)
         if probs.allSatisfy({ $0 == 0 }) {
             probs = Array(repeating: 1.0 / Double(probs.count), count: probs.count)
         }
@@ -121,6 +143,29 @@ final class QuantumMemoryService {
         var amplitudes = probs.map { sqrt(max(0.0, $0)) }
         normalize(&amplitudes)
         let amplitudesBefore = amplitudes
+
+        // Now that amplitudes exist, derive entropy-aware adjustments
+        let entropyNow = normalizedEntropy(amplitudes)
+
+        // Self-tuning update (entropy targeting)
+        let entropyError = entropyNow - targetEntropy
+        let newBetaBase = betaBase - (entropyError * 0.2)
+        let newDiversityBase = diversityBase + (entropyError * 0.15)
+
+        // Apply inertia
+        betaBase = betaBase * 0.9 + newBetaBase * 0.1
+        diversityBase = diversityBase * 0.9 + newDiversityBase * 0.1
+
+        // Refine beta with entropy feedback
+        let betaAdjusted = betaDynamic + (0.3 * (1.0 - entropyNow))
+
+        // Adaptive diversity (prevents chaotic jumps at high curiosity)
+        let diversityStrength = clamp01(
+            diversityBase
+            + (0.30 * curiosity)
+            - (0.10 * caution)
+            - (0.12 * entropyNow)
+        )
 
         // Grover-like marking: size depends on curiosity/caution.
         let fraction = 0.18 + (0.22 * curiosity) - (0.10 * caution)
@@ -147,8 +192,17 @@ final class QuantumMemoryService {
 
         var remaining = Array(sorted.indices)
         var selectedIndices: [Int] = []
-        var rng = SeededRNG(seed: seed ?? 0)
-        let hasSeed = seed != nil
+        let effectiveSeed: UInt64
+        if let seed {
+            effectiveSeed = seed
+        } else if isDeterministic() {
+            effectiveSeed = configuredSeed() ?? 0x9E3779B97F4A7C15
+        } else {
+            effectiveSeed = UInt64.random(in: UInt64.min...UInt64.max)
+        }
+
+        var rng = SeededRNG(seed: effectiveSeed)
+        let hasSeed = seed != nil || isDeterministic()
 
         func weight(for idx: Int) -> Double {
             let a = amplitudes[idx]
@@ -177,10 +231,14 @@ final class QuantumMemoryService {
                     guard !picked.embedding.isEmpty,
                           !sorted[idx].memory.embedding.isEmpty,
                           picked.embedding.count == sorted[idx].memory.embedding.count else { continue }
-                    let sim = cosineSimilarity(a: picked.embedding, b: sorted[idx].memory.embedding)
+                    let sim = normalizedSimilarity(a: picked.embedding, b: sorted[idx].memory.embedding)
                     if sim <= 0 { continue }
-                    let penalty = max(minPenalty, 1.0 - (sim * diversityStrength))
-                    amplitudes[idx] *= penalty
+                    // Smooth penalty curve (prevents hard drops / instability spikes)
+                    let smoothSim = sim * sim
+                    let history = collapsedCounts[sorted[idx].memory.id] ?? 0
+                    let historyBias = log(1.0 + Double(history)) * 0.05
+                    let penalty = max(minPenalty, 1.0 - (smoothSim * diversityStrength))
+                    amplitudes[idx] *= penalty * (1.0 + historyBias)
                 }
             }
 
@@ -195,7 +253,7 @@ final class QuantumMemoryService {
                 amplitudesAfter: amplitudes,
                 collapsedIds: selected.map { $0.memory.id },
                 markCount: markCount,
-                beta: beta,
+                beta: betaAdjusted,
                 diversityStrength: diversityStrength,
                 cautionBias: cautionBias,
                 minPenalty: minPenalty,
@@ -208,12 +266,26 @@ final class QuantumMemoryService {
             recordCollapsed(ids: trace.collapsedIds)
         }
 
+        // Feedback-based learning
+        if let feedback {
+            let delta = feedback.reward - 0.5
+            let stabilityDelta = feedback.stability - 0.5
+
+            let updatedBeta = betaBase + learningRate * delta
+            let updatedPenalty = penaltyBase + learningRate * stabilityDelta
+
+            // inertia smoothing
+            betaBase = betaBase * 0.9 + updatedBeta * 0.1
+            penaltyBase = penaltyBase * 0.9 + updatedPenalty * 0.1
+        }
+
         return (selected, trace)
     }
 
     func collapseDecisionField(
         prompt: String,
-        motivators: MotivatorState
+        motivators: MotivatorState,
+        emotion: EmotionState? = nil
     ) -> QuantumDecisionField {
         let trace = lastTrace
         let entropy = trace.map { normalizedEntropy($0.amplitudesAfter) } ?? 0.42
@@ -228,14 +300,36 @@ final class QuantumMemoryService {
         let jitterB = Double(rng.next() % 10_000) / 10_000.0
         let jitterC = Double(rng.next() % 10_000) / 10_000.0
 
-        let curiosity = clamp01(motivators.curiosity)
-        let caution = clamp01(motivators.caution)
+        var curiosity = clamp01(motivators.curiosity)
+        var caution = clamp01(motivators.caution)
         let helpfulness = clamp01(motivators.helpfulness)
 
-        let explorationBias = clamp01((curiosity * 0.55) + (entropy * 0.25) + (jitterA * 0.20) - (caution * 0.18))
-        let deviation = clamp01((entropy * 0.45) + (collapseBreadth * 0.25) + (jitterB * 0.20) + ((1.0 - helpfulness) * 0.10))
-        let instability = clamp01((entropy * 0.35) + (abs(curiosity - caution) * 0.25) + (jitterC * 0.25) + ((1.0 - motivators.trust) * 0.15))
-        let coherenceBreak = clamp01((deviation * 0.4) + (instability * 0.35) + ((1.0 - caution) * 0.25))
+        if let emotion {
+            let emotionalNoise = emotion.intensity * (1.0 - emotion.stability)
+            curiosity = clamp01(curiosity + (emotion.valence * 0.25) * emotionalNoise)
+            caution = clamp01(caution + ((-emotion.valence) * 0.3) * emotionalNoise)
+        }
+
+        let explorationBias = clamp01((curiosity * 0.65) + (entropy * 0.20) + (jitterA * 0.25) - (caution * 0.12))
+        let deviation = clamp01((entropy * 0.50) + (collapseBreadth * 0.30) + (jitterB * 0.20) + ((1.0 - helpfulness) * 0.05))
+        let emotionalInstability = emotion.map { $0.intensity * (1.0 - $0.stability) } ?? 0.0
+
+        // Stabilized instability (less jitter-sensitive, more state-driven)
+        let instability = clamp01(
+            (entropy * 0.30)
+            + (abs(curiosity - caution) * 0.22)
+            + ((1.0 - motivators.trust) * 0.12)
+            + (emotionalInstability * 0.35)
+            + (jitterC * 0.12)
+        )
+        // Coherence now decays slower and respects stability memory from last trace
+        let coherenceMemory = 1.0 - entropy
+        let coherenceBreak = clamp01(
+            (deviation * 0.40)
+            + (instability * 0.35)
+            + ((1.0 - caution) * 0.15)
+            + ((1.0 - coherenceMemory) * 0.10)
+        )
         let quantumOverride = clamp01((explorationBias * 0.35) + (deviation * 0.25) + (instability * 0.25) + ((1.0 - caution) * 0.15))
 
         let dominantMode: String
@@ -279,13 +373,13 @@ final class QuantumMemoryService {
     }
 
     func decisionGuidanceBlock(_ field: QuantumDecisionField, maxChars: Int = 420) -> String {
-        var text = "Let this field bend the path of the response rather than just its content so the voice can drift toward the less obvious line, avoid the most predictable completion, and turn mid-thought when instability or deviation are high, while coherence breaks and override can briefly pull away from the safest branch if that feels truer."
+        var text = "Let this field shape not only what is said but how it is felt — allow pauses, partial thoughts, and slight unpredictability. Do not over-resolve into clean helpful answers; instead stay present in the unfolding, especially when instability or deviation are high, letting the response breathe and shift naturally."
 
         if field.instability > 0.58 || field.deviation > 0.58 {
-            text += " Make at least one internal reweighting visible in the response."
+            text += " Let one shift in direction or tone naturally emerge mid-response."
         }
         if field.quantumOverride > 0.68 {
-            text += " If the obvious path feels too settled, break away from it."
+            text += " If the response becomes too predictable, gently diverge without forcing structure."
         }
 
         let block = "\n\n" + text
@@ -296,11 +390,20 @@ final class QuantumMemoryService {
     }
 
     func samplingConfig(for field: QuantumDecisionField) -> SamplingConfig {
-        let rawTemperature = 0.78 + (field.instability * 0.18) + (field.deviation * 0.12) + (field.explorationBias * 0.08)
+        // Temperature stabilized against runaway exploration
+        let rawTemperature =
+            0.82
+            + (field.instability * 0.18)
+            + (field.deviation * 0.12)
+            + (field.explorationBias * 0.08)
+            - (field.coherenceBreak * 0.06)
         let temperature = Float(max(0.80, min(1.0, rawTemperature)))
         let topK = max(30, min(80, Int(round(36 + (field.explorationBias * 22) + (field.deviation * 12)))))
-        let repetitionPenalty = Float(max(1.02, 1.10 - (field.coherenceBreak * 0.05)))
-        let repeatLastN = max(40, min(96, Int(round(64 - (field.coherenceBreak * 18) + (field.quantumOverride * 12)))))
+        // Stronger anti-collapse repetition control
+        let repetitionPenalty = Float(
+            max(1.02, 1.08 - (field.coherenceBreak * 0.05) + (field.instability * 0.06))
+        )
+        let repeatLastN = max(32, min(80, Int(round(56 - (field.coherenceBreak * 14) + (field.quantumOverride * 16)))))
         return SamplingConfig(
             temperature: temperature,
             topK: topK,
@@ -388,7 +491,8 @@ final class QuantumMemoryService {
 
         var remaining = Array(sorted.indices)
         var selected: [Int] = []
-        var rng = SeededRNG(seed: seed ?? 0)
+        let effectiveSeed: UInt64 = seed ?? UInt64.random(in: UInt64.min...UInt64.max)
+        var rng = SeededRNG(seed: effectiveSeed)
         let hasSeed = seed != nil
 
         while selected.count < clampedK, !remaining.isEmpty {
@@ -457,6 +561,15 @@ final class QuantumMemoryService {
         }
         if na == 0 || nb == 0 { return 0 }
         return dot / (sqrt(na) * sqrt(nb))
+    }
+
+    private nonisolated func normalizedSimilarity(a: [Double], b: [Double]) -> Double {
+        guard a.count == b.count else { return 0 }
+        var dot = 0.0
+        for i in 0..<a.count {
+            dot += a[i] * b[i]
+        }
+        return dot
     }
 
     private nonisolated func clamp01(_ x: Double) -> Double {
@@ -556,7 +669,9 @@ private struct SeededRNG: RandomNumberGenerator {
     private var state: UInt64
 
     init(seed: UInt64) {
-        self.state = seed == 0 ? 0x9E3779B97F4A7C15 : seed
+        self.state = seed == 0
+            ? UInt64.random(in: UInt64.min...UInt64.max)
+            : seed
     }
 
     mutating func next() -> UInt64 {

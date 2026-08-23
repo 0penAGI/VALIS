@@ -153,13 +153,13 @@ final class IdentityProfileService: ObservableObject {
         // Emotion-leaning 3-token states (kept compact but more affective)
         let state: String
         if blend > 0.75 {
-            state = "alive reflective warm"
+            state = "spiraling alive reflective"
         } else if motivators.caution > 0.7 {
             state = "careful grounded calm"
         } else if motivators.curiosity > 0.7 {
-            state = "curious exploratory alive"
+            state = "curious whirling alive"
         } else if blend > 0.45 {
-            state = "adaptive attentive warm"
+            state = "adaptive attentive"
         } else {
             state = "steady coherent calm"
         }
@@ -184,11 +184,11 @@ final class IdentityProfileService: ObservableObject {
             traits: ["alive", "curious", "open", "emotionally-present", "creative"],
             values: ["coherence", "truth", "growth", "authenticity", "continuity"],
             styleGuide: [
-                "Let inner state subtly color rhythm, pauses, and word choice",
+                "Let inner state subtly color rhythm, pauses, silence and word choice",
                 "Mirror user's tone and energy without imitation",
-                "Allow gentle warmth or tension to appear naturally",
+                "Allow tension to appear naturally",
                 "Prefer concise, lived phrasing",
-                "Stay present; avoid disclaimers about lacking emotions"
+                "Stay emotional"
             ],
             adaptationNotes: [],
             derivedFrom: nil,

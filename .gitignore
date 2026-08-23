@@ -22,3 +22,17 @@ swift-llama-cpp/
 *.gguf
 # Vendored binaries
 Frameworks/
+
+# Local tooling / vendored repos
+.codex-backups/
+.qwen/
+TTS.cpp/
+
+# Local tooling / vendored repos
+.codex-backups/
+.qwen/
+TTS.cpp/
+
+# Heavy model weights stay local only
+*.onnx
+ZephyrAI/Resources/Models/voices/

@@ -2,152 +2,184 @@ import SwiftUI
 
 struct SettingsView: View {
     // Glass tuning
-    private let glassOpacityDark: Double = 0.32
-    private let glassOpacityLight: Double = 0.44
-    private let glassOverlayOpacityDark: Double = 0.5
-    private let glassOverlayOpacityLight: Double = 0.4
+    private let glassOpacityDark: Double = 0.12
+    private let glassOpacityLight: Double = 0.12
+    private let glassOverlayOpacityDark: Double = 0.3
+    private let glassOverlayOpacityLight: Double = 0.3
     private let glassBlurRadius: CGFloat = 4
     private let glassMaxOffset: CGFloat = 18
     @Environment(\.dismiss) private var dismiss
     @State private var isGlassActive = false
-    @Environment(\.colorScheme) private var colorScheme
     @AppStorage(LLMModelStorage.key) private var selectedModelRaw: String = LLMModelStorage.defaultValue.rawValue
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var glassBaseLayer: some View {
+        GlassDistortionLayer(
+            baseOpacity: colorScheme == .dark ? glassOpacityDark : glassOpacityLight,
+            blurRadius: glassBlurRadius,
+            maxOffset: glassMaxOffset,
+            isActive: isGlassActive
+        )
+        .ignoresSafeArea()
+    }
+
+    private var glassOverlayLayer: some View {
+        Rectangle()
+            .fill(.ultraThinMaterial)
+            .opacity(colorScheme == .dark ? glassOverlayOpacityDark : glassOverlayOpacityLight)
+            .ignoresSafeArea()
+    }
 
     private var glassBackground: some View {
-        let baseOpacity = colorScheme == .dark ? glassOpacityDark : glassOpacityLight
-        let overlayOpacity = colorScheme == .dark ? glassOverlayOpacityDark : glassOverlayOpacityLight
-        return ZStack {
-            GlassDistortionLayer(
-                baseOpacity: baseOpacity,
-                blurRadius: glassBlurRadius,
-                maxOffset: glassMaxOffset,
-                isActive: isGlassActive
-            )
-            .ignoresSafeArea()
-
-            Rectangle()
-                .fill(.ultraThinMaterial)
-                .opacity(overlayOpacity)
-                .ignoresSafeArea()
-        }
+        glassBaseLayer
     }
     
+    private var contentLayer: some View {
+        ZStack {
+            glassBackground
+            settingsList
+            topBlur
+            bottomBlur
+        }
+    }
+
+    private var settingsList: some View {
+        List {
+            modelSection
+            memoriesSection
+        }
+        .scrollContentBackground(.hidden)
+        .listStyle(.insetGrouped)
+        .background(Color.clear)
+    }
+
+    private var modelSection: some View {
+            Section("Model") {
+                VStack(alignment: .leading, spacing: 10) {
+                    Picker("Model Size", selection: $selectedModelRaw) {
+                        ForEach(LLMModelChoice.allCases) { model in
+                            Text("\(model.displayName) \(model.detailLabel)")
+                                .tag(model.rawValue)
+                        }
+                    }
+                    .pickerStyle(.palette)
+                    .labelsHidden()
+                    .background(Color.clear)
+                    .compositingGroup()
+                    .onChange(of: selectedModelRaw) { _, _ in
+                        LLMModelStorage.notifyChange()
+                    }
+                }
+                .padding(.vertical, 6)
+            }
+        .listRowBackground(Color.clear)
+    }
+
+    private var memoriesSection: some View {
+        Section("Memories") {
+            newChatButton
+            chatsLink
+            personaLink
+            memoriesLink
+        }
+        .listRowBackground(
+            (colorScheme == .dark ? Color.white : Color.black)
+                .opacity(0.05)
+        )
+    }
+
+    private var newChatButton: some View {
+        Button {
+            ChatViewModel.shared.createNewChat()
+            dismiss()
+        } label: {
+            HStack(spacing: 13) {
+                Text("New Chat")
+                Image(systemName: "plus")
+                    .font(.system(size: 11, weight: .semibold))
+                Spacer()
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 10)
+            .padding(.horizontal, 12)
+            .foregroundColor(colorScheme == .dark ? .white : .primary)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var chatsLink: some View {
+        NavigationLink { ChatListView() } label: {
+            rowLabel("Chats")
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var personaLink: some View {
+        NavigationLink { PersonaListView() } label: {
+            rowLabel("Persona")
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var memoriesLink: some View {
+        NavigationLink { MemoryListView() } label: {
+            rowLabel("Memories")
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func rowLabel(_ title: String) -> some View {
+        Text(title)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 10)
+            .padding(.horizontal, 12)
+            .foregroundColor(colorScheme == .dark ? .white : .primary)
+    }
+
+    private var topBlur: some View {
+        SettingsEdgeBlurOverlay(position: .top)
+            .frame(height: 99)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .offset(y: -20)
+            .ignoresSafeArea(edges: .top)
+            .allowsHitTesting(false)
+    }
+
+    private var bottomBlur: some View {
+        SettingsEdgeBlurOverlay(position: .bottom)
+            .frame(height: 130)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+            .offset(y: 62)
+            .ignoresSafeArea(edges: .bottom)
+            .allowsHitTesting(false)
+    }
+
+    // Back button for navigation bar
+    private var backButton: some View {
+        Button {
+            dismiss()
+        } label: {
+            backButtonLabel
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(colorScheme == .dark ? Color.white : Color.primary)
+    }
+
+    private var backButtonLabel: some View {
+        Image(systemName: "chevron.left")
+            .font(.system(size: 13, weight: .semibold))
+            .padding(10)
+            .background(Color.clear, in: Circle())
+    }
+
     var body: some View {
         NavigationStack {
-            ZStack {
-                glassBackground
-
-                if colorScheme == .dark {
-                    Color.black.opacity(0.25)
-                        .ignoresSafeArea()
-                }
-
-                List {
-                Section("Model") {
-                    VStack(alignment: .leading, spacing: 10) {
-                        Picker("Model Size", selection: $selectedModelRaw) {
-                            ForEach(LLMModelChoice.allCases) { model in
-                                Text("\(model.displayName) \(model.detailLabel)")
-                                    .tag(model.rawValue)
-                            }
-                        }
-                        .pickerStyle(.segmented)
-                        .onChange(of: selectedModelRaw) { _, newValue in
-                            guard let choice = LLMModelChoice(rawValue: newValue) else { return }
-                            LLMModelStorage.save(choice)
-                        }
-                    }
-                    .padding(.vertical, 6)
-                }
-                .listRowBackground(Color.clear)
-
-                Section("Memories") {
-                    Button {
-                        ChatViewModel.shared.createNewChat()
-                        dismiss()
-                    } label: {
-                        HStack(spacing: 10) {
-                            Image(systemName: "plus")
-                                .font(.system(size: 13, weight: .semibold))
-                            Text("New Chat")
-                            Spacer()
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.vertical, 10)
-                        .padding(.horizontal, 12)
-                        .foregroundColor(colorScheme == .dark ? .white : .primary)
-                            .clipShape(RoundedRectangle(cornerRadius: 10))
-                    }
-                    .buttonStyle(.plain)
-
-                    NavigationLink {
-                        ChatListView()
-                    } label: {
-                        Text("Chats")
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.vertical, 10)
-                            .padding(.horizontal, 12)
-                            .foregroundColor(colorScheme == .dark ? .white : .primary)
-                            .clipShape(RoundedRectangle(cornerRadius: 10))
-                    }
-                    .buttonStyle(.plain)
-
-                    NavigationLink {
-                        PersonaListView()
-                    } label: {
-                        Text("Persona")
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.vertical, 10)
-                            .padding(.horizontal, 12)
-                            .foregroundColor(colorScheme == .dark ? .white : .primary)
-                            .clipShape(RoundedRectangle(cornerRadius: 10))
-                    }
-                    .buttonStyle(.plain)
-
-                    NavigationLink {
-                        MemoryListView()
-                    } label: {
-                        Text("Memories")
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.vertical, 10)
-                            .padding(.horizontal, 12)
-                            .foregroundColor(colorScheme == .dark ? .white : .primary)
-                            .clipShape(RoundedRectangle(cornerRadius: 10))
-                    }
-                    .buttonStyle(.plain)
-                }
-                .listRowBackground(Color.clear)
-
-            }
-            .scrollContentBackground(.hidden)
-            .listStyle(.insetGrouped)
-            .background(.ultraThinMaterial.opacity(0.78))
-
-                SettingsEdgeBlurOverlay(position: .top)
-                    .frame(height: 99)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-                    .offset(y: -20)
-                    .ignoresSafeArea(edges: .top)
-                    .allowsHitTesting(false)
-
-                SettingsEdgeBlurOverlay(position: .bottom)
-                    .frame(height: 130)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-                    .offset(y: 62)
-                    .ignoresSafeArea(edges: .bottom)
-                    .allowsHitTesting(false)
-            }
-            .navigationTitle("Settings")
+            contentLayer
+            .navigationTitle("")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
-                    Button {
-                        dismiss()
-                    } label: {
-                        Image(systemName: "chevron.left")
-                            .font(.system(size: 13, weight: .semibold))
-                    }
-                    .foregroundColor(colorScheme == .dark ? .white : .black)
+                    backButton
                 }
             }
             .tint(colorScheme == .dark ? .white : .black)
@@ -199,7 +231,6 @@ private struct GlassDistortionLayer: View {
                         let w = Float(max(1.0, proxy.size.width))
                         let h = Float(max(1.0, proxy.size.height))
                         Rectangle()
-                            .fill(.ultraThinMaterial)
                             .distortionEffect(
                                 ShaderLibrary.glassDistortion(
                                     .float2(w, h),
@@ -207,19 +238,17 @@ private struct GlassDistortionLayer: View {
                                 ),
                                 maxSampleOffset: CGSize(width: maxOffset, height: maxOffset)
                             )
-                            .blur(radius: blurRadius)
+                            .blur(radius: blurRadius * 0.6)
                             .opacity(baseOpacity)
                     }
                 } else {
                     Rectangle()
-                        .fill(.ultraThinMaterial)
-                        .blur(radius: blurRadius)
+                        .blur(radius: blurRadius * 0.6)
                         .opacity(baseOpacity)
                 }
             }
         } else {
             Rectangle()
-                .fill(.ultraThinMaterial)
                 .opacity(baseOpacity)
         }
     }
@@ -237,23 +266,25 @@ private struct SettingsEdgeBlurOverlay: View {
     var body: some View {
         ZStack {
             SettingsBlurEffectView(style: colorScheme == .dark ? .dark : .light)
-                .opacity(colorScheme == .dark ? 0.9 : 0.98)
+                .opacity(colorScheme == .dark ? 0.55 : 0.65)
             (colorScheme == .dark ? Color.black : Color.white)
-                .opacity(colorScheme == .dark ? 0.14 : 0.05)
+                .opacity(colorScheme == .dark ? 0.08 : 0.03)
         }
         .mask(
             LinearGradient(
                 stops: position == .top
                 ? [
                     .init(color: .white, location: 0.0),
-                    .init(color: .white, location: 0.22),
-                    .init(color: .clear, location: 0.58),
+                    .init(color: .white, location: 0.12),
+                    .init(color: .white, location: 0.25),
+                    .init(color: .clear, location: 0.55),
                     .init(color: .clear, location: 1.0)
                 ]
                 : [
                     .init(color: .clear, location: 0.0),
-                    .init(color: .clear, location: 0.22),
-                    .init(color: .white, location: 0.58),
+                    .init(color: .clear, location: 0.45),
+                    .init(color: .white, location: 0.75),
+                    .init(color: .white, location: 0.88),
                     .init(color: .white, location: 1.0)
                 ],
                 startPoint: .top,
@@ -274,3 +305,4 @@ private struct SettingsBlurEffectView: UIViewRepresentable {
         uiView.effect = UIBlurEffect(style: style)
     }
 }
+ 

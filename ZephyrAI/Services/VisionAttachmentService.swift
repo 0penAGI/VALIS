@@ -1,7 +1,13 @@
 import Foundation
-import UIKit
 import CoreML
 @preconcurrency import Vision
+#if canImport(UIKit)
+import UIKit
+private typealias PlatformImage = UIImage
+#elseif canImport(AppKit)
+import AppKit
+private typealias PlatformImage = NSImage
+#endif
 
 struct SimilarImageMatch: Sendable {
     let filename: String
@@ -61,6 +67,62 @@ struct VisionAttachmentAnalysis: Sendable {
         lines.append("Use only this analysis. Do not invent unseen visual details.")
         return lines.joined(separator: "\n")
     }
+
+    func learningSnippets(
+        query: String,
+        title: String?,
+        sourceURL: String?,
+        attachmentFilename: String
+    ) -> [String] {
+        var snippets: [String] = []
+        let normalizedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedTitle = title?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedSourceURL = sourceURL?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        var referenceLines: [String] = ["[visual-reference]"]
+        if !normalizedQuery.isEmpty {
+            referenceLines.append("query: \(normalizedQuery)")
+        }
+        if let normalizedTitle, !normalizedTitle.isEmpty {
+            referenceLines.append("title: \(normalizedTitle)")
+        }
+        if let normalizedSourceURL, !normalizedSourceURL.isEmpty {
+            referenceLines.append("source: \(normalizedSourceURL)")
+        }
+        referenceLines.append("attachment: \(attachmentFilename)")
+        referenceLines.append("dimensions: \(attachment.pixelWidth)x\(attachment.pixelHeight)")
+        snippets.append(referenceLines.joined(separator: "\n"))
+
+        var observationLines: [String] = ["[visual-observation]"]
+        if let captionText, !captionText.isEmpty {
+            observationLines.append("caption: \(captionText)")
+        }
+        if let ocrText, !ocrText.isEmpty {
+            observationLines.append("ocr: \(ocrText)")
+        }
+        if faceCount > 0 {
+            observationLines.append("faces: \(faceCount)")
+        }
+        if !faceLandmarkTags.isEmpty {
+            observationLines.append("face_landmarks: \(faceLandmarkTags.joined(separator: ", "))")
+        }
+        if !detectedObjects.isEmpty {
+            observationLines.append("objects: \(detectedObjects.joined(separator: ", "))")
+        }
+        if !customTags.isEmpty {
+            observationLines.append("tags: \(customTags.joined(separator: ", "))")
+        }
+        if !similarImages.isEmpty {
+            let similar = similarImages.prefix(4).map { "\($0.filename):\(String(format: "%.3f", $0.distance))" }
+            observationLines.append("similar_local_images: \(similar.joined(separator: ", "))")
+        }
+        if !notes.isEmpty {
+            observationLines.append("notes: \(notes.joined(separator: " | "))")
+        }
+        snippets.append(observationLines.joined(separator: "\n"))
+
+        return snippets
+    }
 }
 
 final class VisionAttachmentService {
@@ -78,8 +140,8 @@ final class VisionAttachmentService {
 
     private func analyzeSync(_ attachment: MessageImageAttachment, motivators: MotivatorState) -> VisionAttachmentAnalysis {
         let imageURL = attachmentURL(for: attachment)
-        guard let image = UIImage(contentsOfFile: imageURL.path),
-              let cgImage = image.cgImage else {
+        guard let image = loadImage(from: imageURL),
+              let cgImage = platformCGImage(from: image) else {
             return VisionAttachmentAnalysis(
                 attachment: attachment,
                 ocrText: nil,
@@ -251,8 +313,8 @@ final class VisionAttachmentService {
 
         for fileURL in fileURLs {
             guard fileURL.lastPathComponent != attachment.filename else { continue }
-            guard let image = UIImage(contentsOfFile: fileURL.path),
-                  let compareCGImage = image.cgImage,
+            guard let image = loadImage(from: fileURL),
+                  let compareCGImage = platformCGImage(from: image),
                   let comparePrint = featurePrint(for: compareCGImage) else { continue }
 
             var distance: Float = 0
@@ -291,7 +353,7 @@ final class VisionAttachmentService {
     }
 
     private func buildCustomTags(
-        image: UIImage,
+        image: PlatformImage,
         ocrText: String?,
         faceCount: Int,
         faceLandmarkTags: [String],
@@ -364,8 +426,8 @@ final class VisionAttachmentService {
         return caption.isEmpty ? nil : caption
     }
 
-    private func estimateBrightness(_ image: UIImage) -> CGFloat {
-        guard let cgImage = image.cgImage else { return 0.5 }
+    private func estimateBrightness(_ image: PlatformImage) -> CGFloat {
+        guard let cgImage = platformCGImage(from: image) else { return 0.5 }
         guard let data = cgImage.dataProvider?.data,
               let ptr = CFDataGetBytePtr(data) else { return 0.5 }
 
@@ -392,8 +454,8 @@ final class VisionAttachmentService {
         return total / count
     }
 
-    private func estimateColorMood(_ image: UIImage) -> String {
-        guard let cgImage = image.cgImage,
+    private func estimateColorMood(_ image: PlatformImage) -> String {
+        guard let cgImage = platformCGImage(from: image),
               let data = cgImage.dataProvider?.data,
               let ptr = CFDataGetBytePtr(data) else { return "neutral-color-balance" }
 
@@ -439,5 +501,26 @@ final class VisionAttachmentService {
 
     private func attachmentURL(for attachment: MessageImageAttachment) -> URL {
         attachmentsDirectoryURL.appendingPathComponent(attachment.filename)
+    }
+
+    private func loadImage(from url: URL) -> PlatformImage? {
+        #if canImport(UIKit)
+        return UIImage(contentsOfFile: url.path)
+        #elseif canImport(AppKit)
+        return NSImage(contentsOfFile: url.path)
+        #else
+        return nil
+        #endif
+    }
+
+    private func platformCGImage(from image: PlatformImage) -> CGImage? {
+        #if canImport(UIKit)
+        return image.cgImage
+        #elseif canImport(AppKit)
+        var rect = CGRect(origin: .zero, size: image.size)
+        return image.cgImage(forProposedRect: &rect, context: nil, hints: nil)
+        #else
+        return nil
+        #endif
     }
 }

@@ -3,6 +3,14 @@ import AVFoundation
 import PhotosUI
 import WebKit
 
+#if canImport(UIKit)
+import UIKit
+private typealias PlatformImage = UIImage
+#elseif canImport(AppKit)
+import AppKit
+private typealias PlatformImage = NSImage
+#endif
+
 struct ChatView: View {
     @StateObject private var viewModel = ChatViewModel.shared
     @State private var showSettings = false
@@ -15,12 +23,15 @@ struct ChatView: View {
     @State private var audioRecorder: AVAudioRecorder?
     @State private var audioFilename: URL?
     @State private var audioLevel: CGFloat = 0.2
+    @State private var micLevel: CGFloat = 0.0
     @State private var silenceTimer: TimeInterval = 0
     @State private var meterTimer: Timer?
     @State private var selectedPhotoItem: PhotosPickerItem?
     @State private var inputBarHeight: CGFloat = 58
     private let baselineInputBarHeight: CGFloat = 58
     @State private var isUserControllingScroll = false
+    @State private var didFinishInitialReveal: Bool = false
+    @State private var introRevealTask: Task<Void, Never>?
     @State private var autoScrollResumeTask: Task<Void, Never>?
     private let autoScrollResumeDelayNs: UInt64 = 3_000_000_000
 
@@ -42,6 +53,9 @@ struct ChatView: View {
                                 },
                                 onRegenerateAssistantMessage: { id in
                                     viewModel.regenerateAssistantResponse(for: id)
+                                },
+                                onUpdateArtifact: { updatedCode in
+                                    viewModel.updateArtifactContent(for: message.id, payload: updatedCode)
                                 }
                             )
                                 .id(message.id)
@@ -50,6 +64,9 @@ struct ChatView: View {
                     .padding()
                     .padding(.top, 58)
                 }
+                .opacity(didFinishInitialReveal ? 1 : 0)
+                .scaleEffect(didFinishInitialReveal ? 1 : 0.98)
+                .animation(.easeOut(duration: 0.25), value: didFinishInitialReveal)
                 .scrollDismissesKeyboard(.interactively)
                 .onChange(of: viewModel.messages.last?.content) { _, _ in
                     guard !isUserControllingScroll else { return }
@@ -87,7 +104,7 @@ struct ChatView: View {
                     TapGesture().onEnded {
                         showSandwich = true
                         restartSandwichTimer()
-                        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+                        dismissKeyboard()
                     }
                 )
                 .simultaneousGesture(
@@ -102,7 +119,7 @@ struct ChatView: View {
             }
 
             // Intro Greeting Overlay
-            if viewModel.messages.isEmpty {
+            if viewModel.messages.isEmpty || !viewModel.isModelReady || !didFinishInitialReveal {
                 let isTyping = !viewModel.inputText.isEmpty
                 IntroGreetingView(text: IntroGreetingCopy.current(), isTyping: isTyping)
                     .padding(.top, 8)
@@ -132,18 +149,9 @@ struct ChatView: View {
                         .font(.system(size: 17, weight: .medium))
                         .offset(y: -11)
 
-                    // Right side (status + sandwich)
+                    // Right side (sandwich)
                     HStack(spacing: 9) {
                         Spacer()
-
-                        Text(viewModel.status)
-                            .font(.system(size: 8, weight: .medium))
-                            .foregroundColor(.secondary)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                            .frame(maxWidth: 120, alignment: .trailing)
-                            .opacity(viewModel.status.isEmpty ? 0 : 0.85)
-                            .animation(.easeOut(duration: 0.2), value: viewModel.status)
 
                         Button {
                             showSettings = true
@@ -151,13 +159,14 @@ struct ChatView: View {
                         } label: {
                             Image(systemName: "line.3.horizontal")
                                 .foregroundColor(.primary)
-                                .opacity(showSandwich ? 1 : 0.15)
+                                .opacity(showSandwich ? 1 : 0.08)
                                 .scaleEffect(showSandwich ? 1 : 0.8)
                                 .animation(.easeInOut(duration: 0.25), value: showSandwich)
                                 .frame(width: 28, height: 28)
                                 .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
+                        .offset(y: -15)
                     }
                 }
                 .frame(height: 44)
@@ -165,190 +174,176 @@ struct ChatView: View {
                 .background(Color.clear)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            // Bottom centered status (independent from input bar)
+            VStack {
+                Spacer()
+
+                Text(viewModel.status)
+                    .font(.system(size: 10, weight: .regular))
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .opacity(viewModel.status.isEmpty ? 0 : 0.9)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 6)
+                    .padding(.bottom, 11)
+                    .animation(.easeOut(duration: 0.2), value: viewModel.status)
+            }
+            .allowsHitTesting(false)
         }
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 20, coordinateSpace: .local)
+                .onEnded { value in
+                    let horizontal = value.translation.width
+                    let vertical = value.translation.height
+                    
+                    // Ensure it's a horizontal swipe and mostly left
+                    guard abs(horizontal) > abs(vertical) else { return }
+                    guard horizontal < -60 else { return } // swipe left threshold
+                    
+                    showSettings = true
+                    restartSandwichTimer()
+                }
+        )
         .safeAreaInset(edge: .bottom) {
-            VStack(spacing: 0) {
-                if let editingId = viewModel.editingUserMessageId,
-                   let message = viewModel.messages.first(where: { $0.id == editingId && $0.role == .user }) {
-                    HStack(spacing: 8) {
-                        Image(systemName: "pencil")
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(.secondary)
-                        Text("Editing message: \(message.content)")
-                            .font(.system(size: 12, weight: .medium))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                        Spacer()
-                        Button {
-                            viewModel.cancelEditingUserMessage()
-                            viewModel.inputText = ""
-                        } label: {
-                            Image(systemName: "xmark")
-                                .font(.system(size: 11, weight: .bold))
+            if viewModel.isModelReady {
+                VStack(spacing: 0) {
+                    if let editingId = viewModel.editingUserMessageId,
+                       let message = viewModel.messages.first(where: { $0.id == editingId && $0.role == .user }) {
+                        HStack(spacing: 8) {
+                            Image(systemName: "pencil")
+                                .font(.system(size: 12, weight: .semibold))
                                 .foregroundStyle(.secondary)
+                            Text("Editing message: \(message.content)")
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                            Spacer()
+                            Button {
+                                viewModel.cancelEditingUserMessage()
+                                viewModel.inputText = ""
+                            } label: {
+                                Image(systemName: "xmark")
+                                    .font(.system(size: 11, weight: .bold))
+                                    .foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.plain)
                         }
-                        .buttonStyle(.plain)
+                        .padding(.horizontal, 14)
+                        .padding(.bottom, 6)
                     }
-                    .padding(.horizontal, 14)
-                    .padding(.bottom, 6)
-                }
 
-                if let attachment = viewModel.pendingImageAttachment {
-                    HStack {
-                        InputAttachmentPreview(attachment: attachment) {
-                            viewModel.removePendingImage()
-                            selectedPhotoItem = nil
+                    if let attachment = viewModel.pendingImageAttachment {
+                        HStack {
+                            InputAttachmentPreview(attachment: attachment) {
+                                viewModel.removePendingImage()
+                                selectedPhotoItem = nil
+                            }
+                            Spacer()
                         }
-                        Spacer()
+                        .padding(.horizontal, 14)
+                        .padding(.bottom, 6)
                     }
-                    .padding(.horizontal, 14)
-                    .padding(.bottom, 6)
-                }
 
-                HStack(alignment: .bottom) {
-                    TextField(viewModel.editingUserMessageId == nil ? "Type a message..." : "Edit message...", text: $viewModel.inputText, axis: .vertical)
-                        .focused($isInputFocused)
-                        .textFieldStyle(.plain)
-                        .lineLimit(1...5)
-                        .disabled(isRecording)
-                        .tint(colorScheme == .dark ? .white : .black)
+                    HStack(alignment: .bottom) {
+                        TextField(viewModel.editingUserMessageId == nil ? "Type here..." : "Edit message...", text: $viewModel.inputText, axis: .vertical)
+                            .focused($isInputFocused)
+                            .textFieldStyle(.plain)
+                            .lineLimit(1...5)
+                            .disabled(isRecording || !viewModel.isModelReady)
+                            .tint(colorScheme == .dark ? .white : .black)
 
-                    if viewModel.inputText.isEmpty && viewModel.pendingImageAttachment == nil && !viewModel.isInteracting {
-                        PhotosPicker(selection: $selectedPhotoItem, matching: .images, photoLibrary: .shared()) {
-                            Image(systemName: "plus")
-                                .font(.system(size: 13, weight: .medium))
-                                .foregroundStyle(Color.primary.opacity(0.56))
-                                .frame(width: 30, height: 30)
-                                .contentShape(Rectangle())
-                                .offset(y: 2)
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(viewModel.isInteracting || isRecording)
-
-                        Button(action: {
-                            if isRecording {
-                                stopRecording()
-                            } else {
-                                startRecording()
+                        if viewModel.inputText.isEmpty && viewModel.pendingImageAttachment == nil && !viewModel.isInteracting {
+                            PhotosPicker(selection: $selectedPhotoItem, matching: .images, photoLibrary: .shared()) {
+                                Image(systemName: "plus")
+                                    .font(.system(size: 13, weight: .medium))
+                                    .foregroundStyle(Color.primary.opacity(0.56))
+                                    .frame(width: 30, height: 30)
+                                    .contentShape(Rectangle())
+                                    .offset(y: 2)
                             }
-                        }) {
-                            ZStack {
-                                Circle()
-                                    .stroke(Color.primary.opacity(0.6), lineWidth: 1)
-                                    .frame(width: 34, height: 34)
-                                    .scaleEffect(isRecording ? 1.0 : 0.95)
-                                    .opacity(isRecording ? 0.0 : 1.0)
-                                    .animation(.easeInOut(duration: 1.5).repeatForever(autoreverses: true), value: isRecording)
+                            .buttonStyle(.plain)
+                            .disabled(viewModel.isInteracting || isRecording || !viewModel.isModelReady)
 
-                                Image(systemName: "waveform")
-                                    .font(.system(size: 16, weight: .medium))
-                                    .foregroundColor(.primary)
-                                    .scaleEffect(isRecording ? (0.6 + audioLevel * 1.4) : 1.0)
-                                    .opacity(
-                                        isRecording
-                                        ? (0.4 + audioLevel * 0.8)
-                                        : (sin(Date().timeIntervalSince1970 * 0.8) > 0 ? 0.7 : 0.0)
-                                    )
-                                    .animation(.easeInOut(duration: 0.2), value: audioLevel)
-                                    .animation(.easeInOut(duration: 1.5), value: isRecording)
-                            }
-                            .frame(width: 34, height: 34)
-                        }
-                    } else {
-                        PhotosPicker(selection: $selectedPhotoItem, matching: .images, photoLibrary: .shared()) {
-                            Image(systemName: "plus")
-                                .font(.system(size: 13, weight: .medium))
-                                .foregroundStyle(Color.primary.opacity(0.56))
-                                .frame(width: 30, height: 30)
-                                .contentShape(Rectangle())
-                                .offset(y: 2)
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(viewModel.isInteracting || isRecording)
-
-                        Button(action: {
-                            if viewModel.isInteracting {
-                                viewModel.stopGeneration()
-                            } else {
-                                isInputFocused = false
-                                viewModel.sendMessage()
-                            }
-                        }) {
-                            ZStack {
-                                let isActive = viewModel.isInteracting || !viewModel.inputText.isEmpty || viewModel.pendingImageAttachment != nil
-                                Circle()
-                                    .fill(
-                                        isActive
-                                        ? Color.primary.opacity(viewModel.isInteracting ? 0.15 : 0.08)
-                                        : Color.clear
-                                    )
-                                    .overlay(
-                                        Circle()
-                                            .stroke(
-                                                Color.primary,
-                                                lineWidth: isActive ? 0 : 1.1
-                                            )
-                                    )
-                                    .frame(
-                                        width: isActive ? 34 : 27,
-                                        height: isActive ? 34 : 27
-                                    )
-                                    .rotationEffect(.degrees(viewModel.isInteracting ? 360 : 0))
-                                    .animation(
-                                        .spring(response: 0.25, dampingFraction: 0.75),
-                                        value: isActive
-                                    )
-                                    .animation(
-                                        viewModel.isInteracting
-                                        ? .linear(duration: 1).repeatForever(autoreverses: false)
-                                        : .easeOut(duration: 0.25),
-                                        value: viewModel.isInteracting
-                                    )
-
-                                if viewModel.isInteracting || !viewModel.inputText.isEmpty || viewModel.pendingImageAttachment != nil {
-                                    Circle()
-                                        .fill(Color.primary)
-                                        .frame(width: 22, height: 22)
-                                        .transition(.scale.combined(with: .opacity))
+                            Button(action: {
+                                Haptic.tap()
+                                if isRecording {
+                                    stopRecording()
+                                } else {
+                                    startRecording()
                                 }
+                            }) {
+                                ZStack {
+                                    Image(systemName: "waveform")
+                                        .font(.system(size: 16, weight: .medium))
+                                        .foregroundStyle(colorScheme == .dark ? Color.white : Color.black)
+                                        .symbolRenderingMode(.monochrome)
+                                        .scaleEffect(isRecording ? (0.6 + micLevel * 1.4) : 1.0)
+                                        .opacity(
+                                            isRecording
+                                            ? (0.4 + micLevel * 0.8)
+                                            : (sin(Date().timeIntervalSince1970 * 0.8) > 0 ? 0.7 : 0.0)
+                                        )
+                                        .animation(.easeInOut(duration: 0.2), value: micLevel)
+                                        .animation(.easeInOut(duration: 1.5), value: isRecording)
+                                }
+                                .padding(10)
+                                .contentShape(Circle())
+                                .frame(width: 42, height: 42)
+                                .modifier(SendButtonGlassCircle())
+                            }
+                        } else {
+                            PhotosPicker(selection: $selectedPhotoItem, matching: .images, photoLibrary: .shared()) {
+                                Image(systemName: "plus")
+                                    .font(.system(size: 13, weight: .medium))
+                                    .foregroundStyle(Color.primary.opacity(0.56))
+                                    .frame(width: 30, height: 30)
+                                    .contentShape(Rectangle())
+                                    .offset(y: 2)
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(viewModel.isInteracting || isRecording || !viewModel.isModelReady)
 
+                            Button(action: {
                                 if viewModel.isInteracting {
-                                    Image(systemName: "stop.fill")
-                                        .font(.system(size: 11, weight: .bold))
-                                        .foregroundColor(Color(UIColor.systemBackground))
-                                        .transition(.scale.combined(with: .opacity))
-                                } else if !viewModel.inputText.isEmpty || viewModel.pendingImageAttachment != nil {
-                                    Image(systemName: "arrow.up")
-                                        .font(.system(size: 10, weight: .bold))
-                                        .foregroundColor(Color(UIColor.systemBackground))
-                                        .transition(.scale.combined(with: .opacity))
+                                    viewModel.stopGeneration()
+                                } else {
+                                    isInputFocused = false
+                                    viewModel.sendMessage()
                                 }
+                            }) {
+                                Image(systemName: viewModel.isInteracting ? "stop.fill" : "arrow.up")
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(colorScheme == .dark ? Color.white : Color.black)
+                                    .symbolRenderingMode(.monochrome)
+                                    .padding(10)
+                                    .contentShape(Circle())
+                                    .frame(width: 42, height: 42)
+                                    .modifier(SendButtonGlassCircle())
                             }
-                            .frame(width: 34, height: 34)
-                            .animation(.spring(response: 0.3, dampingFraction: 0.7), value: viewModel.isInteracting)
-                            .animation(.spring(response: 0.3, dampingFraction: 0.7), value: viewModel.inputText)
+                            .buttonStyle(.plain)
+                            .disabled(!viewModel.isModelReady || (!viewModel.isInteracting && viewModel.inputText.isEmpty && viewModel.pendingImageAttachment == nil))
                         }
-                        .disabled(!viewModel.isInteracting && viewModel.inputText.isEmpty && viewModel.pendingImageAttachment == nil)
+                    }
+                    .padding()
+                    .background(Color.clear)
+                }
+                .onGeometryChange(for: CGFloat.self) { geo in
+                    geo.size.height
+                } action: { newHeight in
+                    let clamped = max(baselineInputBarHeight, newHeight)
+                    withAnimation(.easeOut(duration: 0.18)) {
+                        inputBarHeight = clamped
                     }
                 }
-                .padding()
-                .background(Color.clear)
-            }
-            .onGeometryChange(for: CGFloat.self) { geo in
-                geo.size.height
-            } action: { newHeight in
-                let clamped = max(baselineInputBarHeight, newHeight)
-                withAnimation(.easeOut(duration: 0.18)) {
-                    inputBarHeight = clamped
+                .background(alignment: .bottom) {
+                    SoftBarBlurBackground(position: .bottom)
+                        .frame(height: 145 + max(0, inputBarHeight - baselineInputBarHeight))
+                        .offset(y: 42)
+                        .ignoresSafeArea(edges: .bottom)
+                        .allowsHitTesting(false)
                 }
-            }
-            .background(alignment: .bottom) {
-                SoftBarBlurBackground(position: .bottom)
-                    .frame(height: 145 + max(0, inputBarHeight - baselineInputBarHeight))
-                    .offset(y: 42)
-                    .ignoresSafeArea(edges: .bottom)
-                    .allowsHitTesting(false)
             }
         }
         // .ignoresSafeArea(.keyboard, edges: .bottom)
@@ -373,10 +368,34 @@ struct ChatView: View {
         }
         .onAppear {
             restartSandwichTimer()
+            syncIntroRevealState()
+        }
+        .onChange(of: viewModel.isModelReady) { _, _ in
+            syncIntroRevealState()
         }
         .onDisappear {
             autoScrollResumeTask?.cancel()
             autoScrollResumeTask = nil
+            introRevealTask?.cancel()
+            introRevealTask = nil
+        }
+    }
+
+    private func syncIntroRevealState() {
+        introRevealTask?.cancel()
+
+        guard viewModel.isModelReady else {
+            didFinishInitialReveal = false
+            return
+        }
+
+        introRevealTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard !Task.isCancelled else { return }
+            guard viewModel.isModelReady else { return }
+            withAnimation(.easeOut(duration: 0.25)) {
+                didFinishInitialReveal = true
+            }
         }
     }
     
@@ -393,6 +412,7 @@ struct ChatView: View {
                         return
                     }
                     self.setupRecorder()
+                    Haptic.recordStart()
                     self.audioRecorder?.record()
                     self.isRecording = true
                     self.startMetering()
@@ -405,6 +425,7 @@ struct ChatView: View {
     }
 
     private func stopRecording() {
+        Haptic.recordStop()
         audioRecorder?.stop()
         isRecording = false
         stopMetering()
@@ -456,6 +477,7 @@ struct ChatView: View {
             let clamped = max(0.05, min(1.5, CGFloat(safeRaw)))
 
             audioLevel = clamped
+            micLevel = min(max(clamped, 0), 1)
 
             if clamped < 0.08 {
                 silenceTimer += 0.1
@@ -473,6 +495,7 @@ struct ChatView: View {
         meterTimer?.invalidate()
         meterTimer = nil
         audioLevel = 0.2
+        micLevel = 0.0
         silenceTimer = 0
     }
 
@@ -525,6 +548,9 @@ struct ThinkingPanel: View {
         let lower = trimmed.lowercased()
 
         if let toolName = detectedToolName(in: trimmed) {
+            if toolName == "analyze_url" {
+                return "Checking link..."
+            }
             return "Using tool: \(toolName)"
         }
         if lower.contains("code") || lower.contains("function") || lower.contains("bug") || lower.contains("refactor") {
@@ -562,6 +588,23 @@ struct ThinkingPanel: View {
         guard let token, !token.isEmpty else { return nil }
         return token
     }
+
+    private var displayThoughtText: String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let toolName = detectedToolName(in: trimmed), toolName == "analyze_url" else {
+            return text
+        }
+
+        let cleaned = trimmed
+            .replacingOccurrences(of: #"(?i)(?:tool|action)\s*:\s*analyze_url\b[^\n]*"#, with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if cleaned.isEmpty {
+            return "Analyzing page..."
+        }
+
+        return "Analyzing page...\n\n\(cleaned)"
+    }
     
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -570,40 +613,58 @@ struct ThinkingPanel: View {
                 playTapHaptic()
                 isExpanded.toggle()
             }) {
-                HStack {
-                    Text(statusLabel)
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .scaleEffect(pulse ? 1.05 : 1.0)
-                        .opacity(pulse ? 1.0 : 0.7)
-                        .animation(
-                            pulse
-                            ? .easeInOut(duration: 1.2).repeatForever(autoreverses: true)
-                            : .easeOut(duration: 0.2),
-                            value: pulse
-                        )
-                    Spacer()
-                    if hasThoughtText {
-                        Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
-                            .font(.caption2)
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text(statusLabel)
+                            .font(.caption)
                             .foregroundColor(.secondary)
+                            .scaleEffect(pulse ? 1.05 : 1.0)
+                            .opacity(pulse ? 1.0 : 0.7)
+                            .animation(
+                                pulse
+                                ? .easeInOut(duration: 1.2).repeatForever(autoreverses: true)
+                                : .easeOut(duration: 0.2),
+                                value: pulse
+                            )
+                        Spacer()
+                        if hasThoughtText {
+                            Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
                     }
                 }
             }
             .buttonStyle(.plain)
+
+            if isThinking && !isExpanded {
+                TypingIndicatorView()
+                    .opacity(0.7)
+                    .offset(x: -8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
             
             if isExpanded && hasThoughtText {
                 ScrollViewReader { proxy in
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 0) {
-                            Text(text.isEmpty ? "…" : text)
-                                .font(.caption)
-                                .foregroundColor(.secondary)
+                    VStack(alignment: .leading, spacing: 6) {
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 0) {
+                                Text(displayThoughtText.isEmpty ? "…" : displayThoughtText)
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .id("BOTTOM")
+                            }
+                        }
+                        .frame(maxHeight: 140)
+
+                        if isThinking {
+                            TypingIndicatorView()
+                                .opacity(0.7)
+                                .offset(x: -8)
                                 .frame(maxWidth: .infinity, alignment: .leading)
-                                .id("BOTTOM")
                         }
                     }
-                    .frame(maxHeight: 140)
                     .onChange(of: text) { _, _ in
                         guard !isUserControllingThoughtScroll else { return }
                         DispatchQueue.main.async {
@@ -726,18 +787,23 @@ struct TypewriterText: View {
             }
     }
 
-    private func md(_ s: String) -> some View {
-        let base: Text
-        if let a = MarkdownRenderer.renderInline(s) {
-            base = Text(a)
-        } else {
-            base = Text(s)
+    private func md(_ s: String) -> AnyView {
+        if let attributed = MarkdownRenderer.renderPreservingLineBreaks(s) {
+            return AnyView(
+                Text(attributed)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .lineLimit(nil)
+                    .multilineTextAlignment(.leading)
+                    .textSelection(.enabled)
+            )
         }
-        return base
-            .fixedSize(horizontal: false, vertical: true)
-            .lineLimit(nil)
-            .multilineTextAlignment(.leading)
-            .textSelection(.enabled)
+        return AnyView(
+            Text(verbatim: s)
+                .fixedSize(horizontal: false, vertical: true)
+                .lineLimit(nil)
+                .multilineTextAlignment(.leading)
+                .textSelection(.enabled)
+        )
     }
 }
 
@@ -752,19 +818,15 @@ private struct AttachmentThumbnail: View {
     let attachment: MessageImageAttachment
 
     var body: some View {
-        Group {
-            if let image = UIImage(contentsOfFile: attachmentURL(for: attachment).path) {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFit()
-            } else {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 14)
-                        .fill(Color.secondary.opacity(0.12))
-                    Image(systemName: "photo")
-                        .font(.system(size: 20, weight: .medium))
-                        .foregroundStyle(.secondary)
-                }
+        if let image = loadPlatformImage(from: attachmentURL(for: attachment)) {
+            platformImageView(image)
+        } else {
+            ZStack {
+                RoundedRectangle(cornerRadius: 14)
+                    .fill(Color.secondary.opacity(0.12))
+                Image(systemName: "photo")
+                    .font(.system(size: 20, weight: .medium))
+                    .foregroundStyle(.secondary)
             }
         }
     }
@@ -800,6 +862,7 @@ private struct MessageAttachmentView: View {
     let attachment: MessageImageAttachment
     let maxWidth: CGFloat
     @State private var showFullscreen = false
+    @State private var isVisible = false
 
     private var maxHeight: CGFloat {
         320
@@ -815,6 +878,14 @@ private struct MessageAttachmentView: View {
         }
         .buttonStyle(.plain)
         .contentShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .opacity(isVisible ? 1 : 0)
+        .animation(.easeOut(duration: 0.22), value: isVisible)
+        .onAppear {
+            isVisible = true
+        }
+        .onDisappear {
+            isVisible = false
+        }
         .fullScreenCover(isPresented: $showFullscreen) {
             AttachmentFullscreenView(attachment: attachment)
                 .presentationBackground(.clear)
@@ -866,26 +937,23 @@ private struct AttachmentFullscreenView: View {
                     .ignoresSafeArea()
             }
 
-            Group {
-                if let image = UIImage(contentsOfFile: attachmentURL(for: attachment).path) {
-                    Image(uiImage: image)
-                        .resizable()
-                        .scaledToFit()
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .padding(20)
-                        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
-                        .offset(y: verticalDragOffset)
-                        .scaleEffect(imageScale)
-                        .gesture(dismissDragGesture)
-                } else {
-                    VStack(spacing: 12) {
-                        Image(systemName: "photo")
-                            .font(.system(size: 36, weight: .medium))
-                        Text("Image unavailable")
-                            .font(.system(size: 16, weight: .medium))
-                    }
-                    .foregroundStyle(.secondary)
+            if let image = loadPlatformImage(from: attachmentURL(for: attachment)) {
+                platformImageView(image)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .padding(20)
+                    .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+                    .offset(y: verticalDragOffset)
+                    .scaleEffect(imageScale)
+                    .gesture(dismissDragGesture)
+            } else {
+                VStack(spacing: 12) {
+                    Image(systemName: "photo")
+                        .font(.system(size: 36, weight: .medium))
+                    Text("Image unavailable")
+                        .font(.system(size: 16, weight: .medium))
                 }
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
 
             Button {
@@ -993,19 +1061,20 @@ struct TypingIndicatorView: View {
             dot(delay: 0.4)
         }
         .padding(.leading, 11)
+        .padding(.top, 4)
         .onAppear {
             animate = true
         }
         .onDisappear {
             animate = false
         }
-        .accessibilityLabel("Generating respo nse")
+        .accessibilityLabel("Generating response")
     }
 
     private func dot(delay: Double) -> some View {
         Circle()
             .fill(Color.secondary.opacity(0.7))
-            .frame(width: 3.14, height: 3.14)
+            .frame(width: 3, height: 3)
             .scaleEffect(animate ? 1.4 : 0.9)
             .opacity(animate ? 1.0 : 0.3)
             .animation(
@@ -1025,6 +1094,7 @@ struct MessageView: View {
     let isPolishingArtifact: Bool
     let onEditUserMessage: (UUID) -> Void
     let onRegenerateAssistantMessage: (UUID) -> Void
+    let onUpdateArtifact: (String) -> Void
     
     private let speech = SpeechService.shared
     private let experienceService = ExperienceService.shared
@@ -1063,7 +1133,11 @@ struct MessageView: View {
             return ""
         }
         return stripArtifacts(from: message.content)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var spokenContent: String {
+        let candidate = renderableContent.trimmingCharacters(in: .whitespacesAndNewlines)
+        return candidate.isEmpty ? message.content : candidate
     }
 
     private var streamingArtifact: Artifact? {
@@ -1093,30 +1167,32 @@ struct MessageView: View {
         if s.contains("\\(") || s.contains("\\[") || s.contains("$$") {
             return AnyView(MathJaxMessageView(content: s))
         }
-        
-        let base: Text
-
-        if var a = MarkdownRenderer.renderInline(s) {
-
-            // Rewrite link styling to avoid default blue tint
-            for run in a.runs {
-                if run.link != nil {
-                    a[run.range].foregroundColor = .primary
-                    a[run.range].underlineStyle = .single
-                    a[run.range].underlineColor = UIColor.label.withAlphaComponent(0.6)
-                }
-            }
-
-            base = Text(a)
-        } else {
-            base = Text(s)
+        if let attributed = MarkdownRenderer.renderPreservingLineBreaks(s) {
+            return AnyView(
+                Text(attributed)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .lineLimit(nil)
+                    .multilineTextAlignment(.leading)
+                    .textSelection(.enabled)
+            )
         }
+        return AnyView(
+            Text(verbatim: s)
+                .fixedSize(horizontal: false, vertical: true)
+                .lineLimit(nil)
+                .multilineTextAlignment(.leading)
+                .textSelection(.enabled)
+        )
+    }
 
-        return AnyView(base
-            .fixedSize(horizontal: false, vertical: true)
-            .lineLimit(nil)
-            .multilineTextAlignment(.leading)
-            .textSelection(.enabled))
+    private func plainText(_ s: String) -> some View {
+        AnyView(
+            Text(verbatim: s)
+                .fixedSize(horizontal: false, vertical: true)
+                .lineLimit(nil)
+                .multilineTextAlignment(.leading)
+                .textSelection(.enabled)
+        )
     }
     
     private func parseSegments(_ s: String) -> [Segment] {
@@ -1160,10 +1236,10 @@ struct MessageView: View {
         
         while !lines.isEmpty {
             let line = lines.removeFirst()
-            let t = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
             
             if inCode {
-                if t.hasPrefix("```") {
+                if trimmed.hasPrefix("```") {
                     inCode = false
                     flushCode()
                 } else {
@@ -1172,16 +1248,16 @@ struct MessageView: View {
                 continue
             }
             
-            if t.hasPrefix("```") {
+            if trimmed.hasPrefix("```") {
                 flushQuote()
                 flushText()
                 inCode = true
-                let after = t.dropFirst(3)
+                let after = trimmed.dropFirst(3)
                 codeLang = after.isEmpty ? nil : String(after)
                 continue
             }
             
-            if t.hasPrefix(">") {
+            if trimmed.hasPrefix(">") {
                 flushText()
                 bufferQuote.append(line)
                 // If next line is not quote, flush
@@ -1447,11 +1523,7 @@ struct MessageView: View {
                     ForEach(Array(segments.enumerated()), id: \.offset) { _, seg in
                         switch seg {
                         case .text(let t):
-                            if message.role == .assistant {
-                                md(t)
-                            } else {
-                                md(t)
-                            }
+                            plainText(t)
                         case .code(let code, let lang):
                             CodeBlockView(content: code, language: lang)
                         case .quote(let q):
@@ -1459,7 +1531,11 @@ struct MessageView: View {
                         }
                     }
                     ForEach(effectiveArtifacts) { artifact in
-                        ArtifactBlockView(artifact: artifact, isPolishing: false)
+                        ArtifactBlockView(
+                            artifact: artifact,
+                            isPolishing: false,
+                            onUpdateArtifact: onUpdateArtifact
+                        )
                     }
                 }
                     .frame(maxWidth: userBubbleMaxWidth, alignment: .trailing)
@@ -1473,19 +1549,19 @@ struct MessageView: View {
                             Image(systemName: "pencil")
                         }
                         Button(action: {
-                            UIPasteboard.general.string = message.content
+                            copyToClipboard(message.content)
                         }) {
                             Text("Copy")
                             Image(systemName: "doc.on.doc")
                         }
                         Button(action: {
-                            speech.speak(text: message.content, voice: .female)
+                            speech.speak(text: spokenContent, voice: .female)
                         }) {
                             Text("Speak (Female)")
                             Image(systemName: "waveform")
                         }
                         Button(action: {
-                            speech.speak(text: message.content, voice: .male)
+                            speech.speak(text: spokenContent, voice: .male)
                         }) {
                             Text("Speak (Male)")
                             Image(systemName: "waveform.circle")
@@ -1512,26 +1588,22 @@ struct MessageView: View {
                             .font(.caption)
                             .foregroundColor(.gray)
                     } else {
-                        if isThinkingForMessage || ((message.thinkContent ?? "").isEmpty == false) {
+                        if isThinkingForMessage || (message.thinkContent ?? "").isEmpty == false {
                             ThinkingPanel(
                                 text: isThinkingForMessage ? currentThink : (message.thinkContent ?? ""),
                                 isThinking: isThinkingForMessage
                             )
                             .padding(.bottom, 4)
                         }
-                        if hasRenderableText || message.imageAttachment != nil || !effectiveArtifacts.isEmpty || streamingArtifact != nil {
+                        if hasRenderableText || message.imageAttachment != nil || !effectiveArtifacts.isEmpty || streamingArtifact != nil || isStreamingCurrentMessage {
                             VStack(alignment: .leading, spacing: 8) {
                                 if let attachment = message.imageAttachment {
                                     MessageAttachmentView(attachment: attachment, maxWidth: 260)
                                 }
                                 ForEach(Array(segments.enumerated()), id: \.offset) { _, seg in
-                                switch seg {
-                                case .text(let t):
-                                    if message.role == .assistant {
+                                    switch seg {
+                                    case .text(let t):
                                         md(t)
-                                    } else {
-                                        md(t)
-                                    }
                                     case .code(let code, let lang):
                                         CodeBlockView(content: code, language: lang)
                                     case .quote(let q):
@@ -1539,7 +1611,11 @@ struct MessageView: View {
                                     }
                                 }
                                 ForEach(effectiveArtifacts) { artifact in
-                                    ArtifactBlockView(artifact: artifact, isPolishing: isPolishingArtifact)
+                                    ArtifactBlockView(
+                                        artifact: artifact,
+                                        isPolishing: isPolishingArtifact,
+                                        onUpdateArtifact: onUpdateArtifact
+                                    )
                                 }
                                 if let streamingArtifact {
                                     ArtifactGeneratingCardView(artifact: streamingArtifact)
@@ -1549,7 +1625,15 @@ struct MessageView: View {
                                 .padding(.leading, 14)
                                 .padding(.trailing, 18)
                                 .foregroundColor(.primary)
-                                .opacity(message.content.isEmpty ? 0.01 : 1.0)
+                                // Keep image-only / artifact-only assistant replies visible immediately.
+                                .opacity(
+                                    message.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+                                    message.imageAttachment == nil &&
+                                    effectiveArtifacts.isEmpty &&
+                                    streamingArtifact == nil
+                                    ? 0.01
+                                    : 1.0
+                                )
                                 .animation(.easeOut(duration: 0.2), value: message.content)
                                 .contextMenu {
                                     Button(action: {
@@ -1559,19 +1643,19 @@ struct MessageView: View {
                                         Image(systemName: "arrow.clockwise")
                                     }
                                     Button(action: {
-                                        UIPasteboard.general.string = message.content
+                                        copyToClipboard(message.content)
                                     }) {
                                         Text("Copy")
                                         Image(systemName: "doc.on.doc")
                                     }
                                     Button(action: {
-                                        speech.speak(text: message.content, voice: .female)
+                                        speech.speak(text: spokenContent, voice: .female)
                                     }) {
                                         Text("Speak (Female)")
                                         Image(systemName: "waveform")
                                     }
                                     Button(action: {
-                                        speech.speak(text: message.content, voice: .male)
+                                        speech.speak(text: spokenContent, voice: .male)
                                     }) {
                                         Text("Speak (Male)")
                                         Image(systemName: "waveform.circle")
@@ -1591,9 +1675,6 @@ struct MessageView: View {
                                         }
                                     }
                                 }
-                        }
-                        else if isThinkingForMessage || !(currentThink.isEmpty) {
-                            TypingIndicatorView()
                         }
                     }
                 }
@@ -1668,7 +1749,8 @@ private struct ArtifactGeneratingCardView: View {
             ArtifactFullscreenView(
                 artifact: artifact,
                 startInCodeMode: true,
-                isLiveStream: true
+                isLiveStream: true,
+                onSaveCode: { _ in }
             )
         }
     }
@@ -1733,6 +1815,7 @@ private struct ArtifactGenerationShaderLayer: View {
 private struct ArtifactBlockView: View {
     let artifact: MessageView.Artifact
     let isPolishing: Bool
+    let onUpdateArtifact: (String) -> Void
     @State private var showCode: Bool = false
     @State private var showFullscreen: Bool = false
     @State private var showFullscreenHint: Bool = false
@@ -1833,7 +1916,8 @@ private struct ArtifactBlockView: View {
             ArtifactFullscreenView(
                 artifact: artifact,
                 startInCodeMode: false,
-                isLiveStream: false
+                isLiveStream: false,
+                onSaveCode: onUpdateArtifact
             )
         }
     }
@@ -1859,10 +1943,14 @@ private struct ArtifactFullscreenView: View {
     let artifact: MessageView.Artifact
     let startInCodeMode: Bool
     let isLiveStream: Bool
+    let onSaveCode: (String) -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var showCode: Bool = false
     @State private var editableCode: String = ""
     @State private var renderedCode: String = ""
+    @State private var lastPersistedCode: String = ""
+    @State private var pendingSaveTask: Task<Void, Never>?
+    @State private var pendingRenderTask: Task<Void, Never>?
     @State private var showEditHint: Bool = false
     @State private var hideHintTask: Task<Void, Never>?
     @State private var showCopiedHint: Bool = false
@@ -1881,6 +1969,7 @@ private struct ArtifactFullscreenView: View {
                                 VStack(alignment: .leading, spacing: 0) {
                                     Text(editableCode)
                                         .font(.system(.body, design: .monospaced))
+                                        .lineLimit(nil)
                                         .fixedSize(horizontal: true, vertical: false)
                                         .textSelection(.enabled)
                                         .padding(10)
@@ -1934,6 +2023,7 @@ private struct ArtifactFullscreenView: View {
                 editableCode = artifact.payload
                 renderedCode = artifact.payload
             }
+            lastPersistedCode = artifact.payload
             if startInCodeMode {
                 showCode = true
             }
@@ -1942,12 +2032,17 @@ private struct ArtifactFullscreenView: View {
             }
         }
         .onChange(of: editableCode) { _, newValue in
-            renderedCode = newValue
+            scheduleRenderedCodeUpdate(for: newValue)
+
+            guard !isLiveStream else { return }
+            scheduleArtifactSave(for: newValue)
         }
         .onChange(of: artifact.payload) { _, newValue in
             if isLiveStream {
+                guard editableCode != newValue else { return }
                 editableCode = newValue
                 renderedCode = newValue
+                lastPersistedCode = newValue
             }
         }
         .onChange(of: showCode) { _, isCodeMode in
@@ -1961,6 +2056,8 @@ private struct ArtifactFullscreenView: View {
             }
         }
         .onDisappear {
+            pendingRenderTask?.cancel()
+            flushPendingArtifactSave()
             hideHintTask?.cancel()
             hideCopiedHintTask?.cancel()
             resumeLiveFollowTask?.cancel()
@@ -1979,8 +2076,11 @@ private struct ArtifactFullscreenView: View {
                         }
 
                         Button {
+                            pendingSaveTask?.cancel()
+                            pendingRenderTask?.cancel()
                             editableCode = artifact.payload
                             renderedCode = artifact.payload
+                            lastPersistedCode = artifact.payload
                             if isLiveStream {
                                 isFollowingLiveCode = true
                             }
@@ -1993,7 +2093,7 @@ private struct ArtifactFullscreenView: View {
                         .disabled(isLiveStream)
 
                         Button {
-                            UIPasteboard.general.string = editableCode
+                            copyToClipboard(editableCode)
                             showCopiedHintTemporarily()
                         } label: {
                             Image(systemName: "doc.on.doc")
@@ -2011,7 +2111,9 @@ private struct ArtifactFullscreenView: View {
                     }
                     .padding(.horizontal, 14)
                     .padding(.vertical, 9)
-                    .background(.ultraThinMaterial, in: Capsule())
+                    .background {
+                        ArtifactFullscreenGlassBarBackground(shape: Capsule())
+                    }
                 }
 
                 if showEditHint {
@@ -2043,6 +2145,51 @@ private struct ArtifactFullscreenView: View {
             .padding(.horizontal, 10)
             .padding(.top, 4)
         }
+    }
+
+    private func scheduleRenderedCodeUpdate(for code: String) {
+        pendingRenderTask?.cancel()
+
+        if showCode {
+            renderedCode = code
+            return
+        }
+
+        pendingRenderTask = Task {
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            guard !Task.isCancelled else { return }
+
+            await MainActor.run {
+                renderedCode = code
+            }
+        }
+    }
+
+    private func scheduleArtifactSave(for code: String) {
+        guard code != lastPersistedCode else { return }
+        pendingSaveTask?.cancel()
+        pendingSaveTask = Task {
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                persistArtifactCodeIfNeeded(code)
+            }
+        }
+    }
+
+    private func flushPendingArtifactSave() {
+        guard !isLiveStream else { return }
+        pendingSaveTask?.cancel()
+        pendingRenderTask?.cancel()
+        pendingSaveTask = nil
+        persistArtifactCodeIfNeeded(editableCode)
+    }
+
+    private func persistArtifactCodeIfNeeded(_ code: String) {
+        guard !isLiveStream else { return }
+        guard code != lastPersistedCode else { return }
+        lastPersistedCode = code
+        onSaveCode(code)
     }
 
     private func showEditHintTemporarily() {
@@ -2097,6 +2244,59 @@ private struct ArtifactFullscreenView: View {
             await MainActor.run {
                 isFollowingLiveCode = true
             }
+        }
+    }
+}
+
+private struct ArtifactFullscreenGlassBarBackground<S: InsettableShape>: View {
+    let shape: S
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        ZStack {
+            if #available(iOS 26.0, *) {
+                shape
+                    .fill(.clear)
+                    .glassEffect(.regular.interactive(), in: shape)
+            } else if #available(iOS 17.0, *) {
+                GeometryReader { proxy in
+                    TimelineView(.animation) { timeline in
+                        let t = Float(timeline.date.timeIntervalSinceReferenceDate)
+                        let w = Float(max(1.0, proxy.size.width))
+                        let h = Float(max(1.0, proxy.size.height))
+
+                        shape
+                            .fill(.ultraThinMaterial)
+                            .distortionEffect(
+                                ShaderLibrary.glassDistortion(
+                                    .float2(w, h),
+                                    .float(t)
+                                ),
+                                maxSampleOffset: CGSize(width: 12, height: 12)
+                            )
+                            .blur(radius: 4)
+                            .opacity(colorScheme == .dark ? 0.36 : 0.5)
+                    }
+                }
+            } else {
+                shape
+                    .fill(.ultraThinMaterial)
+                    .opacity(colorScheme == .dark ? 0.28 : 0.4)
+            }
+
+            shape
+                .strokeBorder(
+                    LinearGradient(
+                        colors: [
+                            Color.white.opacity(colorScheme == .dark ? 0.34 : 0.58),
+                            Color.white.opacity(0.1),
+                            Color.black.opacity(colorScheme == .dark ? 0.18 : 0.06)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    ),
+                    lineWidth: 1
+                )
         }
     }
 }
@@ -2295,6 +2495,71 @@ private struct MathJaxMessageView: UIViewRepresentable {
     }
 }
 
+private struct SendButtonGlassCircle: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(iOS 26.0, *) {
+            content.glassEffect(.regular.interactive(), in: Circle())
+        } else {
+            content.background(.ultraThinMaterial, in: Circle())
+        }
+    }
+}
+
 #Preview {
     ChatView()
+}
+
+enum Haptic {
+    static func tap() {
+        #if os(iOS)
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        #endif
+    }
+
+    static func recordStart() {
+        #if os(iOS)
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+        #endif
+    }
+
+    static func recordStop() {
+        #if os(iOS)
+        UINotificationFeedbackGenerator().notificationOccurred(.warning)
+        #endif
+    }
+}
+
+private func dismissKeyboard() {
+    #if canImport(UIKit)
+    UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+    #endif
+}
+
+private func copyToClipboard(_ string: String) {
+    #if canImport(UIKit)
+    UIPasteboard.general.string = string
+    #elseif canImport(AppKit)
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(string, forType: .string)
+    #endif
+}
+
+private func loadPlatformImage(from url: URL) -> PlatformImage? {
+    #if canImport(UIKit)
+    return UIImage(contentsOfFile: url.path)
+    #elseif canImport(AppKit)
+    return NSImage(contentsOfFile: url.path)
+    #else
+    return nil
+    #endif
+}
+
+private func platformImageView(_ image: PlatformImage) -> AnyView {
+    #if canImport(UIKit)
+    return AnyView(Image(uiImage: image).resizable().scaledToFit())
+    #elseif canImport(AppKit)
+    return AnyView(Image(nsImage: image).resizable().scaledToFit())
+    #else
+    return AnyView(EmptyView())
+    #endif
 }
