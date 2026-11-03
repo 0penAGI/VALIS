@@ -84,6 +84,12 @@ struct VoiceLayerService {
     private func protectedRanges(in text: String) -> [NSRange] {
         let patterns = [
             #"(?is)```.*?(?:```|$)"#,
+            #"(?s)`[^`\n]+`"#,
+            #"(?s)!?\[[^\]\n]+\]\([^\)\n]+\)"#,
+            #"(?s)(?<!\*)\*\*.+?\*\*(?!\*)"#,
+            #"(?s)(?<!_)__(?!\s).+?(?<!\s)__(?!_)"#,
+            #"(?s)(?<!\*)\*(?!\s)(?!\*)(.+?)(?<!\s)\*(?!\*)"#,
+            #"(?s)(?<!_)_(?!\s)(.+?)(?<!\s)_(?!_)"#,
             #"(?is)<think\b[^>]*>.*?(?:</think>|$)"#,
             #"(?is)<artifact\b[^>]*>.*?(?:</artifact>|$)"#,
             #"(?im)^[ \t]*(?:TOOL|ACTION)\s*:[^\n]*$"#
@@ -213,18 +219,7 @@ struct VoiceLayerService {
             result = regex.stringByReplacingMatches(
                 in: result,
                 range: range,
-                withTemplate: "$1, $2 — и $3"
-            )
-        }
-
-        // Light pause injection for medium sentences
-        let midPause = #"([a-zA-Zа-яА-Я0-9]{6,}) ([a-zA-Zа-яА-Я0-9]{6,})"#
-        if let regex2 = try? NSRegularExpression(pattern: midPause) {
-            let range2 = NSRange(result.startIndex..<result.endIndex, in: result)
-            result = regex2.stringByReplacingMatches(
-                in: result,
-                range: range2,
-                withTemplate: "$1, $2"
+                withTemplate: "$1 и $2 — и $3"
             )
         }
 

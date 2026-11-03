@@ -24,6 +24,34 @@ extension UIDevice {
 }
 #endif
 
+struct AffectProfile: Sendable {
+    var valence: Double = 0
+    var intensity: Double = 0.2
+    var stability: Double = 0.6
+    var curiosity: Double = 0.55
+    var helpfulness: Double = 0.35
+    var caution: Double = 0.35
+    var mood: Double = 0.6
+    var trust: Double = 0.5
+    var energy: Double = 0.7
+    var driftScore: Double = 0
+
+    static func from(emotion: EmotionState, motivators: MotivatorState, drift: ResponseDriftSignal?) -> AffectProfile {
+        AffectProfile(
+            valence: emotion.valence,
+            intensity: emotion.intensity,
+            stability: emotion.stability,
+            curiosity: motivators.curiosity,
+            helpfulness: motivators.helpfulness,
+            caution: motivators.caution,
+            mood: motivators.mood,
+            trust: motivators.trust,
+            energy: motivators.energy,
+            driftScore: drift?.driftScore ?? 0
+        )
+    }
+}
+
 @MainActor
 final class LLMService: ObservableObject {
 
@@ -116,6 +144,8 @@ final class LLMService: ObservableObject {
         var samplingOverride: SamplingConfig? = nil
         var useThinkTagPrompting: Bool? = nil
         var managesActiveGenerationState: Bool = true
+        var affectProfile: AffectProfile? = nil
+        var thinkingEnabled: Bool? = nil
     }
 
     enum PerformanceProfile {
@@ -163,7 +193,7 @@ final class LLMService: ObservableObject {
     private func startResourceMonitoring() {
         guard memoryPressureSource == nil else { return }
 
-        let source = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical], queue: .global(qos: .utility))
+        let source = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical, .normal], queue: .global(qos: .utility))
         source.setEventHandler { [weak self] in
             let data = source.data
             Task { @MainActor in
@@ -172,6 +202,12 @@ final class LLMService: ObservableObject {
                     self.memoryPressureLevel = 2
                 } else if data.contains(.warning) {
                     self.memoryPressureLevel = max(self.memoryPressureLevel, 1)
+                } else if data.contains(.normal) {
+                    self.memoryPressureLevel = 0
+                }
+                self.runtime?.handleMemoryPressure(level: self.memoryPressureLevel)
+                if self.memoryPressureLevel >= 2 {
+                    self.cache.removeAllObjects()
                 }
             }
         }
@@ -182,7 +218,9 @@ final class LLMService: ObservableObject {
         NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
-                self?.memoryPressureLevel = max(self?.memoryPressureLevel ?? 0, 1)
+                guard let self else { return }
+                self.memoryPressureLevel = max(self.memoryPressureLevel, 1)
+                self.runtime?.handleMemoryPressure(level: self.memoryPressureLevel)
             }
             .store(in: &cancellables)
         #endif
@@ -290,6 +328,7 @@ final class LLMService: ObservableObject {
         isModelReady = false
         await Task.yield()
         startResourceMonitoring()
+        await generationSemaphore.wait()
 
         do {
             let modelURL = try resolveModelURL(for: modelChoice)
@@ -299,19 +338,27 @@ final class LLMService: ObservableObject {
                 contextSize: modelContextSize,
                 isSmallModel: modelChoice == .small
             )
-            guard revision == modelLoadRevision else { return }
+            guard revision == modelLoadRevision else {
+                await generationSemaphore.signal()
+                return
+            }
             runtime = loadedRuntime
             isModelReady = true
             status = ""
         } catch {
-            guard revision == modelLoadRevision else { return }
+            guard revision == modelLoadRevision else {
+                await generationSemaphore.signal()
+                return
+            }
             if case LlamaRuntimeError.modelNotFound = error {
                 await handleMissingModel(choice: modelChoice, revision: revision, contextSize: modelContextSize)
+                await generationSemaphore.signal()
                 return
             }
             status = "\(error.localizedDescription)"
             print(error)
         }
+        await generationSemaphore.signal()
     }
 
     // MARK: Generate
@@ -330,6 +377,10 @@ final class LLMService: ObservableObject {
         runtime = nil
         await Task.yield()
 
+        // The generation runner holds this permit for the full llama.cpp decode.
+        // Wait for cancellation to drain before allocating a replacement runtime.
+        await generationSemaphore.wait()
+
         let modelChoice = selectedModel
         let modelContextSize = contextSize(for: modelChoice)
 
@@ -341,19 +392,27 @@ final class LLMService: ObservableObject {
                 contextSize: modelContextSize,
                 isSmallModel: modelChoice == .small
             )
-            guard revision == modelLoadRevision else { return }
+            guard revision == modelLoadRevision else {
+                await generationSemaphore.signal()
+                return
+            }
             runtime = loadedRuntime
             isModelReady = true
             status = ""
         } catch {
-            guard revision == modelLoadRevision else { return }
+            guard revision == modelLoadRevision else {
+                await generationSemaphore.signal()
+                return
+            }
             if case LlamaRuntimeError.modelNotFound = error {
                 await handleMissingModel(choice: modelChoice, revision: revision, contextSize: modelContextSize)
+                await generationSemaphore.signal()
                 return
             }
             status = "\(error.localizedDescription)"
             print(error)
         }
+        await generationSemaphore.signal()
     }
 
     func generate(
@@ -369,8 +428,13 @@ final class LLMService: ObservableObject {
         options: GenerationOptions
     ) async -> AsyncStream<String> {
 
+        var resolvedOptions = options
+        if resolvedOptions.thinkingEnabled == nil {
+            resolvedOptions.thinkingEnabled = LLMThinkingModeStorage.load() == .thinking
+        }
+
         let token = GenerationCancellationToken()
-        if options.managesActiveGenerationState {
+        if resolvedOptions.managesActiveGenerationState {
             await MainActor.run {
                 self.currentToken?.cancel()
                 self.currentToken = token
@@ -395,13 +459,13 @@ final class LLMService: ObservableObject {
                     token: token,
                     userPrompt: userPrompt,
                     systemPrompt: systemPrompt,
-                    options: options,
+                    options: resolvedOptions,
                     runtime: runtimeSnapshot,
                     cache: cacheSnapshot,
                     generationSemaphore: semaphoreSnapshot
                 )
                 continuation.finish()
-                if options.managesActiveGenerationState {
+                if resolvedOptions.managesActiveGenerationState {
                     await MainActor.run {
                         guard let strongSelf = weakSelf else { return }
                         if strongSelf.currentToken === token {
@@ -862,7 +926,8 @@ private enum LLMGenerationRunner {
         runtime: LlamaRuntime?,
         cache: NSCache<NSString, NSString>
     ) async {
-        var fullResponse = ""
+        var responseChunks: [String] = []
+        var echoProbe = ""
 
         var maxTokens: Int
         switch detectProfile() {
@@ -880,6 +945,15 @@ private enum LLMGenerationRunner {
         guard let runtime else {
             if !token.isCancelled {
                 continuation.yield("Model not loaded")
+            }
+            return
+        }
+
+        do {
+            try runtime.applyPendingContextShrinkIfNeeded()
+        } catch {
+            if !token.isCancelled {
+                continuation.yield("\n[ERROR: \(error.localizedDescription)]")
             }
             return
         }
@@ -910,7 +984,7 @@ private enum LLMGenerationRunner {
         let includeMemory = options.includeMemoryContext
         let memoryHardCap = max(0, min(memoryBudget, Int(Double(maxPromptChars) * (budget?.memoryBudgetRatio ?? 0.22))))
         // FAST PATH: skip memory retrieval for short prompts (reduces latency)
-        let shouldUseMemory = includeMemory && userPrompt.count > 600
+        let shouldUseMemory = includeMemory
 
         async let fieldStateTask = MemoryService.shared.fieldStateSnapshot()
         async let memoryContextTask: String = shouldUseMemory
@@ -944,7 +1018,10 @@ private enum LLMGenerationRunner {
         }
 
         let kvInjection: KVInjection? = options.useKVInjection
-            ? KVInjection(fieldVector: fieldState.fieldVector, beta: 0.03)
+            ? KVInjection(
+                fieldVector: Self.affectSteeredField(field: fieldState.fieldVector, affect: options.affectProfile),
+                beta: 0.03
+            )
             : nil
 
         let defaultThinkTagPrompting = await MainActor.run {
@@ -972,10 +1049,12 @@ private enum LLMGenerationRunner {
 <|im_start|>user
 \(userPrefix)
 """
+            let assistantPrefix = options.thinkingEnabled == false ? "<think>\n\n</think>\n\n" : ""
             let suffix = """
 \(userPrompt)
 <|im_end|>
 <|im_start|>assistant
+\(assistantPrefix)
 """
             return (prefix: prefix, suffix: suffix, full: prefix + suffix)
         }
@@ -1036,10 +1115,11 @@ private enum LLMGenerationRunner {
                     }
 
                     emittedTokens += 1
-                    fullResponse += chunk
+                    responseChunks.append(chunk)
 
                     if !promptEchoDetected {
-                        let probe = fullResponse
+                        echoProbe += chunk
+                        let probe = echoProbe
                             .trimmingCharacters(in: .whitespacesAndNewlines)
                             .lowercased()
 
@@ -1048,7 +1128,7 @@ private enum LLMGenerationRunner {
                            (probe == normalizedUserPrompt ||
                             normalizedUserPrompt.hasPrefix(probe) ||
                             probe.hasPrefix(normalizedUserPrompt)) {
-                            if fullResponse.count < max(256, userPrompt.count * 2) {
+                            if echoProbe.count < max(256, userPrompt.count * 2) {
                                 return
                             }
                         }
@@ -1068,6 +1148,7 @@ private enum LLMGenerationRunner {
 
         if token.isCancelled { return }
 
+        let fullResponse = responseChunks.joined()
         let finalPromptChars = prompt.count
         if let service, let firstTokenAt {
             let firstTokenLatency = firstTokenAt.timeIntervalSince(generationStartedAt)
@@ -1158,6 +1239,44 @@ private enum LLMGenerationRunner {
 
     private static func buildHiddenPrefix(from state: FieldStateSnapshot) -> String {
         ""
+    }
+
+    private static func affectSteeredField(field: [Double], affect: AffectProfile?) -> [Double] {
+        guard let affect, !field.isEmpty else { return field }
+
+        func clamp(_ v: Double, _ lo: Double, _ hi: Double) -> Double {
+            max(lo, min(hi, v))
+        }
+
+        let scale = 1.0 + clamp(
+            affect.intensity * 0.08
+                + affect.valence * 0.04
+                - (1.0 - affect.stability) * 0.06
+                - affect.driftScore * 0.06
+                - (1.0 - affect.mood) * 0.03,
+            -0.18, 0.25
+        )
+
+        let components: [Double] = [
+            clamp(affect.valence, -1.0, 1.0) * 0.5,
+            (clamp(affect.intensity, 0.0, 1.0) - 0.5) * 0.4,
+            (clamp(affect.stability, 0.0, 1.0) - 0.5) * 0.3,
+            (clamp(affect.curiosity, 0.0, 1.0) - 0.5) * 0.3,
+            (clamp(affect.energy, 0.0, 1.0) - 0.5) * 0.3,
+            (clamp(affect.mood, 0.0, 1.0) - 0.5) * 0.3,
+            (clamp(affect.caution, 0.0, 1.0) - 0.5) * 0.3,
+            (clamp(affect.trust, 0.0, 1.0) - 0.5) * 0.3,
+            -clamp(affect.driftScore, 0.0, 1.0) * 0.3
+        ]
+
+        let alpha = 0.15
+        var out = field
+        for i in out.indices {
+            let bias = components[i % components.count]
+            out[i] = clamp(out[i] * scale + bias * alpha, -1.0, 1.0)
+            if !out[i].isFinite { out[i] = 0 }
+        }
+        return out
     }
 
     private static func samplingConfig(from state: FieldStateSnapshot) -> SamplingConfig {

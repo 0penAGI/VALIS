@@ -3,7 +3,7 @@ import Foundation
 import UIKit
 #endif
 
-struct Memory: Identifiable, Codable {
+struct Memory: Identifiable, Codable, Sendable {
     let id: UUID
     let content: String
     let timestamp: Date
@@ -131,12 +131,12 @@ class MemoryService: ObservableObject {
     @Published var memories: [Memory] = []
     @Published private(set) var graph: MemoryGraph = MemoryGraph()
     @Published private(set) var echoGraph: CognitiveEchoGraph = CognitiveEchoGraph()
-    @Published private(set) var conversationSummary: String = ""
     @Published private(set) var userProfile: UserProfile = UserProfile()
     private var memoryIndex = ApproximateMemoryIndex()
 
     private var spontaneousTask: Task<Void, Never>?
     private var lastAutonomousAt: Date?
+    private let persistenceQueue = DispatchQueue(label: "valis.memory-persistence", qos: .utility)
     private let maxAutonomousSnippets = 3
     private let autonomousImportance: Double = 0.7
 
@@ -304,9 +304,14 @@ class MemoryService: ObservableObject {
     }
     
     func addMemory(_ content: String) {
+        // Check for near-duplicate before adding
+        if hasNearDuplicateMemory(for: content, lookback: 180) {
+            return
+        }
         let enriched = buildCognitiveLayer(for: content)
         memories.append(enriched)
         saveMemories()
+        memoryIndex.insert(memoryId: enriched.id, embedding: enriched.embedding)
         updateGraph(for: enriched)
         echoGraph.activate(memoryId: enriched.id, embedding: enriched.embedding, importance: enriched.importance, isPersistent: enriched.isIdentity)
         applyIdentityRestorationIfNeeded(from: enriched)
@@ -315,9 +320,13 @@ class MemoryService: ObservableObject {
     }
 
     func addAutonomousMemory(_ content: String) {
+        if hasNearDuplicateMemory(for: content, lookback: 180) {
+            return
+        }
         let enriched = buildCognitiveLayer(for: content, importanceOverride: autonomousImportance)
         memories.append(enriched)
         saveMemories()
+        memoryIndex.insert(memoryId: enriched.id, embedding: enriched.embedding)
         updateGraph(for: enriched)
         echoGraph.activate(memoryId: enriched.id, embedding: enriched.embedding, importance: enriched.importance, strength: 0.6, isPersistent: enriched.isIdentity)
         applyIdentityRestorationIfNeeded(from: enriched)
@@ -349,6 +358,7 @@ class MemoryService: ObservableObject {
         )
         memories.append(enriched)
         saveMemories()
+        memoryIndex.insert(memoryId: enriched.id, embedding: enriched.embedding)
         updateGraph(for: enriched)
         echoGraph.activate(
             memoryId: enriched.id,
@@ -586,33 +596,44 @@ class MemoryService: ObservableObject {
     }
     
     private func saveMemories() {
-        do {
-            let data = try JSONEncoder().encode(memories)
-            try data.write(to: getMemoriesURL())
-        } catch {
-            print("Failed to save memories: \(error)")
+        let snapshot = memories
+        let destination = getMemoriesURL()
+        persistenceQueue.async {
+            do {
+                let data = try JSONEncoder().encode(snapshot)
+                try data.write(to: destination, options: .atomic)
+            } catch {
+                print("Failed to save memories: \(error)")
+            }
         }
     }
-    
+
     private func saveGraph() {
-        do {
-            let data = try JSONEncoder().encode(graph)
-            try data.write(to: getGraphURL())
-        } catch {
-            print("Failed to save graph: \(error)")
+        let snapshot = graph
+        let destination = getGraphURL()
+        persistenceQueue.async {
+            do {
+                let data = try JSONEncoder().encode(snapshot)
+                try data.write(to: destination, options: .atomic)
+            } catch {
+                print("Failed to save graph: \(error)")
+            }
         }
     }
-    
+
     private func saveEchoGraph() {
-        do {
-            let snapshot = echoGraph.snapshot()
-            let data = try JSONEncoder().encode(snapshot)
-            try data.write(to: getEchoGraphURL())
-        } catch {
-            print("Failed to save echo graph: \(error)")
+        let snapshot = echoGraph.snapshot()
+        let destination = getEchoGraphURL()
+        persistenceQueue.async {
+            do {
+                let data = try JSONEncoder().encode(snapshot)
+                try data.write(to: destination, options: .atomic)
+            } catch {
+                print("Failed to save echo graph: \(error)")
+            }
         }
     }
-    
+
     private func loadFromDocuments() -> [Memory]? {
         let url = getMemoriesURL()
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
@@ -839,10 +860,6 @@ class MemoryService: ObservableObject {
         return String(compact.prefix(maxChars)).trimmingCharacters(in: .whitespacesAndNewlines) + "…"
     }
     
-    func getContextBlock() -> String {
-        getContextBlock(maxChars: Int.max)
-    }
-
     /// LLM-facing memory block. This intentionally avoids the full "field snapshot" framing
     /// to reduce templating/stamp effects in answers.
     func getLLMContextBlock(maxChars: Int) -> String {
@@ -856,10 +873,28 @@ class MemoryService: ObservableObject {
         let now = Date()
         let baseField = echoGraph.fieldVector()
         let normalizedContextShift = max(0.0, min(1.0, contextShift))
+        let visiblePool = visibleMemories()
+        let retrievalPool: [Memory]
+        if visiblePool.count <= 128 {
+            retrievalPool = visiblePool
+        } else {
+            let memoriesByID = Dictionary(uniqueKeysWithValues: visiblePool.map { ($0.id, $0) })
+            let approximateIDs = memoryIndex.candidates(for: baseField, limit: 96)
+            var selectedIDs = Set<UUID>()
+            var narrowedPool = approximateIDs.compactMap { id -> Memory? in
+                guard let memory = memoriesByID[id], selectedIDs.insert(id).inserted else { return nil }
+                return memory
+            }
+            // Pinned and identity memories remain eligible even when the approximate index misses them.
+            narrowedPool.append(contentsOf: visiblePool.filter { memory in
+                (memory.isPinned || memory.isIdentity) && selectedIDs.insert(memory.id).inserted
+            })
+            retrievalPool = narrowedPool.isEmpty ? visiblePool : narrowedPool
+        }
         let field = attendedField(
             baseField: baseField,
             queryText: userText,
-            memoryPool: visibleMemories(),
+            memoryPool: retrievalPool,
             contextShift: normalizedContextShift
         )
         let novelty = recentNoveltySignal(window: noveltyWindowSize)
@@ -869,8 +904,7 @@ class MemoryService: ObservableObject {
         let predicted = MarkovMemoryLayer.shared.predictNextStates(from: userText, topK: 6)
         let predictedSet = Set(predicted)
 
-        let candidates = memories
-            .filter { !isHiddenSystemMemory($0) }
+        let candidates = retrievalPool
             .compactMap { mem -> QuantumMemoryService.Candidate? in
                 let activation = echoGraph.activation(for: mem.id)
                 guard contextGatePass(
@@ -1019,133 +1053,6 @@ class MemoryService: ObservableObject {
         return hash == 0 ? 1 : hash
     }
 
-    func getContextBlock(maxChars: Int) -> String {
-        if memories.isEmpty { return "" }
-        if maxChars <= 0 { return "" }
-
-        let now = Date()
-        let baseField = echoGraph.fieldVector()
-        let querySeed = conversationSummary.isEmpty ? userProfile.topTopics.joined(separator: " ") : conversationSummary
-        let field = attendedField(baseField: baseField, queryText: querySeed, memoryPool: visibleMemories())
-        let fieldLine = formatFieldVector(field, targetCount: 10)
-
-        let activationLevel = echoGraph.averageActivation(excludingPersistent: true)
-        let novelty = recentNoveltySignal(window: noveltyWindowSize)
-        let dynamicThreshold = dynamicContextGateThreshold(novelty: novelty)
-
-        let visibleMemories = memories.filter { !isHiddenSystemMemory($0) }
-        let recent = visibleMemories.sorted { $0.timestamp > $1.timestamp }
-        let affectSample = Array(recent.prefix(8))
-        let avgValence = affectSample.map { $0.emotionValence }.reduce(0.0, +) / Double(max(1, affectSample.count))
-        let avgIntensity = affectSample.map { $0.emotionIntensity }.reduce(0.0, +) / Double(max(1, affectSample.count))
-
-        let approxIds = memoryIndex.candidates(for: field, limit: 96)
-        let approxVisible = approxIds.isEmpty
-            ? visibleMemories
-            : approxIds.compactMap { id in visibleMemories.first(where: { $0.id == id }) }
-
-        let candidates = approxVisible
-            .compactMap { mem -> QuantumMemoryService.Candidate? in
-                let activation = echoGraph.activation(for: mem.id)
-                guard contextGatePass(
-                    memory: mem,
-                    activation: activation,
-                    field: field,
-                    dynamicThreshold: dynamicThreshold,
-                    novelty: novelty
-                ) else {
-                    return nil
-                }
-                let score = relevanceScore(for: mem, field: field, now: now)
-                return QuantumMemoryService.Candidate(memory: mem, activation: activation, score: score)
-            }
-
-        let selectedNodes: [QuantumMemoryService.Candidate] = {
-            let sorted = candidates.sorted { $0.score > $1.score }
-            let pinned = sorted.filter { $0.memory.isPinned }
-            let reservedPinned = Array(pinned.prefix(1))
-            let pool = sorted.filter { candidate in
-                !reservedPinned.contains(where: { $0.memory.id == candidate.memory.id })
-            }
-            guard QuantumFeatures.isMemorySearchEnabled(),
-                  QuantumMemoryService.shared.isEnabled(),
-                  pool.count > 1 else {
-                return reservedPinned + Array(pool.prefix(max(0, 3 - reservedPinned.count)))
-            }
-            let motivators = MotivationService.shared.state
-            let enableTrace = QuantumMemoryService.shared.isTraceEnabled()
-            let result = QuantumMemoryService.shared.collapse(
-                candidates: pool,
-                k: max(0, 3 - reservedPinned.count),
-                motivators: motivators,
-                enableTrace: enableTrace
-            )
-            if enableTrace, let trace = result.trace {
-                print("[QuantumCollapse] candidates=\(trace.candidateIds.count) collapsed=\(trace.collapsedIds.count) beta=\(String(format: "%.2f", trace.beta)) mark=\(trace.markCount) div=\(String(format: "%.2f", trace.diversityStrength)) caution=\(String(format: "%.2f", trace.cautionBias))")
-            }
-            return reservedPinned + result.selected
-        }()
-        var nodeLines: [String] = []
-        var nodeIds: [UUID] = []
-
-        for node in selectedNodes {
-            let timeWeight = timeWeight(for: node.memory, now: now)
-            let line = "N: a=\(fmt(node.activation)), i=\(fmt(node.memory.importance)), t=\(fmt(timeWeight))"
-            nodeLines.append(line)
-            nodeIds.append(node.memory.id)
-        }
-
-        recordAccess(for: nodeIds)
-
-        let topText: String? = {
-            guard let top = selectedNodes.first else { return String?.none }
-            let includeText = activationLevel >= dynamicThreshold || novelty > 0.7
-            guard includeText else { return String?.none }
-            let compressed = compressMemory(top.memory.content, maxChars: 120)
-            return compressed.isEmpty ? String?.none : "T: \(compressed)"
-        }()
-
-        let meanActivation = echoGraph.averageActivation(excludingPersistent: false)
-
-        var parts: [String] = []
-        parts.append("Cognitive Field Snapshot:")
-        if !fieldLine.isEmpty {
-            parts.append("F: \(fieldLine)")
-        }
-        parts.append("A: mean=\(fmt(meanActivation)), gate=\(fmt(dynamicThreshold)), nov=\(fmt(novelty))")
-        parts.append("E: v=\(fmt(avgValence)), i=\(fmt(avgIntensity))")
-        
-        // ECHO строка: эмоция + identity summary для синхронизации тона
-        let emotionLabel = EmotionService.shared.state.label
-        let identitySummary = IdentityProfileService.shared.current.summary
-        parts.append("ECHO: \(emotionLabel) \(identitySummary)")
-
-        if !nodeLines.isEmpty {
-            parts.append("L1:")
-            parts.append(contentsOf: nodeLines)
-        }
-        if let topText {
-            parts.append(topText)
-        }
-
-        var result = "\n\n" + parts.joined(separator: "\n")
-        if result.count > maxChars {
-            // Drop text first if too long
-            let trimmedParts = parts.filter { !$0.hasPrefix("T:") }
-            result = "\n\n" + trimmedParts.joined(separator: "\n")
-        }
-        if result.count > maxChars {
-            // Drop node list if still too long
-            let trimmedParts = parts.filter { !$0.hasPrefix("N:") && $0 != "L1:" }
-            result = "\n\n" + trimmedParts.joined(separator: "\n")
-        }
-        if result.count > maxChars {
-            result = String(result.prefix(maxChars))
-        }
-
-        return result
-    }
-
     func fieldVectorSnapshot() -> [Double] {
         echoGraph.fieldVector()
     }
@@ -1153,8 +1060,7 @@ class MemoryService: ObservableObject {
     func fieldStateSnapshot() -> FieldStateSnapshot {
         let field = echoGraph.fieldVector()
         let activation = echoGraph.averageActivation(excludingPersistent: true)
-        let recent = memories.sorted { $0.timestamp > $1.timestamp }
-        let sample = Array(recent.prefix(8))
+        let sample = topK(memories, count: 8, by: { $0.timestamp > $1.timestamp })
         let avgValence = sample.map { $0.emotionValence }.reduce(0.0, +) / Double(max(1, sample.count))
         let avgIntensity = sample.map { $0.emotionIntensity }.reduce(0.0, +) / Double(max(1, sample.count))
         return FieldStateSnapshot(
@@ -1169,10 +1075,7 @@ class MemoryService: ObservableObject {
 
     func applyCognitiveLayer(
         to draft: String,
-        userPrompt: String,
-        detail: DetailLevel,
-        motivators: MotivatorState,
-        preferences: UserPreferenceProfile
+        detail: DetailLevel
     ) -> String {
         var text = draft
         text = normalizeWhitespace(text)
@@ -1183,51 +1086,6 @@ class MemoryService: ObservableObject {
         }
 
         return text
-    }
-
-    private func isSensitiveHighRiskPrompt(_ prompt: String) -> Bool {
-        let lower = prompt.lowercased()
-        let markers = [
-            "medical", "medicine", "diagnos", "symptom", "dosage", "drug", "suicide", "self-harm",
-            "legal", "law", "lawsuit", "court", "contract", "criminal",
-            "finance", "financial", "investment", "tax", "debt", "loan",
-            "danger", "weapon", "attack",
-            "медицин", "диагноз", "симптом", "дозиров", "лекар",
-            "суицид", "самоповреж",
-            "юрид", "закон", "суд", "договор", "уголов",
-            "финанс", "инвест", "налог", "долг", "кредит",
-            "опасн", "оруж"
-        ]
-        return markers.contains(where: { lower.contains($0) })
-    }
-
-    private func needsClarification(text: String, prompt: String, preferences: UserPreferenceProfile) -> Bool {
-        let lower = text.lowercased()
-        if lower.contains("не знаю") || lower.contains("not sure") || lower.contains("unsure") {
-            return true
-        }
-        if text.count < 80 && prompt.count > 20 {
-            return true
-        }
-
-        let promptConcepts = Set(extractConcepts(from: prompt))
-        let responseConcepts = Set(extractConcepts(from: text))
-        if !promptConcepts.isEmpty {
-            let overlap = promptConcepts.intersection(responseConcepts).count
-            if overlap <= max(1, promptConcepts.count / 3) {
-                return true
-            }
-        }
-
-        let dislikes = preferences.topDislikes(limit: 4)
-        if !dislikes.isEmpty {
-            let responseLower = text.lowercased()
-            if dislikes.contains(where: { responseLower.contains($0) }) {
-                return true
-            }
-        }
-
-        return false
     }
 
     private func normalizeWhitespace(_ text: String) -> String {
@@ -1286,15 +1144,6 @@ class MemoryService: ObservableObject {
         return out
     }
 
-    private func containsCautionHint(in text: String) -> Bool {
-        let lower = text.lowercased()
-        let hints = [
-            "не является", "это не", "обратитесь", "проконсультируйтесь",
-            "врач", "доктор", "юрист", "финансов", "риск", "осторож"
-        ]
-        return hints.contains { lower.contains($0) }
-    }
-    
     private func relevanceScore(for memory: Memory, field: [Double], now: Date) -> Double {
         let activation = echoGraph.activation(for: memory.id)
         let timeWeight = timeWeight(for: memory, now: now)
@@ -1328,9 +1177,8 @@ class MemoryService: ObservableObject {
             let score = (querySim * 0.52) + (latentSim * 0.38) + pinBias + identityBias + activationBias
             return (memory, score)
         }
-        .sorted { $0.score > $1.score }
 
-        let top = Array(scored.prefix(attentionTopK))
+        let top = topK(scored, count: attentionTopK, by: { $0.score > $1.score })
         guard !top.isEmpty else { return baseField }
 
         let weights = attentionWeights(for: top.map(\.score))
@@ -1467,29 +1315,6 @@ class MemoryService: ObservableObject {
         return ranked.map(\.memory)
     }
 
-    private func formatFieldVector(_ field: [Double], targetCount: Int) -> String {
-        guard !field.isEmpty else { return "" }
-        let target = min(max(1, targetCount), field.count)
-        if field.count <= target {
-            return field.map { fmt($0) }.joined(separator: ",")
-        }
-        let chunkSize = Double(field.count) / Double(target)
-        var out: [String] = []
-        for i in 0..<target {
-            let start = Int(Double(i) * chunkSize)
-            let end = min(field.count, Int(Double(i + 1) * chunkSize))
-            if start >= end { continue }
-            let slice = field[start..<end]
-            let avg = slice.reduce(0.0, +) / Double(slice.count)
-            out.append(fmt(avg))
-        }
-        return out.joined(separator: ",")
-    }
-
-    private func fmt(_ value: Double) -> String {
-        String(format: "%.2f", value)
-    }
-
     private func recordAccess(for ids: [UUID]) {
         guard !ids.isEmpty else { return }
         let now = Date()
@@ -1535,48 +1360,6 @@ class MemoryService: ObservableObject {
         }
     }
     
-    private func aggregateEmotions(memories: [Memory]) -> [String: Double] {
-        var agg: [String: Double] = [:]
-        for m in memories {
-            agg[m.emotion, default: 0.0] += 1.0
-        }
-        let total = max(1.0, agg.values.reduce(0, +))
-        for k in agg.keys {
-            agg[k] = (agg[k] ?? 0.0) / total
-        }
-        return agg
-    }
-
-    private func emotionalDynamicsSummary(from recent: [Memory]) -> String {
-        let sample = recent.prefix(8)
-        guard !sample.isEmpty else { return "stable" }
-        let avgValence = sample.map { $0.emotionValence }.reduce(0.0, +) / Double(sample.count)
-        let avgIntensity = sample.map { $0.emotionIntensity }.reduce(0.0, +) / Double(sample.count)
-
-        let tone: String
-        if avgValence > 0.2 { tone = "positive trend" }
-        else if avgValence < -0.2 { tone = "negative trend" }
-        else { tone = "neutral trend" }
-
-        let intensityTag: String
-        if avgIntensity > 0.7 { intensityTag = "high intensity" }
-        else if avgIntensity < 0.3 { intensityTag = "low intensity" }
-        else { intensityTag = "medium intensity" }
-
-        return "\(tone), \(intensityTag)"
-    }
-
-    func updateConversationSummary(fromUserText text: String) {
-        Task { @MainActor in
-            self.markUserSignal()
-            let compressed = compressMemory(text, maxChars: 120)
-            let next = conversationSummary.isEmpty
-                ? "U: \(compressed)"
-                : conversationSummary + " | U: \(compressed)"
-            conversationSummary = trimSummary(next, maxChars: 480)
-        }
-    }
-
     func updateUserProfile(fromUserText text: String) {
         Task { @MainActor in
             self.markUserSignal()
@@ -1600,18 +1383,13 @@ class MemoryService: ObservableObject {
         return .balanced
     }
 
-    private func trimSummary(_ text: String, maxChars: Int) -> String {
-        guard text.count > maxChars else { return text }
-        return String(text.suffix(maxChars))
-    }
-
     private func autonomousConsolidateIfIdle() async {
         let latestId: UUID? = await MainActor.run {
             let now = Date()
             if let last = lastAutonomousAt, now.timeIntervalSince(last) < autonomousInterval {
                 return nil
             }
-            return memories.sorted(by: { $0.timestamp > $1.timestamp }).first?.id
+            return topK(memories, count: 1, by: { $0.timestamp > $1.timestamp }).first?.id
         }
         guard let id = latestId else { return }
         await autonomousConsolidate(memoryId: id)
@@ -2166,7 +1944,7 @@ struct FieldStateSnapshot {
     let activationLevel: Double
 }
 
-enum DetailLevel: String, Codable {
+enum DetailLevel: String, Codable, Sendable {
     case brief
     case balanced
     case detailed
@@ -2192,26 +1970,26 @@ struct UserProfile: Codable {
     }
 }
 
-enum MemoryNodeType: String, Codable {
+enum MemoryNodeType: String, Codable, Sendable {
     case memory
     case concept
     case emotion
     case identity
 }
 
-struct MemoryNode: Codable, Identifiable {
+struct MemoryNode: Codable, Identifiable, Sendable {
     let id: String
     let type: MemoryNodeType
     let label: String
 }
 
-struct MemoryEdge: Codable {
+struct MemoryEdge: Codable, Sendable {
     let from: String
     let to: String
     let weight: Double
 }
 
-struct MemoryGraph: Codable {
+struct MemoryGraph: Codable, Sendable {
     var nodes: [String: MemoryNode] = [:]
     var edges: [MemoryEdge] = []
     
@@ -2226,7 +2004,7 @@ struct MemoryGraph: Codable {
     }
 }
 
-struct CognitiveNode: Identifiable, Codable {
+struct CognitiveNode: Identifiable, Codable, Sendable {
     let id: UUID
     var embedding: [Double]
     var activation: Double
@@ -2304,13 +2082,13 @@ struct CognitiveNode: Identifiable, Codable {
     }
 }
 
-struct CognitiveEdge: Codable {
+struct CognitiveEdge: Codable, Sendable {
     let from: UUID
     let to: UUID
     var weight: Double
 }
 
-struct CognitiveEchoGraphSnapshot: Codable {
+struct CognitiveEchoGraphSnapshot: Codable, Sendable {
     var nodes: [UUID: CognitiveNode]
     var edges: [CognitiveEdge]
 }

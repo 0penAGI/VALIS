@@ -2,7 +2,7 @@ import Foundation
 
 // MARK: - Signal
 
-struct ResponseDriftSignal: Codable, Equatable {
+struct ResponseDriftSignal: Codable, Equatable, Sendable {
 
     let anchorRetention: Double
     let metaphorLoad: Double
@@ -22,7 +22,7 @@ struct ResponseDriftSignal: Codable, Equatable {
 
 // MARK: - Service
 
-final class ResponseDriftService {
+final class ResponseDriftService: @unchecked Sendable {
 
     static let shared = ResponseDriftService()
 

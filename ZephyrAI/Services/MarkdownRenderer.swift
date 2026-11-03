@@ -2,18 +2,28 @@ import Foundation
 import SwiftUI
 
 enum MarkdownRenderer {
-    private static let cache = NSCache<NSString, NSAttributedString>()
+    private static let cache: NSCache<NSString, NSAttributedString> = {
+        let cache = NSCache<NSString, NSAttributedString>()
+        cache.countLimit = 512
+        cache.totalCostLimit = 8 * 1_024 * 1_024
+        return cache
+    }()
 
     private enum RenderingMode: String {
         case inline
         case block
     }
 
-    static func renderInline(_ text: String) -> AttributedString? {
-        let normalized = preserveSpacing(text)
+    static func renderInline(
+        _ text: String,
+        cacheResult: Bool = true,
+        linkifyURLs: Bool = true
+    ) -> AttributedString? {
+        let input = linkifyURLs ? linkifyBareURLs(in: text) : text
+        let normalized = preserveSpacing(input)
         let mode = renderingMode(for: normalized)
         let key = cacheKey(for: normalized, mode: mode)
-        if let cached = cache.object(forKey: key) {
+        if cacheResult, let cached = cache.object(forKey: key) {
             return AttributedString(cached)
         }
 
@@ -29,7 +39,13 @@ enum MarkdownRenderer {
         }
 
         let styled = styleLinks(in: attributed)
-        cache.setObject(NSAttributedString(styled), forKey: key)
+        if cacheResult {
+            cache.setObject(
+                NSAttributedString(styled),
+                forKey: key,
+                cost: max(1, normalized.utf8.count * 4)
+            )
+        }
         return styled
     }
 
@@ -37,10 +53,14 @@ enum MarkdownRenderer {
         _ = renderInline(text)
     }
 
-    static func renderPreservingLineBreaks(_ text: String) -> AttributedString? {
+    static func renderPreservingLineBreaks(
+        _ text: String,
+        cacheFinalLine: Bool = true
+    ) -> AttributedString? {
         let normalized = preserveSpacing(text)
         let parts = normalized.components(separatedBy: "\n")
         var combined = AttributedString()
+        var insideCodeFence = false
 
         for (index, part) in parts.enumerated() {
             if index > 0 {
@@ -49,11 +69,19 @@ enum MarkdownRenderer {
 
             guard !part.isEmpty else { continue }
 
-            if let rendered = renderInline(part) {
+            let isFenceMarker = part.trimmingCharacters(in: .whitespaces).hasPrefix("```")
+            let shouldLinkifyURLs = !insideCodeFence && !isFenceMarker
+            let shouldCacheLine = cacheFinalLine || index != parts.count - 1
+            if let rendered = renderInline(
+                part,
+                cacheResult: shouldCacheLine,
+                linkifyURLs: shouldLinkifyURLs
+            ) {
                 combined += rendered
             } else {
                 combined += AttributedString(part)
             }
+            if isFenceMarker { insideCodeFence.toggle() }
         }
 
         return combined
@@ -107,6 +135,80 @@ enum MarkdownRenderer {
         return lower.hasPrefix("http://")
             || lower.hasPrefix("https://")
             || lower.hasPrefix("www.")
+    }
+
+    /// Converts plain-text URLs into Markdown links before parsing so they are
+    /// tappable and long URLs do not leak into the visible message text.
+    private static func linkifyBareURLs(in text: String) -> String {
+        let pattern = #"https?://[^\s<>]+"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+            return text
+        }
+
+        let nsText = text as NSString
+        let matches = regex.matches(in: text, range: NSRange(location: 0, length: nsText.length))
+        guard !matches.isEmpty else { return text }
+
+        let output = NSMutableString(string: text)
+        for match in matches.reversed() {
+            var urlRange = match.range
+            var urlText = nsText.substring(with: urlRange)
+            while let last = urlText.last {
+                let isTrailingPunctuation = ".,;:!?]}".contains(last)
+                    || (last == ")" && urlText.filter { $0 == "(" }.count < urlText.filter { $0 == ")" }.count)
+                guard isTrailingPunctuation else { break }
+                urlText.removeLast()
+                urlRange.length -= 1
+            }
+            guard !urlText.isEmpty, let url = URL(string: urlText) else { continue }
+
+            let prefixRange = NSRange(location: 0, length: urlRange.location)
+            let prefix = nsText.substring(with: prefixRange)
+
+            // Leave URLs inside existing Markdown links and inline code alone.
+            if prefix.hasSuffix("](") { continue }
+            if prefix.hasSuffix("<"), NSMaxRange(match.range) < nsText.length,
+               nsText.substring(from: NSMaxRange(match.range)).hasPrefix(">") { continue }
+            if prefix.filter({ $0 == "`" }).count % 2 == 1 { continue }
+
+            let separatorCandidates = [" – ", " — ", " - ", ": "]
+            let sourceSeparator = separatorCandidates
+                .compactMap { separator -> (NSRange, String)? in
+                    let range = (prefix as NSString).range(of: separator, options: .backwards)
+                    return range.location == NSNotFound ? nil : (range, separator)
+                }
+                .max { $0.0.location < $1.0.location }
+
+            let replacementRange: NSRange
+            let displayText: String
+            if let (separatorRange, _) = sourceSeparator {
+                let labelStart = NSMaxRange(separatorRange)
+                let labelRange = NSRange(location: labelStart, length: prefixRange.length - labelStart)
+                let label = (prefix as NSString).substring(with: labelRange)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !label.isEmpty {
+                    replacementRange = NSRange(
+                        location: separatorRange.location,
+                        length: urlRange.location + urlRange.length - separatorRange.location
+                    )
+                    displayText = "[\(label)](\(urlText))"
+                } else {
+                    replacementRange = urlRange
+                    displayText = "[\(shortHost(for: url))](\(urlText))"
+                }
+            } else {
+                replacementRange = urlRange
+                displayText = "[\(shortHost(for: url))](\(urlText))"
+            }
+
+            output.replaceCharacters(in: replacementRange, with: displayText)
+        }
+        return output as String
+    }
+
+    private static func shortHost(for url: URL) -> String {
+        guard let host = url.host, !host.isEmpty else { return "Open source" }
+        return host.replacingOccurrences(of: #"^www\."#, with: "", options: .regularExpression)
     }
 
     private static func preserveSpacing(_ text: String) -> String {

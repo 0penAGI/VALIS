@@ -139,11 +139,9 @@ final class ActionService {
     private let multiSearchProvider = MultiSearchProvider.makeDefault()
     private let eventStore = EKEventStore()
     private let memoryService = MemoryService.shared
-    private var webSummaryCache: [String: (text: String, timestamp: Date)] = [:]
     private var urlAnalysisCache: [String: (text: String, timestamp: Date)] = [:]
     private var urlValidationCache: [String: (isValid: Bool, timestamp: Date)] = [:]
     private let preparedContextCache = NSCache<NSString, NSString>()
-    private let webCacheTTL: TimeInterval = 600
     private let urlCacheTTL: TimeInterval = 900
 
     private init() {}
@@ -524,18 +522,6 @@ For news, headlines, breaking stories, current events, and "что нового"
         return out
     }
 
-    private func buildToolContextBlock(from webContext: String) -> String {
-        guard !webContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return ""
-        }
-        return """
-
-Signal context (web):
-\(webContext)
-
-"""
-    }
-
     private func replyLanguageLine(for query: String) -> String {
         guard let code = LanguageRoutingService.detectedNormalizedCode(for: query),
               let name = LanguageRoutingService.displayName(forNormalizedCode: code),
@@ -611,31 +597,6 @@ Signal context (web):
         }
 
         return "\n" + lines.joined(separator: "\n") + "\n"
-    }
-
-    private func buildStudiedInformationSynthesis(summary: String, wikipediaSummary: String, trustedEvidence: [String]) -> String {
-        var fragments: [String] = []
-
-        let normalizedWikipedia = compactSearchAnswerSeed(from: wikipediaSummary, maxChars: 180)
-        if !normalizedWikipedia.isEmpty {
-            fragments.append("Wikipedia: \(normalizedWikipedia)")
-        }
-
-        let normalizedDDG = compactSearchAnswerSeed(from: summary, maxChars: 180)
-        if !normalizedDDG.isEmpty, normalizedDDG.caseInsensitiveCompare(normalizedWikipedia) != .orderedSame {
-            fragments.append("DDG: \(normalizedDDG)")
-        }
-
-        for evidence in trustedEvidence {
-            let compact = compactSearchSummary(evidence, maxChars: 220)
-            guard !compact.isEmpty else { continue }
-            fragments.append(compact)
-            if fragments.count >= 3 {
-                break
-            }
-        }
-
-        return fragments.joined(separator: " | ")
     }
 
     func testBuildPreparedSearchContextBlock(query: String, summary: String, wikipediaSummary: String, results: [(title: String, url: URL)], trustedEvidence: [String] = []) -> String {
@@ -748,83 +709,6 @@ Signal action (\(title)):
 \(message)
 
 """
-    }
-
-    // MARK: - Rule Triggers
-
-    private func shouldUseWebSearch(for text: String) -> Bool {
-        let lowercased = normalizedRuleTriggerText(text).lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-        if lowercased.isEmpty { return false }
-
-        // Never trigger web search for local action/calendar intents.
-        let localActionHints = [
-            "calendar", "event", "reminder", "schedule", "appointment",
-            "weather", "forecast", "temperature", "погода", "прогноз", "температура",
-            "health", "steps", "activity", "workout", "fitness", "шаги", "активность",
-            "system", "device", "battery", "storage", "memory", "thermal", "заряд", "память", "система",
-            "календар", "событ", "напоминан", "встреч", "расписан",
-            "action:", "tool: calendar", "op=create", "op=list", "op=open"
-        ]
-        if localActionHints.contains(where: { lowercased.contains($0) }) {
-            return false
-        }
-
-        if lowercased.contains("http://") || lowercased.contains("https://") || lowercased.contains("www.") {
-            return false
-        }
-
-        // Explicit search intent.
-        let directTriggers = [
-            "search", "google", "web", "internet", "look up", "lookup", "find online",
-            "find info", "research", "info", "details", "learn more",
-            "найди", "найти", "узнай", "инфу", "информация", "поиск", "в интернете", "загугли", "поищи", "погугли"
-        ]
-        if directTriggers.contains(where: { lowercased.contains($0) }) {
-            return true
-        }
-
-        // Freshness / current-facts intent.
-        let freshnessTriggers = [
-            "latest", "today", "current", "recent", "up to date", "new update", "breaking",
-            "сегодня", "последние", "свежие", "актуаль", "что нового", "новости"
-        ]
-        if freshnessTriggers.contains(where: { lowercased.contains($0) }) {
-            return true
-        }
-
-        // Typical factual question forms.
-        let factualQuestionStarts = [
-            "who ", "what ", "when ", "where ", "which ", "how many ", "how much ",
-            "кто ", "что ", "когда ", "где ", "какой ", "какая ", "какие ", "сколько "
-        ]
-        if factualQuestionStarts.contains(where: { lowercased.hasPrefix($0) }) {
-            return true
-        }
-
-        // If it's a short factual question with '?', search by default.
-        if lowercased.contains("?"), lowercased.count <= 180 {
-            return true
-        }
-
-        return false
-    }
-
-    private func shouldUseDateTool(for text: String) -> Bool {
-        let lowercased = text.lowercased()
-        let triggers = [
-            "какая сегодня дата", "сегодняшняя дата", "какой сегодня день",
-            "today's date", "what is today's date", "current date"
-        ]
-        return triggers.contains { lowercased.contains($0) }
-    }
-
-    private func shouldUseNewsTool(for text: String) -> Bool {
-        let lowercased = normalizedRuleTriggerText(text).lowercased()
-        let triggers = [
-            "news", "latest", "headlines", "breaking",
-            "новости", "свежие новости", "последние новости", "что нового"
-        ]
-        return triggers.contains { lowercased.contains($0) }
     }
 
     nonisolated private func normalizedRuleTriggerText(_ text: String) -> String {
@@ -1711,16 +1595,6 @@ Signal action (\(title)):
         }
     }
 
-    private struct DuckDuckGoResponse: Decodable {
-        let Abstract: String?
-        let AbstractText: String?
-        let RelatedTopics: [RelatedTopic]?
-
-        struct RelatedTopic: Decodable {
-            let Text: String?
-        }
-    }
-
     private struct WikipediaSummary: Decodable {
         let title: String?
         let extract: String?
@@ -1731,78 +1605,6 @@ Signal action (\(title)):
             let width: Int?
             let height: Int?
         }
-    }
-
-    private struct RedditListing: Decodable {
-        let data: RedditListingData
-
-        struct RedditListingData: Decodable {
-            let children: [RedditChild]
-        }
-
-        struct RedditChild: Decodable {
-            let data: RedditPost
-        }
-
-        struct RedditPost: Decodable {
-            let title: String
-            let url: String?
-            let score: Int?
-            let author: String?
-            let createdUtc: TimeInterval?
-        }
-    }
-
-    private func fetchDuckDuckGoSummary(query: String) async throws -> String {
-        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return "" }
-
-        var components = URLComponents(string: "https://api.duckduckgo.com/")!
-        components.queryItems = [
-            URLQueryItem(name: "q", value: trimmed),
-            URLQueryItem(name: "format", value: "json"),
-            URLQueryItem(name: "no_redirect", value: "1"),
-            URLQueryItem(name: "no_html", value: "1"),
-            URLQueryItem(name: "skip_disambig", value: "1")
-        ]
-
-        guard let url = components.url else { return "" }
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 12
-        request.setValue("VALIS/1.0 (iOS)", forHTTPHeaderField: "User-Agent")
-
-        let (data, _) = try await URLSession.shared.data(for: request)
-        let decoded = try JSONDecoder().decode(DuckDuckGoResponse.self, from: data)
-
-        var parts: [String] = []
-        if let abstract = decoded.Abstract, !abstract.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            parts.append(abstract.trimmingCharacters(in: .whitespacesAndNewlines))
-        } else if let abstractText = decoded.AbstractText, !abstractText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            parts.append(abstractText.trimmingCharacters(in: .whitespacesAndNewlines))
-        }
-
-        let relatedTexts = (decoded.RelatedTopics ?? [])
-            .compactMap { $0.Text }
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-            .prefix(3)
-
-        if !relatedTexts.isEmpty {
-            parts.append(relatedTexts.joined(separator: "\n"))
-        }
-
-        return parts.joined(separator: "\n\n")
-    }
-
-    private func fetchSearchResults(query: String) async -> [SearchResult] {
-        guard let response = await multiSearchProvider.search(query) else { return [] }
-        var results = response.results
-        if !response.results.isEmpty {
-            results = response.results
-        } else if let answer = response.answer, !answer.isEmpty {
-            return []
-        }
-        return quantumRerankWebResults(results, query: query)
     }
 
     private func stripHTML(_ text: String) -> String {
@@ -1823,29 +1625,6 @@ Signal action (\(title)):
             out = out.replacingOccurrences(of: k, with: v)
         }
         return out
-    }
-
-    private func fetchWebSummaryWithFallback(query: String) async -> String {
-        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return "" }
-        if let cached = cachedWebSummary(for: trimmed) {
-            return cached
-        }
-
-        // Try multi-provider chain first (SearXNG → OpenSERP → DDG Instant → Wiki → Lite).
-        if let summary = await multiSearchProvider.searchSummary(trimmed), !summary.isEmpty {
-            storeWebSummaryCache(summary, query: trimmed)
-            return summary
-        }
-
-        // Fallback: Wikipedia directly (in case multiSearchProvider missed it).
-        let wiki = await fetchWikipediaSummary(topic: trimmed)
-        if !wiki.isEmpty {
-            storeWebSummaryCache(wiki, query: trimmed)
-            return wiki
-        }
-
-        return ""
     }
 
     func buildPreparedSearchContext(for query: String) async -> String {
@@ -1888,7 +1667,7 @@ Signal action (\(title)):
             return ""
         }
 
-        print("[SearchDiag] bestCandidate query=\(bestCandidate.query.prefix(40)) score=\(String(format: "%.2f", bestCandidate.score)) summaryLen=\(bestCandidate.summary.count) wikiSummaryLen=\(bestCandidate.wikipediaSummary.count) results=\(bestCandidate.results.count) trusted=\(bestCandidate.trustedEvidence.count)")
+        print("[SearchDiag] bestCandidate query=\(bestCandidate.query.prefix(40)) score=\(bestCandidate.score) summaryLen=\(bestCandidate.summary.count) wikiSummaryLen=\(bestCandidate.wikipediaSummary.count) results=\(bestCandidate.results.count) trusted=\(bestCandidate.trustedEvidence.count)")
 
         let normalizedSummary = compactSearchSummary(bestCandidate.summary, maxChars: 800)
         let normalizedWikipedia = compactSearchSummary(bestCandidate.wikipediaSummary, maxChars: 800)
@@ -1993,92 +1772,6 @@ Signal action (\(title)):
             numericConflict: numericConflict,
             sourceDisagreement: sourceDisagreement
         )
-    }
-
-    private func buildTrustedSearchEvidence(for results: [SearchResult], query: String) async -> [String] {
-        let selectedResults = selectEvidenceResults(results, query: query)
-
-        return await withTaskGroup(of: String?.self) { group in
-            for result in selectedResults {
-                guard trustedDomainScore(for: result.url) >= 0.55 else { continue }
-
-                group.addTask {
-                    let analysis = await self.analyzeURL(result.url)
-                    let compact = await self.compactSearchSummary(
-                        analysis,
-                        maxChars: 260
-                    )
-
-                    guard !compact.isEmpty else {
-                        return nil
-                    }
-
-                    let host =
-                        result.url.host?.lowercased()
-                        ?? result.url.absoluteString
-
-                    return "- \(result.title) (\(host)): \(compact)"
-                }
-            }
-
-            var evidence: [String] = []
-
-            for await item in group {
-                if let item {
-                    evidence.append(item)
-                }
-            }
-
-            return Array(evidence.prefix(2))
-        }
-    }
-
-    private func selectEvidenceResults(_ results: [SearchResult], query: String) -> [SearchResult] {
-        let trusted = results.filter { trustedDomainScore(for: $0.url) >= 0.55 }
-        guard trusted.count > 2 else { return trusted }
-
-        let useQuantum = QuantumMemoryService.shared.isEnabled()
-        let field = useQuantum
-            ? QuantumMemoryService.shared.collapseDecisionField(prompt: query, motivators: MotivationService.shared.state)
-            : nil
-        let maxCount = (field?.explorationBias ?? 0) > 0.66 ? 3 : 2
-        let queryTerms = Set(query.lowercased().components(separatedBy: CharacterSet.alphanumerics.inverted).filter { $0.count > 2 })
-
-        let scored = trusted.enumerated().map { index, result -> (SearchResult, Double) in
-            let host = result.url.host?.lowercased() ?? ""
-            let titleTerms = Set(result.title.lowercased().components(separatedBy: CharacterSet.alphanumerics.inverted).filter { $0.count > 2 })
-            let overlap = queryTerms.isEmpty ? 0.0 : Double(queryTerms.intersection(titleTerms).count) / Double(max(1, queryTerms.count))
-            let trust = trustedDomainScore(for: result.url)
-            let rankBias = 1.0 - (Double(index) / Double(max(1, trusted.count)))
-            let explorationBoost = (field?.explorationBias ?? 0) * Double((host.hashValue & 0xFF)) / 255.0
-            let score = (trust * 0.50) + (overlap * 0.32) + (rankBias * 0.14) + (explorationBoost * 0.04)
-            return (result, score)
-        }
-
-        let sorted = scored.sorted { $0.1 > $1.1 }.map(\.0)
-        var selected: [SearchResult] = []
-        var usedHosts = Set<String>()
-
-        for result in sorted {
-            let host = result.url.host?.lowercased() ?? result.url.absoluteString
-            if usedHosts.insert(host).inserted || selected.isEmpty {
-                selected.append(result)
-            }
-            if selected.count >= maxCount {
-                break
-            }
-        }
-
-        if selected.count < maxCount {
-            for result in sorted where !selected.contains(where: { $0.url == result.url }) {
-                selected.append(result)
-                if selected.count >= maxCount {
-                    break
-                }
-            }
-        }
-
-        return selected
     }
 
     func searchQueryCandidates(from raw: String) -> [String] {
@@ -2372,31 +2065,6 @@ Signal action (\(title)):
         return .low
     }
 
-    private func quantumRerankWebResults(_ results: [SearchResult], query: String) -> [SearchResult] {
-        guard results.count > 1 else { return results }
-        let queryTerms = Set(query.lowercased().components(separatedBy: CharacterSet.alphanumerics.inverted).filter { $0.count > 2 })
-        let useQuantum = QuantumMemoryService.shared.isEnabled()
-        let field = useQuantum
-            ? QuantumMemoryService.shared.collapseDecisionField(prompt: query, motivators: MotivationService.shared.state)
-            : nil
-
-        let scored = results.enumerated().map { index, result -> (SearchResult, Double) in
-            let titleTerms = Set(result.title.lowercased().components(separatedBy: CharacterSet.alphanumerics.inverted).filter { $0.count > 2 })
-            let overlap = Double(queryTerms.intersection(titleTerms).count)
-            let overlapScore = queryTerms.isEmpty ? 0.0 : overlap / Double(max(1, queryTerms.count))
-            let recencyBias = 1.0 - (Double(index) / Double(max(1, results.count)))
-            let domainTrust = trustedDomainScore(for: result.url)
-            let explorationJitter = (field?.explorationBias ?? 0) * Double((result.url.absoluteString.hashValue & 0xFF)) / 255.0
-            let deviationBias = (field?.deviation ?? 0) * Double((result.title.hashValue & 0x7F)) / 127.0
-            let score = (overlapScore * 0.42) + (domainTrust * 0.36) + (recencyBias * 0.18) + (explorationJitter * 0.03) + (deviationBias * 0.01)
-            return (result, score)
-        }
-
-        return scored
-            .sorted { $0.1 > $1.1 }
-            .map(\.0)
-    }
-
     private func trustedDomainScore(for url: URL) -> Double {
         guard let host = url.host?.lowercased() else { return 0.2 }
 
@@ -2514,81 +2182,6 @@ Signal action (\(title)):
             }
         }
         return nil
-    }
-
-    private func fetchImageCandidate(from result: SearchResult, query: String) async -> WebImageCandidate? {
-        guard let html = try? await fetchHTML(url: result.url), !html.isEmpty else { return nil }
-
-        let imageCandidates = [
-            extractFirstMatch(in: html, pattern: #"(?is)<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["'][^>]*>"#),
-            extractFirstMatch(in: html, pattern: #"(?is)<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["'][^>]*>"#),
-            extractFirstMatch(in: html, pattern: #"(?is)<meta[^>]+property=["']og:image:url["'][^>]+content=["']([^"']+)["'][^>]*>"#)
-        ].compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-
-        for rawImageURL in imageCandidates {
-            guard let resolved = resolveImageURL(rawImageURL, relativeTo: result.url) else { continue }
-            guard await validateImageResourceURL(resolved) else { continue }
-            return WebImageCandidate(
-                query: query,
-                imageURL: resolved,
-                title: result.title,
-                sourcePageURL: result.url
-            )
-        }
-
-        return nil
-    }
-
-    private func resolveImageURL(_ raw: String, relativeTo baseURL: URL) -> URL? {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        if let absolute = URL(string: trimmed), isAllowedWebURL(absolute) {
-            return absolute
-        }
-        return URL(string: trimmed, relativeTo: baseURL)?.absoluteURL
-    }
-
-    private func fetchRedditNews(limit: Int, query: String = "") async throws -> String {
-        let clamped = max(1, min(15, limit))
-        var components = URLComponents(string: "https://www.reddit.com/r/news/.json")!
-        components.queryItems = [
-            URLQueryItem(name: "limit", value: "\(clamped)")
-        ]
-
-        guard let url = components.url else { return "" }
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 10
-        request.setValue("ValisAI/1.0 (iOS)", forHTTPHeaderField: "User-Agent")
-
-        let (data, _) = try await URLSession.shared.data(for: request)
-        let decoded = try JSONDecoder().decode(RedditListing.self, from: data)
-
-        let items = decoded.data.children.map { $0.data }
-        let formatter = RelativeDateTimeFormatter()
-        formatter.unitsStyle = .abbreviated
-        if let code = LanguageRoutingService.detectedNormalizedCode(for: query), !code.isEmpty {
-            formatter.locale = Locale(identifier: code)
-        }
-        let unknownTime = localizedUnknownTime(for: query)
-
-        let lines: [String] = items.prefix(clamped).map { post in
-            let title = post.title.trimmingCharacters(in: .whitespacesAndNewlines)
-            let score = post.score.map { "▲\($0)" } ?? "▲0"
-            let age: String
-            if let created = post.createdUtc {
-                let date = Date(timeIntervalSince1970: created)
-                age = formatter.localizedString(for: date, relativeTo: Date())
-            } else {
-                age = unknownTime
-            }
-            let url = post.url ?? ""
-            if url.isEmpty {
-                return "- \(title) (\(score), \(age))"
-            }
-            return "- \(title) (\(score), \(age))\n  \(url)"
-        }
-
-        return lines.joined(separator: "\n")
     }
 
     private struct RSSFeedItem {
@@ -2732,35 +2325,6 @@ Signal action (\(title)):
         return results.compactMap { $0.title }.filter { !$0.isEmpty }
     }
 
-    private func localizedUnknownTime(for query: String) -> String {
-        switch LanguageRoutingService.detectedNormalizedCode(for: query) {
-        case "ru":
-            return "время неизвестно"
-        case "uk":
-            return "час невідомий"
-        case "de":
-            return "Zeit unbekannt"
-        case "fr":
-            return "heure inconnue"
-        case "es":
-            return "hora desconocida"
-        case "it":
-            return "ora sconosciuta"
-        case "pt":
-            return "hora desconhecida"
-        case "ja":
-            return "時刻不明"
-        case "ko":
-            return "시간 불명"
-        case "zh":
-            return "时间未知"
-        case "th":
-            return "ไม่ทราบเวลา"
-        default:
-            return "unknown time"
-        }
-    }
-
     private func splitSnippets(_ text: String) -> [String] {
         let chunks = text
             .split(separator: "\n\n")
@@ -2780,22 +2344,6 @@ Signal action (\(title)):
     private func ingestExternalSnippets(text: String, source: String, query: String) {
         let snippets = splitSnippets(text)
         memoryService.ingestExternalSnippets(snippets, source: source, query: query)
-    }
-
-    private func extractURLs(from text: String) -> [URL] {
-        let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
-        let range = NSRange(text.startIndex..<text.endIndex, in: text)
-        let matches = detector?.matches(in: text, options: [], range: range) ?? []
-        let urls = matches.compactMap { $0.url }.filter { isAllowedWebURL($0) }
-        var unique: [URL] = []
-        var seen = Set<String>()
-        for url in urls {
-            let key = url.absoluteString.lowercased()
-            if seen.insert(key).inserted {
-                unique.append(url)
-            }
-        }
-        return unique
     }
 
     private func normalizeURL(_ raw: String) -> URL? {
@@ -2846,52 +2394,6 @@ Signal action (\(title)):
             let (_, response) = try await URLSession.shared.data(for: request)
             if let http = response as? HTTPURLResponse {
                 let ok = (200...399).contains(http.statusCode)
-                storeURLValidationCache(ok, key: key)
-                return ok
-            }
-        } catch {
-            storeURLValidationCache(false, key: key)
-            return false
-        }
-
-        storeURLValidationCache(false, key: key)
-        return false
-    }
-
-    private func validateImageResourceURL(_ url: URL) async -> Bool {
-        let key = "image::" + url.absoluteString.lowercased()
-        if let cached = cachedURLValidation(for: key) {
-            return cached
-        }
-
-        let allowedImageTypes = ["image/jpeg", "image/png", "image/webp", "image/gif", "image/avif", "image/bmp", "image/svg+xml"]
-
-        do {
-            var request = URLRequest(url: url)
-            request.timeoutInterval = 8
-            request.httpMethod = "HEAD"
-            request.setValue("VALIS/1.0 (iOS)", forHTTPHeaderField: "User-Agent")
-            let (_, response) = try await URLSession.shared.data(for: request)
-            if let http = response as? HTTPURLResponse {
-                let contentType = (http.value(forHTTPHeaderField: "Content-Type") ?? "").lowercased()
-                let ok = (200...399).contains(http.statusCode) && allowedImageTypes.contains(where: { contentType.contains($0) })
-                storeURLValidationCache(ok, key: key)
-                if ok { return true }
-            }
-        } catch {
-            // Fall through.
-        }
-
-        do {
-            var request = URLRequest(url: url)
-            request.timeoutInterval = 10
-            request.httpMethod = "GET"
-            request.setValue("bytes=0-1024", forHTTPHeaderField: "Range")
-            request.setValue("VALIS/1.0 (iOS)", forHTTPHeaderField: "User-Agent")
-            let (_, response) = try await URLSession.shared.data(for: request)
-            if let http = response as? HTTPURLResponse {
-                let contentType = (http.value(forHTTPHeaderField: "Content-Type") ?? "").lowercased()
-                let ok = (200...399).contains(http.statusCode) && allowedImageTypes.contains(where: { contentType.contains($0) })
                 storeURLValidationCache(ok, key: key)
                 return ok
             }
@@ -3149,21 +2651,6 @@ Signal action (\(title)):
             return nil
         }
         return String(text[resultRange])
-    }
-
-    private func cachedWebSummary(for query: String) -> String? {
-        let key = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard let cached = webSummaryCache[key] else { return nil }
-        if Date().timeIntervalSince(cached.timestamp) > webCacheTTL {
-            webSummaryCache.removeValue(forKey: key)
-            return nil
-        }
-        return cached.text
-    }
-
-    private func storeWebSummaryCache(_ text: String, query: String) {
-        let key = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        webSummaryCache[key] = (text, Date())
     }
 
     private func cachedURLAnalysis(for key: String) -> String? {

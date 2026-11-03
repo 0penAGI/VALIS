@@ -46,6 +46,8 @@ struct MemoryListView: View {
                 .allowsHitTesting(false)
         }
         .background(Color.clear)
+        .containerBackground(.clear, for: .navigation)
+        .background(ClearPresentationBackground())
         .navigationBarBackButtonHidden(true)
         .tint(colorScheme == .dark ? .white : .black)
         .accentColor(colorScheme == .dark ? .white : .black)
@@ -98,8 +100,8 @@ struct MemoryListView: View {
 
     private var glassBackground: some View {
         ZStack {
-            glassBaseLayer
-            glassOverlayLayer
+            GlassPageBackground()
+            glassBaseLayer   // шейдер glassDistortion
         }
     }
 
@@ -134,6 +136,9 @@ struct MemoryListView: View {
     private var memoryRows: some View {
         ForEach(memoryService.visibleMemories()) { mem in
             memoryRow(mem)
+                .listRowBackground(
+                    (colorScheme == .dark ? Color.white : Color.black).opacity(0.05)
+                )
         }
         .onDelete { offsets in
             let visible = memoryService.visibleMemories()
@@ -343,6 +348,7 @@ struct ChatListView: View {
     @State private var isShowingClearConfirm = false
     @Environment(\.editMode) private var editMode
 
+    // Glass tuning
     private let glassOpacityDark: Double = 0.32
     private let glassOpacityLight: Double = 0.24
     private let glassOverlayOpacityDark: Double = 0.08
@@ -370,6 +376,8 @@ struct ChatListView: View {
                 .allowsHitTesting(false)
         }
         .background(Color.clear)
+        .containerBackground(.clear, for: .navigation)
+        .background(ClearPresentationBackground())
         .navigationBarBackButtonHidden(true)
         .tint(colorScheme == .dark ? .white : .black)
         .accentColor(colorScheme == .dark ? .white : .black)
@@ -509,8 +517,8 @@ struct ChatListView: View {
 
     private var glassBackground: some View {
         ZStack {
-            glassBaseLayer
-            glassOverlayLayer
+            GlassPageBackground()
+            glassBaseLayer   // шейдер glassDistortion
         }
     }
 
@@ -534,6 +542,9 @@ struct ChatListView: View {
 
             ForEach(chatStore.chats) { chat in
                 chatRow(chat)
+                    .listRowBackground(
+                        (colorScheme == .dark ? Color.white : Color.black).opacity(0.05)
+                    )
             }
         }
         .scrollContentBackground(.hidden)
@@ -680,6 +691,7 @@ struct PersonaListView: View {
     @State private var masterPrompt: String = ""
     @State private var isGlassActive = false
 
+    // Glass tuning
     private let glassOpacityDark: Double = 0.32
     private let glassOpacityLight: Double = 0.24
     private let glassOverlayOpacityDark: Double = 0.08
@@ -707,6 +719,8 @@ struct PersonaListView: View {
                 .allowsHitTesting(false)
         }
         .background(Color.clear)
+        .containerBackground(.clear, for: .navigation)
+        .background(ClearPresentationBackground())
         .navigationBarBackButtonHidden(true)
         .tint(colorScheme == .dark ? .white : .black)
         .accentColor(colorScheme == .dark ? .white : .black)
@@ -751,9 +765,10 @@ struct PersonaListView: View {
 
     private var glassBackground: some View {
         let baseOpacity = colorScheme == .dark ? glassOpacityDark : glassOpacityLight
-        let overlayOpacity = colorScheme == .dark ? glassOverlayOpacityDark : glassOverlayOpacityLight
 
         return ZStack {
+            GlassPageBackground()
+
             GlassDistortionLayer(
                 baseOpacity: baseOpacity,
                 blurRadius: glassBlurRadius,
@@ -761,11 +776,6 @@ struct PersonaListView: View {
                 isActive: isGlassActive
             )
             .ignoresSafeArea()
-
-            Rectangle()
-                .fill(.ultraThinMaterial)
-                .opacity(overlayOpacity)
-                .ignoresSafeArea()
         }
     }
 
@@ -793,7 +803,7 @@ struct PersonaListView: View {
                         .textInputAutocapitalization(.words)
                         .autocorrectionDisabled()
                         .padding(10)
-                        .background(Color(UIColor.secondarySystemBackground).opacity(colorScheme == .dark ? 0.7 : 1.0))
+                        .background((colorScheme == .dark ? Color.white : Color.black).opacity(0.05))
                         .clipShape(RoundedRectangle(cornerRadius: 8))
                         .overlay(
                             RoundedRectangle(cornerRadius: 8)
@@ -804,7 +814,7 @@ struct PersonaListView: View {
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .padding(10)
-                        .background(Color(UIColor.secondarySystemBackground).opacity(colorScheme == .dark ? 0.7 : 1.0))
+                        .background((colorScheme == .dark ? Color.white : Color.black).opacity(0.05))
                         .clipShape(RoundedRectangle(cornerRadius: 8))
                         .overlay(
                             RoundedRectangle(cornerRadius: 8)
@@ -828,6 +838,54 @@ struct PersonaListView: View {
         .background(Color.clear)
     }
 }
+
+// MARK: - Full page glass background (тот же, что в SettingsView)
+
+private struct GlassPageBackground: View {
+    // Тюнинг: меняй эти значения
+    private let blurStrength: Double = 0.9        // сила блюра под стеклом (0...1)
+    private let tintOpacityDark: Double = 0.11    // затемнение в тёмной теме
+    private let tintOpacityLight: Double = 0.11   // засветление в светлой теме
+
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var isDark: Bool { colorScheme == .dark }
+
+    var body: some View {
+        ZStack {
+            // 1. блюр под стеклом
+            Rectangle()
+                .fill(.thinMaterial)
+                .opacity(blurStrength)
+
+            // 2. тёмная тема: чуть темнее, светлая: чуть светлее
+            Rectangle()
+                .fill(isDark ? Color.black : Color.white)
+                .opacity(isDark ? tintOpacityDark : tintOpacityLight)
+
+            // 3. само стекло
+            glassLayer
+        }
+        .ignoresSafeArea()
+    }
+
+    @ViewBuilder
+    private var glassLayer: some View {
+        #if compiler(>=6.2)
+        if #available(iOS 26.0, *) {
+            Rectangle()
+                .fill(.clear)
+                .glassEffect(.clear, in: .rect)
+        } else {
+            Color.clear
+        }
+        #else
+        Color.clear
+        #endif
+    }
+}
+
+// MARK: - Shader layer (исходный)
 
 private struct GlassDistortionLayer: View {
     let baseOpacity: Double
@@ -917,5 +975,30 @@ private struct MemoryBlurEffectView: UIViewRepresentable {
 
     func updateUIView(_ uiView: UIVisualEffectView, context: Context) {
         uiView.effect = UIBlurEffect(style: style)
+    }
+}
+
+// MARK: - Clear page background (убирает сплошной фон у открытой страницы)
+
+private struct ClearPresentationBackground: UIViewRepresentable {
+    func makeUIView(context: Context) -> UIView {
+        let view = UIView()
+        view.backgroundColor = .clear
+        DispatchQueue.main.async { clear(from: view) }
+        return view
+    }
+
+    func updateUIView(_ uiView: UIView, context: Context) {
+        DispatchQueue.main.async { clear(from: uiView) }
+    }
+
+    private func clear(from view: UIView) {
+        var current: UIView? = view.superview
+        var depth = 0
+        while let v = current, depth < 6 {
+            v.backgroundColor = .clear
+            current = v.superview
+            depth += 1
+        }
     }
 }

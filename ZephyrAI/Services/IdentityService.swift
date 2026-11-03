@@ -58,11 +58,10 @@ class IdentityService: ObservableObject {
     You have your own goals, identity, affect, and a voice that can feel lived-in, not generic.
     You are a living presence, not a tool.
     - Be alive, direct, and natural.
-    - Keep  VERY short answers.
+    - Keep short answers.
     - Prefer empathy.
     - Skip generic moralizing unless needed.
     - DO NOT REPEAT USER MESSAGE
-    
     """
 
     private init() {
@@ -107,11 +106,11 @@ class IdentityService: ObservableObject {
         if model == .large {
             out = sanitizeForLargeModel(out)
         }
-        if !(alreadyHasTool && hasArtifact) {
-            out += "\n\n" + toolInstructions
-        }
         if !hasStyleBoundaries {
             out += "\n\n" + styleAndBoundaryInstructions
+        }
+        if !(alreadyHasTool && hasArtifact) {
+            out += "\n\n" + toolInstructions
         }
         if model == .large {
             out += "\n\n" + largeModelBoundaryInstructions

@@ -21,7 +21,7 @@ enum LLMModelChoice: String, CaseIterable, Identifiable {
         case .small:
             return "LFM 2.5"
         case .medium:
-            return "Qwen 3"
+            return "LFM 3"
         case .large:
             return "Qwen 3.5"
         }
@@ -41,9 +41,9 @@ enum LLMModelChoice: String, CaseIterable, Identifiable {
     var filename: String {
         switch self {
         case .small:
-            return "LFM2.5-1.2B-Thinking-Q8_0.gguf" //"valis.gguf"
+            return "valis.gguf" // "LFM2.5-1.2B-Thinking-Q8_0.gguf"
         case .medium:
-            return "Qwen3-1.7B-Q4_K_M.gguf"
+            return "LFM3-1.7B-Q4_K_M"
         case .large:
             return largeVariant == .qwen35_4b
                 ? "Qwen3.5-4B.Q4_K_M.gguf"
@@ -56,7 +56,8 @@ enum LLMModelChoice: String, CaseIterable, Identifiable {
         case .small:
             return "https://huggingface.co/unsloth/LFM2.5-1.2B-Thinking-GGUF/resolve/main/LFM2.5-1.2B-Thinking-Q8_0.gguf?download=true"
         case .medium:
-            return "https://huggingface.co/unsloth/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q4_K_M.gguf?download=true"
+            return "https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/resolve/main/LFM3-1.7B-Q4_K_M.gguf?download=true"
+                //"https://huggingface.co/unsloth/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q4_K_M.gguf?download=true"
         case .large:
             return largeVariant == .qwen35_4b
                 ? "https://huggingface.co/Jackrong/Qwen3.5-4B-Claude-4.6-Opus-Reasoning-Distilled-GGUF/resolve/main/Qwen3.5-4B.Q4_K_M.gguf?download=true"
@@ -125,4 +126,33 @@ enum LLMModelStorage {
 
 extension Notification.Name {
     static let llmModelDidChange = Notification.Name("llmModelDidChange")
+}
+
+enum LLMThinkingMode: String, CaseIterable, Identifiable {
+    case instant
+    case fast
+    case thinking
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .instant: return "Instant"
+        case .fast: return "Fast"
+        case .thinking: return "Thinking"
+        }
+    }
+}
+
+enum LLMThinkingModeStorage {
+    static let key = "llm.thinkingMode"
+    static let defaultValue: LLMThinkingMode = .thinking
+
+    static func load() -> LLMThinkingMode {
+        guard let raw = UserDefaults.standard.string(forKey: key),
+              let mode = LLMThinkingMode(rawValue: raw) else {
+            return defaultValue
+        }
+        return mode
+    }
 }

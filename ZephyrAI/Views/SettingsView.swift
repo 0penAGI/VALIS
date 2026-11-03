@@ -10,7 +10,10 @@ struct SettingsView: View {
     private let glassMaxOffset: CGFloat = 18
     @Environment(\.dismiss) private var dismiss
     @State private var isGlassActive = false
+    @State private var showInstantModeInfo = false
+    @State private var instantModeInfoTask: Task<Void, Never>?
     @AppStorage(LLMModelStorage.key) private var selectedModelRaw: String = LLMModelStorage.defaultValue.rawValue
+    @AppStorage(LLMThinkingModeStorage.key) private var thinkingModeRaw: String = LLMThinkingModeStorage.defaultValue.rawValue
     @Environment(\.colorScheme) private var colorScheme
 
     private var glassBaseLayer: some View {
@@ -31,9 +34,12 @@ struct SettingsView: View {
     }
 
     private var glassBackground: some View {
-        glassBaseLayer
+        ZStack {
+            GlassPageBackground()
+            glassBaseLayer   // твой шейдер glassDistortion
+        }
     }
-    
+
     private var contentLayer: some View {
         ZStack {
             glassBackground
@@ -54,24 +60,57 @@ struct SettingsView: View {
     }
 
     private var modelSection: some View {
-            Section("Model") {
-                VStack(alignment: .leading, spacing: 10) {
-                    Picker("Model Size", selection: $selectedModelRaw) {
-                        ForEach(LLMModelChoice.allCases) { model in
-                            Text("\(model.displayName) \(model.detailLabel)")
-                                .tag(model.rawValue)
-                        }
-                    }
-                    .pickerStyle(.palette)
-                    .labelsHidden()
-                    .background(Color.clear)
-                    .compositingGroup()
-                    .onChange(of: selectedModelRaw) { _, _ in
-                        LLMModelStorage.notifyChange()
+        Section("Model") {
+            VStack(alignment: .leading, spacing: 10) {
+                Picker("Response Mode", selection: $thinkingModeRaw) {
+                    ForEach(LLMThinkingMode.allCases) { mode in
+                        Text(mode.title).tag(mode.rawValue)
                     }
                 }
-                .padding(.vertical, 6)
+                .pickerStyle(.segmented)
+                .accessibilityLabel("Response Mode")
+                .onChange(of: thinkingModeRaw) { _, newValue in
+                    instantModeInfoTask?.cancel()
+                    guard newValue == LLMThinkingMode.instant.rawValue else {
+                        withAnimation(.easeOut(duration: 0.12)) {
+                            showInstantModeInfo = false
+                        }
+                        return
+                    }
+
+                    withAnimation(.spring(response: 0.38, dampingFraction: 0.88)) {
+                        showInstantModeInfo = true
+                    }
+                    instantModeInfoTask = Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 3_500_000_000)
+                        guard !Task.isCancelled else { return }
+                        withAnimation(.easeOut(duration: 0.12)) {
+                            showInstantModeInfo = false
+                        }
+                    }
+                }
+
+                if showInstantModeInfo {
+                    instantModeInfoBubble
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
+
+                Picker("Model Size", selection: $selectedModelRaw) {
+                    ForEach(LLMModelChoice.allCases) { model in
+                        Text("\(model.displayName) \(model.detailLabel)")
+                            .tag(model.rawValue)
+                    }
+                }
+                .pickerStyle(.palette)
+                .labelsHidden()
+                .background(Color.clear)
+                .compositingGroup()
+                .onChange(of: selectedModelRaw) { _, _ in
+                    LLMModelStorage.notifyChange()
+                }
             }
+            .padding(.vertical, 6)
+        }
         .listRowBackground(Color.clear)
     }
 
@@ -186,9 +225,56 @@ struct SettingsView: View {
             .toolbarBackground(.hidden, for: .navigationBar)
             .toolbarBackground(Color.clear, for: .navigationBar)
         }
+        .presentationBackground(.clear)
+        .containerBackground(.clear, for: .navigation)
+        .background(ClearPresentationBackground())
         .onAppear { isGlassActive = true }
-        .onDisappear { isGlassActive = false }
+        .onDisappear {
+            isGlassActive = false
+            instantModeInfoTask?.cancel()
+        }
         .applyBreakthroughEffect()
+    }
+
+    private var instantModeInfoBubble: some View {
+        let shape = RoundedRectangle(cornerRadius: 18, style: .continuous)
+
+        return HStack(spacing: 10) {
+            Image(systemName: "bolt.fill")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(colorScheme == .dark ? .white : .primary)
+
+            Text("Instant replies skip long-term memory for faster responses.")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(colorScheme == .dark ? .white.opacity(0.92) : .primary.opacity(0.9))
+                .fixedSize(horizontal: false, vertical: true)
+
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 13)
+        .padding(.vertical, 11)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background {
+            #if compiler(>=6.2)
+            if #available(iOS 26.0, *) {
+                shape
+                    .fill(.clear)
+                    .glassEffect(.regular, in: shape)
+            } else {
+                fallbackInstantInfoGlass(shape: shape)
+            }
+            #else
+            fallbackInstantInfoGlass(shape: shape)
+            #endif
+        }
+    }
+
+    private func fallbackInstantInfoGlass(shape: RoundedRectangle) -> some View {
+        shape
+            .fill(.ultraThinMaterial)
+            .overlay(
+                shape.strokeBorder(Color.white.opacity(colorScheme == .dark ? 0.18 : 0.32), lineWidth: 1)
+            )
     }
 }
 
@@ -215,6 +301,54 @@ private extension View {
 #Preview {
     SettingsView()
 }
+
+// MARK: - Full page glass background
+
+private struct GlassPageBackground: View {
+    // Тюнинг: меняй эти значения
+    private let blurStrength: Double = 0.9       // сила блюра под стеклом (0...1)
+    private let tintOpacityDark: Double = 0.11    // затемнение в тёмной теме
+    private let tintOpacityLight: Double = 0.11   // засветление в светлой теме
+
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var isDark: Bool { colorScheme == .dark }
+
+    var body: some View {
+        ZStack {
+            // 1. блюр под стеклом
+            Rectangle()
+                .fill(.thinMaterial)
+                .opacity(blurStrength)
+
+            // 2. тёмная тема: чуть темнее, светлая: чуть светлее
+            Rectangle()
+                .fill(isDark ? Color.black : Color.white)
+                .opacity(isDark ? tintOpacityDark : tintOpacityLight)
+
+            // 3. само стекло
+            glassLayer
+        }
+        .ignoresSafeArea()
+    }
+
+    @ViewBuilder
+    private var glassLayer: some View {
+        #if compiler(>=6.2)
+        if #available(iOS 26.0, *) {
+            Rectangle()
+                .fill(.clear)
+                .glassEffect(.clear, in: .rect)
+        } else {
+            Color.clear
+        }
+        #else
+        Color.clear
+        #endif
+    }
+}
+
+// MARK: - Background distortion
 
 private struct GlassDistortionLayer: View {
     let baseOpacity: Double
@@ -305,4 +439,30 @@ private struct SettingsBlurEffectView: UIViewRepresentable {
         uiView.effect = UIBlurEffect(style: style)
     }
 }
- 
+
+// MARK: - Clear page background (sheet / fullScreenCover / hosting container)
+
+/// Снимает непрозрачный системный фон у контейнера, в котором показана страница,
+/// чтобы под стеклом был виден экран позади (чат), а не сплошная заливка.
+private struct ClearPresentationBackground: UIViewRepresentable {
+    func makeUIView(context: Context) -> UIView {
+        let view = UIView()
+        view.backgroundColor = .clear
+        DispatchQueue.main.async { clear(from: view) }
+        return view
+    }
+
+    func updateUIView(_ uiView: UIView, context: Context) {
+        DispatchQueue.main.async { clear(from: uiView) }
+    }
+
+    private func clear(from view: UIView) {
+        var current: UIView? = view.superview
+        var depth = 0
+        while let v = current, depth < 6 {
+            v.backgroundColor = .clear
+            current = v.superview
+            depth += 1
+        }
+    }
+}

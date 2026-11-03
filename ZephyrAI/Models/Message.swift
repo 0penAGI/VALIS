@@ -1,12 +1,12 @@
 import Foundation
 
-enum Role: String, Codable {
+enum Role: String, Codable, Sendable {
     case user
     case assistant
     case system
 }
 
-struct MessageImageAttachment: Codable, Equatable {
+struct MessageImageAttachment: Codable, Equatable, Sendable {
     let id: UUID
     let filename: String
     let pixelWidth: Int
@@ -32,7 +32,7 @@ struct MessageImageAttachment: Codable, Equatable {
     }
 }
 
-struct Message: Identifiable, Codable, Equatable {
+struct Message: Identifiable, Codable, Equatable, Sendable {
     let id: UUID
     let role: Role
     var content: String

@@ -11,27 +11,81 @@ final class ContinuousContextService {
     static let shared = ContinuousContextService()
 
     private var cachedBlock: String?
+    private var cachedDetailedBlock: String?
     private var cacheTime: Date?
     private let cacheTTL: TimeInterval = 30
 
-    private init() {}
+    #if canImport(Network)
+    private let pathMonitor = NWPathMonitor()
+    private let monitorQueue = DispatchQueue(label: "ZephyrAI.NetworkPathMonitor")
+    private var latestPath: NWPath?
+    #endif
 
-    func contextBlock() -> String {
-        if let cached = cachedBlock, let t = cacheTime,
-           Date().timeIntervalSince(t) < cacheTTL {
-            return cached
+    private init() {
+        #if canImport(Network)
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            Task { @MainActor [weak self] in
+                self?.latestPath = path
+            }
         }
-        let block = buildBlock()
-        cachedBlock = block
-        cacheTime = Date()
+        pathMonitor.start(queue: monitorQueue)
+        #endif
+    }
+
+    func contextBlock(includeDeviceState: Bool) -> String {
+        let now = Date()
+        if includeDeviceState {
+            if let cached = cachedDetailedBlock, let t = cacheTime,
+               now.timeIntervalSince(t) < cacheTTL {
+                return cached
+            }
+        } else {
+            if let cached = cachedBlock, let t = cacheTime,
+               now.timeIntervalSince(t) < cacheTTL {
+                return cached
+            }
+        }
+        let block = buildBlock(includeDeviceState: includeDeviceState)
+        if includeDeviceState {
+            cachedDetailedBlock = block
+        } else {
+            cachedBlock = block
+        }
+        cacheTime = now
         return block
     }
 
-    private func buildBlock() -> String {
+    func isDeviceStateRelevant(_ prompt: String) -> Bool {
+        let lower = prompt.lowercased()
+            .folding(options: .diacriticInsensitive, locale: .current)
+        let triggers = [
+            "battery", "заряд", "батаре", "батарея", "заряж",
+            "battery level", "%, battery", "energy saver",
+            "low power", "энергосбереж", "экономии", "лимит заряда",
+            "thermal", "overheat", "надоело греется", "нагрев", "нагрева", "перегрев", "горяч",
+            "wifi", "wi-fi", "wi fi", "network", "cellular", "mobile data",
+            "internet connection", "сеть", "соединение", "интернет", "офлайн", "offline", "сотовая",
+            "storage", "хранилищ", "память телефона", "сколько памяти", "свободн", "место на",
+            "device state", "состояние телефона", "состояние устройства", "про телефон", "про устройство",
+            "статус телефона", "status of my phone", "device status", "system status", "статус системы"
+        ]
+        return triggers.contains { lower.contains($0) }
+    }
+
+    private func buildBlock(includeDeviceState: Bool) -> String {
         var parts: [String] = []
 
         parts.append("Current Time: \(formatTime())")
         parts.append("Date: \(formatDate())")
+
+        let locale = Locale.current
+        if let lang = locale.language.languageCode?.identifier {
+            parts.append("Locale: \(lang)")
+        }
+
+        guard includeDeviceState else {
+            return "Device state:\n" + parts.joined(separator: "\n")
+        }
 
         #if canImport(UIKit)
         let device = UIDevice.current
@@ -61,19 +115,28 @@ final class ContinuousContextService {
         }
         #endif
 
-        let net = NWPathMonitor().currentPath
-        if net.usesInterfaceType(.wifi) {
-            parts.append("Network: Wi-Fi")
-        } else if net.usesInterfaceType(.cellular) {
-            parts.append("Network: Cellular")
-        } else if !net.status.statusString.isEmpty {
-            parts.append("Network: \(net.status.statusString)")
+        #if canImport(Network)
+        if let path = latestPath {
+            switch path.status {
+            case .satisfied:
+                if path.usesInterfaceType(.wifi) {
+                    parts.append("Network: Wi-Fi")
+                } else if path.usesInterfaceType(.cellular) {
+                    parts.append("Network: Cellular")
+                } else if path.usesInterfaceType(.wiredEthernet) {
+                    parts.append("Network: Ethernet")
+                } else {
+                    parts.append("Network: connected")
+                }
+            case .requiresConnection:
+                parts.append("Network: requires sign-in or confirmation")
+            case .unsatisfied:
+                parts.append("Network: offline")
+            @unknown default:
+                break
+            }
         }
-
-        let locale = Locale.current
-        if let lang = locale.language.languageCode?.identifier {
-            parts.append("Locale: \(lang)")
-        }
+        #endif
 
         return "Device state:\n" + parts.joined(separator: "\n")
     }
@@ -93,16 +156,3 @@ final class ContinuousContextService {
         return f.string(from: Date())
     }
 }
-
-#if canImport(Network)
-private extension NWPath.Status {
-    var statusString: String {
-        switch self {
-        case .satisfied: return "connected"
-        case .unsatisfied: return "offline"
-        case .requiresConnection: return "connecting"
-        @unknown default: return "unknown"
-        }
-    }
-}
-#endif

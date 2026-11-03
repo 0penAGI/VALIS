@@ -4,6 +4,14 @@ import Darwin
 import UIKit
 #endif
 
+/// llama.cpp backend state is process-wide. Swift initializes this static exactly once,
+/// even if model reloads construct runtimes on different queues at the same time.
+private enum LlamaBackendLifecycle {
+    static let initialized: Void = {
+        llama_backend_init()
+    }()
+}
+
 enum LlamaRuntimeError: LocalizedError {
     case modelNotFound(expectedFilename: String)
     case backendInitFailed
@@ -75,9 +83,15 @@ final class LlamaRuntime {
     private var samplingTopLogits: [Float] = []
     private var samplingProbs: [Float] = []
     private var samplingOrder: [Int] = []
+    private let stateLock = NSLock()
     private var promptPrefixCache: [String: PromptPrefixSnapshot] = [:]
     private var promptPrefixCacheOrder: [String] = []
-    private let promptPrefixCacheLimit = 4
+    private var promptPrefixCacheBytes = 0
+    private var pendingContextShrinkTarget: Int32?
+
+    private static let prefixCacheBudgetFraction = 0.10
+    private static let prefixCacheMaxBudgetBytes = 1024 * 1024 * 1024
+    private static let prefixCacheHardEntryLimit = 8
 
     var contextSize: Int32
     private let batchSize: Int32
@@ -100,8 +114,8 @@ final class LlamaRuntime {
         self.threadCount = threads ?? Self.recommendedThreadCount(gpuLayers: gpuLayers)
 
         llama_log_set(LlamaRuntime.loadLogs, nil)
-        print("[Llama] Initializing backend")
-        llama_backend_init()
+        print("[Llama] Initializing backend (process lifetime)")
+        _ = LlamaBackendLifecycle.initialized
         if let info = llama_print_system_info() {
             print("[Llama] System info: \(String(cString: info))")
         }
@@ -129,9 +143,10 @@ final class LlamaRuntime {
         var ctxParams = llama_context_default_params()
         ctxParams.n_ctx = UInt32(max(1, self.contextSize))
         ctxParams.n_batch = UInt32(min(maxBatch, Int(self.contextSize)))
+        Self.applyQuantizedKV(to: &ctxParams, contextSize: self.contextSize)
 
         print("[Llama] Creating context (n_ctx=\(ctxParams.n_ctx), n_batch=\(ctxParams.n_batch))")
-        guard let ctx = llama_init_from_model(model, ctxParams) else {
+        guard let ctx = Self.createContext(model: model, baseParams: ctxParams, contextSize: self.contextSize) else {
             llama_model_free(model)
             throw LlamaRuntimeError.contextInitFailed
         }
@@ -160,8 +175,6 @@ final class LlamaRuntime {
         let model = UIDevice.current.modelName.lowercased()
         let memoryGB = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824.0
         let modelSizeGB = estimatedModelSizeInGB(at: modelPath)
-        let lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
-        let thermalState = ProcessInfo.processInfo.thermalState
 
         var layers: Int32
 
@@ -195,19 +208,6 @@ final class LlamaRuntime {
             layers -= 4
         } else if contextSize >= 4_096 {
             layers -= 2
-        }
-
-        if lowPower {
-            layers -= 4
-        }
-
-        switch thermalState {
-        case .serious:
-            layers -= 4
-        case .critical:
-            layers -= 8
-        default:
-            break
         }
 
         let minLayers: Int32 = isSmallModel ? 6 : 8
@@ -216,8 +216,6 @@ final class LlamaRuntime {
         #else
         let memoryGB = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824.0
         let modelSizeGB = estimatedModelSizeInGB(at: modelPath)
-        let lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
-        let thermalState = ProcessInfo.processInfo.thermalState
 
         var layers: Int32
 
@@ -253,23 +251,69 @@ final class LlamaRuntime {
             layers -= 2
         }
 
-        if lowPower {
-            layers -= 4
-        }
-
-        switch thermalState {
-        case .serious:
-            layers -= 4
-        case .critical:
-            layers -= 8
-        default:
-            break
-        }
-
         let minLayers: Int32 = isSmallModel ? 6 : 8
         let maxLayers: Int32 = 34
         return max(minLayers, min(maxLayers, layers))
         #endif
+    }
+
+    /// Q8_0 KV cache: ~2x less memory + less bandwidth per decoded token vs F16,
+    /// with negligible quality loss on the local models. K is attention-critical
+    /// (dot product), so keep it Q8_0 everywhere; V can go Q4_0 on constrained
+    /// devices (low RAM / older iPhone / big context / power-saving / hot) since
+    /// V does not participate in dot products and tolerates coarser quantization.
+    private static func recommendedKVTypeK() -> ggml_type { GGML_TYPE_Q8_0 }
+
+    private static func recommendedKVTypeV(contextSize: Int32) -> ggml_type {
+        #if canImport(UIKit)
+        let device = UIDevice.current.modelName.lowercased()
+        let memoryGB = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824.0
+        let thermal = ProcessInfo.processInfo.thermalState
+        let constrained = memoryGB < 6
+            || device.contains("iphone 13") || device.contains("iphone 14")
+            || contextSize >= 12_288
+            || ProcessInfo.processInfo.isLowPowerModeEnabled
+            || thermal == .serious
+            || thermal == .critical
+        return constrained ? GGML_TYPE_Q4_0 : GGML_TYPE_Q8_0
+        #else
+        return GGML_TYPE_Q8_0
+        #endif
+    }
+
+    private static func applyQuantizedKV(to ctxParams: inout llama_context_params, contextSize: Int32) {
+        ctxParams.type_k = Self.recommendedKVTypeK()
+        ctxParams.type_v = Self.recommendedKVTypeV(contextSize: contextSize)
+    }
+
+    /// Creates the context, applying quantized KV types with a safe fallback.
+    ///
+    /// Quantized V cache requires Flash Attention, which llama.cpp auto-disables
+    /// for models/tensors it cannot place on the requested device (e.g. hybrid
+    /// Gated Delta Net models on Metal). When that happens llama_init_from_model
+    /// returns NULL; we retry once with V back to F16 (K stays Q8, no loss).
+    private static func createContext(
+        model: OpaquePointer,
+        baseParams: llama_context_params,
+        contextSize: Int32
+    ) -> OpaquePointer? {
+        let desiredV = Self.recommendedKVTypeV(contextSize: contextSize)
+        if desiredV == GGML_TYPE_F16 {
+            var params = baseParams
+            Self.applyQuantizedKV(to: &params, contextSize: contextSize)
+            return llama_init_from_model(model, params)
+        }
+
+        var primary = baseParams
+        Self.applyQuantizedKV(to: &primary, contextSize: contextSize)
+        if let ctx = llama_init_from_model(model, primary) {
+            return ctx
+        }
+
+        print("[Llama] Quantized V cache rejected (needs Flash Attention); falling back to V=F16 (K stays Q8_0).")
+        var fallback = primary
+        fallback.type_v = GGML_TYPE_F16
+        return llama_init_from_model(model, fallback)
     }
 
     private static func recommendedThreadCount(gpuLayers: Int32) -> Int32 {
@@ -280,19 +324,6 @@ final class LlamaRuntime {
             threads -= 2
         } else if gpuLayers >= 16 {
             threads -= 1
-        }
-
-        if ProcessInfo.processInfo.isLowPowerModeEnabled {
-            threads -= 1
-        }
-
-        switch ProcessInfo.processInfo.thermalState {
-        case .serious:
-            threads -= 1
-        case .critical:
-            threads -= 2
-        default:
-            break
         }
 
         return Int32(max(1, threads))
@@ -316,7 +347,6 @@ final class LlamaRuntime {
         if let model = model {
             llama_model_free(model)
         }
-        llama_backend_free()
     }
 
     private func rebuildContext() throws {
@@ -325,13 +355,15 @@ final class LlamaRuntime {
         }
         if let ctx = context {
             llama_free(ctx)
+            self.context = nil
         }
 
         var ctxParams = llama_context_default_params()
         ctxParams.n_ctx = UInt32(max(1, self.contextSize))
-        ctxParams.n_batch = UInt32(max(1, Int(self.batchSize)))
+        ctxParams.n_batch = UInt32(max(1, min(Int(self.batchSize), Int(self.contextSize))))
+        Self.applyQuantizedKV(to: &ctxParams, contextSize: self.contextSize)
 
-        guard let newCtx = llama_init_from_model(model, ctxParams) else {
+        guard let newCtx = Self.createContext(model: model, baseParams: ctxParams, contextSize: self.contextSize) else {
             throw LlamaRuntimeError.contextInitFailed
         }
 
@@ -340,8 +372,52 @@ final class LlamaRuntime {
 
         let threads = Self.recommendedThreadCount(gpuLayers: gpuLayerCount)
         llama_set_n_threads(newCtx, threads, threads)
-        promptPrefixCache.removeAll()
-        promptPrefixCacheOrder.removeAll()
+        clearPrefixCache()
+    }
+
+    // MARK: - Memory pressure
+
+    /// Reacts to OS memory pressure. The prefix KV snapshots are the largest
+    /// reclaimable allocations we own, so we trim them immediately; the context
+    /// itself is shrunk lazily at the next generation start (never mid-decode).
+    func handleMemoryPressure(level: Int) {
+        switch level {
+        case 2...:
+            clearPrefixCache()
+            requestContextShrink(to: 8192)
+        case 1:
+            trimPrefixCache(toBytes: Self.prefixCacheBudgetBytes() / 2)
+            requestContextShrink(to: 16384)
+        default:
+            break
+        }
+    }
+
+    private func requestContextShrink(to target: Int32) {
+        stateLock.lock()
+        if let existing = pendingContextShrinkTarget {
+            pendingContextShrinkTarget = min(existing, target)
+        } else {
+            pendingContextShrinkTarget = target
+        }
+        stateLock.unlock()
+    }
+
+    private func takePendingContextShrinkTarget() -> Int32? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        let target = pendingContextShrinkTarget
+        pendingContextShrinkTarget = nil
+        return target
+    }
+
+    func applyPendingContextShrinkIfNeeded() throws {
+        guard let target = takePendingContextShrinkTarget() else { return }
+        let clamped = min(contextSize, target)
+        guard clamped >= 4096, clamped < contextSize else { return }
+        print("[Llama] Memory pressure: shrinking context \(contextSize) -> \(clamped)")
+        contextSize = clamped
+        try rebuildContext()
     }
 
     func generateStream(
@@ -372,6 +448,8 @@ final class LlamaRuntime {
         shouldStop: () -> Bool,
         onToken: (String) -> Void
     ) throws {
+        try applyPendingContextShrinkIfNeeded()
+
         guard var ctx = context, let vocab = vocab else {
             throw LlamaRuntimeError.contextInitFailed
         }
@@ -380,7 +458,7 @@ final class LlamaRuntime {
 
         let prefixKey = promptPrefix.isEmpty ? nil : promptPrefix
         print("[Llama] Tokenizing prompt (prefixLen=\(promptPrefix.count), suffixLen=\(prompt.count))")
-        let cachedPrefix = prefixKey.flatMap { promptPrefixCache[$0] }
+        let cachedPrefix = prefixKey.flatMap { cachedPrefixSnapshot(for: $0) }
         let prefixTokens: [llama_token]
         if let cachedPrefix {
             prefixTokens = cachedPrefix.tokens
@@ -476,7 +554,7 @@ final class LlamaRuntime {
 
         if let prefixKey,
            promptPrefix.isEmpty == false,
-           promptPrefixCache[prefixKey] == nil,
+           cachedPrefix == nil,
            prefixDecodeTokens.count == prefixTokens.count {
             cachePromptPrefix(prefixKey, ctx: ctx, tokens: prefixTokens)
         }
@@ -607,29 +685,108 @@ final class LlamaRuntime {
         return Array(tokens.prefix(Int(count)))
     }
 
+    private static func availableMemoryBytes() -> Int {
+        #if os(macOS) || targetEnvironment(macCatalyst)
+        return Int(ProcessInfo.processInfo.physicalMemory)
+        #else
+        return Int(os_proc_available_memory())
+        #endif
+    }
+
+    /// 10% of the memory the process can still allocate before the OS kills it.
+    /// Snapshots are full-KV-state copies, so this keeps them from doubling our
+    /// footprint under pressure.
+    private static func prefixCacheBudgetBytes() -> Int {
+        let available = availableMemoryBytes()
+        guard available > 0 else { return 0 }
+        let fraction = Int(Double(available) * prefixCacheBudgetFraction)
+        return min(prefixCacheMaxBudgetBytes, max(0, fraction))
+    }
+
+    private func cachedPrefixSnapshot(for key: String) -> PromptPrefixSnapshot? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard let snapshot = promptPrefixCache[key] else { return nil }
+        promptPrefixCacheOrder.removeAll { $0 == key }
+        promptPrefixCacheOrder.append(key)
+        return snapshot
+    }
+
+    private func clearPrefixCache() {
+        stateLock.lock()
+        promptPrefixCache.removeAll()
+        promptPrefixCacheOrder.removeAll()
+        promptPrefixCacheBytes = 0
+        stateLock.unlock()
+    }
+
+    private func trimPrefixCache(toBytes target: Int) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        while promptPrefixCacheBytes > target, let oldest = promptPrefixCacheOrder.first {
+            if let evicted = promptPrefixCache.removeValue(forKey: oldest) {
+                promptPrefixCacheBytes -= evicted.stateData.count
+            }
+            promptPrefixCacheOrder.removeFirst()
+        }
+    }
+
     private func cachePromptPrefix(_ key: String, ctx: OpaquePointer, tokens: [llama_token]) {
         let stateSize = llama_state_get_size(ctx)
         guard stateSize > 0 else { return }
 
-        var bytes = [UInt8](repeating: 0, count: Int(stateSize))
-        let copied = bytes.withUnsafeMutableBytes { buffer -> size_t in
+        let budget = Self.prefixCacheBudgetBytes()
+        guard Int(stateSize) <= budget else {
+            let stateMB = Double(stateSize) / 1_048_576.0
+            let budgetMB = Double(budget) / 1_048_576.0
+            print("[Llama] Prefix KV snapshot \(String(format: "%.1f", stateMB)) MB exceeds cache budget \(String(format: "%.1f", budgetMB)) MB; skipping cache.")
+            return
+        }
+
+        // Allocate the snapshot buffer directly and let llama write into it,
+        // avoiding a second full-size copy.
+        var stateData = Data(count: Int(stateSize))
+        let copied = stateData.withUnsafeMutableBytes { buffer -> size_t in
             guard let base = buffer.baseAddress else { return 0 }
             return llama_state_get_data(ctx, base.assumingMemoryBound(to: UInt8.self), stateSize)
         }
         guard copied > 0 else { return }
+        if copied < stateData.count {
+            stateData.removeSubrange(Int(copied)..<stateData.count)
+        }
 
         let snapshot = PromptPrefixSnapshot(
-            stateData: Data(bytes: bytes),
+            stateData: stateData,
             tokenCount: tokenCount,
             tokens: tokens
         )
+
+        stateLock.lock()
+
+        if let existing = promptPrefixCache.removeValue(forKey: key) {
+            promptPrefixCacheBytes -= existing.stateData.count
+        }
         promptPrefixCache[key] = snapshot
+        promptPrefixCacheBytes += snapshot.stateData.count
         promptPrefixCacheOrder.removeAll { $0 == key }
         promptPrefixCacheOrder.append(key)
-        if promptPrefixCacheOrder.count > promptPrefixCacheLimit,
-           let evicted = promptPrefixCacheOrder.first {
-            promptPrefixCache.removeValue(forKey: evicted)
+
+        while (promptPrefixCacheBytes > budget || promptPrefixCacheOrder.count > Self.prefixCacheHardEntryLimit),
+              let oldest = promptPrefixCacheOrder.first {
+            if let evicted = promptPrefixCache.removeValue(forKey: oldest) {
+                promptPrefixCacheBytes -= evicted.stateData.count
+            }
             promptPrefixCacheOrder.removeFirst()
+        }
+
+        let totalBytes = promptPrefixCacheBytes
+        stateLock.unlock()
+
+        if UserDefaults.standard.bool(forKey: "debug.promptTrace") {
+            let snapshotMB = Double(snapshot.stateData.count) / 1_048_576.0
+            let totalMB = Double(totalBytes) / 1_048_576.0
+            let budgetMB = Double(budget) / 1_048_576.0
+            print("[Llama] Cached prefix KV snapshot \(String(format: "%.1f", snapshotMB)) MB; cache \(String(format: "%.1f", totalMB)) MB / budget \(String(format: "%.1f", budgetMB)) MB")
         }
     }
 
@@ -664,7 +821,9 @@ final class LlamaRuntime {
         let penaltyFreq: Float = penaltyRepeat > 1.03 ? 0.04 : 0.0
         let penaltyPresent: Float = penaltyRepeat > 1.03 ? 0.02 : 0.0
 
-        if let penalties = llama_sampler_init_penalties(
+        let nVocab = vocab.map { llama_vocab_n_tokens($0) } ?? 0
+        if nVocab > 0, let penalties = llama_sampler_init_penalties(
+            nVocab,
             repeatLastN == 0 ? -1 : Int32(repeatLastN),
             penaltyRepeat,
             penaltyFreq,
