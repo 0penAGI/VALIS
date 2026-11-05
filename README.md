@@ -4,7 +4,7 @@
 
 VALIS is an on-device AI chat application for iOS built with SwiftUI and `llama.cpp` (GGUF). It combines local inference with a "plastic brain" memory system, persistent multi-chat architecture, multimodal vision, live HTML artifacts, a voice-layer post-processor, and a glass-morphic UI.
 
-![chat](https://github.com/0penAGI/VALIS/blob/main/greeting.png)
+![chat](https://github.com/0penAGI/VALIS/blob/main/greeting.PNG)
 
 [FULL BENCHMARK](https://0penagi.github.io/VALIS/)
 
@@ -55,7 +55,7 @@ PHILOSOPHICAL DEPTH
 **Key Finding:** The Plastic Brain memory architecture compensates for model scale. Kuramoto resonance synchronization and CognitiveEchoGraph context ranking provide coherence that cloud models achieve only with orders-of-magnitude more parameters.
 
 ---
-![chat](https://github.com/0penAGI/VALIS/blob/main/hi.png)
+![chat](https://github.com/0penAGI/VALIS/blob/main/hi.PNG)
 
 ## Core Features
 
@@ -69,7 +69,7 @@ PHILOSOPHICAL DEPTH
 
 ### Memory System (Plastic Brain)
 
-![chat](https://github.com/0penAGI/VALIS/blob/main/settings.png)
+![chat](https://github.com/0penAGI/VALIS/blob/main/settings.PNG)
 
 - **Temporal U-Shape Weighting**: Prioritizes both recent and deeply old memories (non-exponential decay)
 - **Power-Law Activation Decay**: Fast initial drop, long-tail plateau in CognitiveEchoGraph
@@ -86,7 +86,7 @@ PHILOSOPHICAL DEPTH
 
 ### Chat & Artifacts
 
-![chat](https://github.com/0penAGI/VALIS/blob/main/artifact.png)
+![chat](https://github.com/0penAGI/VALIS/blob/main/artifact.PNG)
 
 - **Separate Chats, Shared Memory**: Independent message history with unified long-term memory vault
 - **Thinking UI**: `<think>...</think>` blocks render as collapsible panels
@@ -97,7 +97,7 @@ PHILOSOPHICAL DEPTH
 - **Background Polish**: Unfinished artifacts receive continuation passes
 - **User HTML Detection**: Fenced ` ```html ` blocks auto-wrap into artifact canvases
 
-![chat](https://github.com/0penAGI/VALIS/blob/main/edit.png)
+![chat](https://github.com/0penAGI/VALIS/blob/main/edit.PNG)
 
 ### Multimodal Vision
 
