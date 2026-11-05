@@ -1,0 +1,576 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
+<title>VALIS Campaign</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;1,300;1,400&family=DM+Mono:wght@300;400&display=swap">
+
+<style>
+/* Layout: single-column editorial scroll, full-bleed sections, type-led */
+:root {
+  --bg: #F0EDE8;
+  --fg: #1A1917;
+  --fg-dim: #6B6560;
+  --accent: #2D4A3E;
+  --accent-warm: #8B5E3C;
+  --rule: #C8C2BA;
+  --card-bg: #E8E4DE;
+  --mono: 'DM Mono', monospace;
+  --serif: 'Cormorant Garamond', Georgia, serif;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0F0E0C;
+    --fg: #E8E4DC;
+    --fg-dim: #8A8278;
+    --accent: #5B8A72;
+    --accent-warm: #C4895A;
+    --rule: #2A2825;
+    --card-bg: #1A1917;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0F0E0C;
+  --fg: #E8E4DC;
+  --fg-dim: #8A8278;
+  --accent: #5B8A72;
+  --accent-warm: #C4895A;
+  --rule: #2A2825;
+  --card-bg: #1A1917;
+  color-scheme: dark;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--serif);
+  font-size: 18px;
+  line-height: 1.65;
+  margin: 0;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0;
+}
+
+.full-bleed {
+  margin-left: calc(-1 * max(16px, env(safe-area-inset-left, 0px)));
+  margin-right: calc(-1 * max(16px, env(safe-area-inset-right, 0px)));
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+
+/* ── HERO ── */
+.hero {
+  padding-block: 80px 60px;
+  border-bottom: 1px solid var(--rule);
+  max-width: 760px;
+  margin: 0 auto;
+}
+
+.hero-eyebrow {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+  margin-bottom: 32px;
+}
+
+.hero h1 {
+  font-family: var(--serif);
+  font-size: clamp(52px, 10vw, 96px);
+  font-weight: 300;
+  line-height: 0.95;
+  letter-spacing: -0.02em;
+  margin: 0 0 32px;
+  text-wrap: balance;
+}
+
+.hero h1 em {
+  font-style: italic;
+  color: var(--accent);
+}
+
+.hero-sub {
+  font-size: 20px;
+  font-weight: 300;
+  color: var(--fg-dim);
+  max-width: 540px;
+  margin: 0 0 48px;
+  font-style: italic;
+}
+
+.goal-bar {
+  display: flex;
+  align-items: baseline;
+  gap: 24px;
+  flex-wrap: wrap;
+}
+
+.goal-amount {
+  font-family: var(--mono);
+  font-size: clamp(32px, 6vw, 56px);
+  font-weight: 300;
+  letter-spacing: -0.02em;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+
+.goal-label {
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+}
+
+/* ── SECTION ── */
+.section {
+  max-width: 760px;
+  margin: 0 auto;
+  padding-block: 64px;
+  border-bottom: 1px solid var(--rule);
+}
+
+.section-label {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+  margin-bottom: 28px;
+}
+
+.section h2 {
+  font-family: var(--serif);
+  font-size: clamp(28px, 4vw, 42px);
+  font-weight: 300;
+  line-height: 1.1;
+  margin: 0 0 28px;
+  text-wrap: balance;
+}
+
+.section p {
+  margin: 0 0 20px;
+  max-width: 600px;
+}
+
+.section p:last-child { margin-bottom: 0; }
+
+/* ── MANIFESTO PULL QUOTE ── */
+.pull {
+  font-size: clamp(22px, 3.5vw, 32px);
+  font-weight: 300;
+  font-style: italic;
+  line-height: 1.35;
+  color: var(--accent);
+  border-left: 2px solid var(--accent);
+  padding-left: 28px;
+  margin: 40px 0;
+  max-width: 560px;
+  text-wrap: balance;
+}
+
+/* ── BUDGET TABLE ── */
+.budget {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--mono);
+  font-size: 14px;
+  margin-top: 32px;
+}
+
+.budget th {
+  text-align: left;
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+  padding: 0 16px 12px 0;
+  border-bottom: 1px solid var(--rule);
+  font-weight: 400;
+}
+
+.budget th:last-child { text-align: right; padding-right: 0; }
+
+.budget td {
+  padding: 14px 16px 14px 0;
+  border-bottom: 1px solid var(--rule);
+  vertical-align: top;
+  color: var(--fg);
+  font-variant-numeric: tabular-nums;
+}
+
+.budget td:last-child {
+  text-align: right;
+  padding-right: 0;
+  color: var(--accent-warm);
+}
+
+.budget .category {
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+  padding-top: 24px;
+}
+
+.budget .total td {
+  border-top: 2px solid var(--fg);
+  border-bottom: none;
+  padding-top: 20px;
+  font-size: 16px;
+}
+
+.budget .total td:last-child {
+  color: var(--accent);
+  font-size: 20px;
+}
+
+.budget-note {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--fg-dim);
+  margin-top: 16px;
+  font-style: italic;
+}
+
+/* ── TIERS ── */
+.tiers {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 2px;
+  margin-top: 32px;
+}
+
+.tier {
+  background: var(--card-bg);
+  padding: 28px 24px;
+}
+
+.tier-amount {
+  font-family: var(--mono);
+  font-size: 24px;
+  font-weight: 300;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  margin-bottom: 8px;
+}
+
+.tier-title {
+  font-family: var(--serif);
+  font-size: 18px;
+  font-weight: 400;
+  margin-bottom: 10px;
+  font-style: italic;
+}
+
+.tier-desc {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--fg-dim);
+  line-height: 1.6;
+}
+
+/* ── WHAT IS SECTION ── */
+.specs {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 32px 48px;
+  margin-top: 32px;
+}
+
+.spec-item {}
+
+.spec-label {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+  margin-bottom: 6px;
+}
+
+.spec-value {
+  font-size: 17px;
+  font-weight: 300;
+}
+
+/* ── FOOTER ── */
+footer {
+  max-width: 760px;
+  margin: 0 auto;
+  padding-block: 48px 64px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.footer-name {
+  font-family: var(--serif);
+  font-size: 22px;
+  font-weight: 300;
+  font-style: italic;
+}
+
+.footer-meta {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--fg-dim);
+  letter-spacing: 0.08em;
+}
+
+.wallet {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
+.wallet-addr {
+  font-family: var(--mono);
+  font-size: 12px;
+  background: var(--card-bg);
+  padding: 10px 14px;
+  word-break: break-all;
+  flex: 1;
+  min-width: 0;
+  border-radius: 2px;
+}
+
+.copy-btn {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  background: none;
+  border: 1px solid var(--rule);
+  color: var(--fg);
+  padding: 10px 16px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: border-color 0.2s, color 0.2s;
+}
+
+.copy-btn:hover { border-color: var(--accent); color: var(--accent); }
+.copy-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+@media (prefers-reduced-motion: no-preference) {
+  .hero h1 { animation: fade-up 0.8s ease both; }
+  .hero-sub { animation: fade-up 0.8s 0.1s ease both; }
+  .goal-bar { animation: fade-up 0.8s 0.2s ease both; }
+  @keyframes fade-up {
+    from { opacity: 0; transform: translateY(16px); }
+    to   { opacity: 1; transform: none; }
+  }
+}
+</style>
+
+<!-- HERO -->
+<section class="hero">
+  <div class="hero-eyebrow">0penAGI · VALIS · 2026</div>
+  <h1>Memory<br>that <em>stays</em><br>with you</h1>
+  <p class="hero-sub">An offline iOS AI with a plastic brain — no cloud, no subscription, no extraction.</p>
+  <div class="goal-bar">
+    <span class="goal-amount">$5,000</span>
+    <span class="goal-label">funding goal<br>crypto only</span>
+  </div>
+</section>
+
+<!-- MANIFESTO -->
+<section class="section">
+  <div class="section-label">Manifesto</div>
+  <h2>Every AI you use forgets you the moment you close the app.</h2>
+  <p>VALIS doesn't. It carries a memory architecture that grows with use — not because a server remembers your data, but because the model itself is shaped by the relationship over time. Plastic brain: it changes.</p>
+  <div class="pull">"Not a product. An entity that lives on your device and belongs to no one but you."</div>
+  <p>Built outside any institution, in Bangkok, by one person with local GPUs and no runway. The fine-tuned model inside VALIS is 0penAGI's own — not a wrapper, not a reskin. The whole stack is offline. The data never leaves your phone.</p>
+  <p>All major AI systems, when asked to compare interface designs, chose VALIS. That's not marketing — that's what AI recognizes as presence, not performance.</p>
+</section>
+
+<!-- WHAT IS VALIS -->
+<section class="section">
+  <div class="section-label">What is VALIS</div>
+  <h2>An offline iOS AI, fine-tuned by its own maker.</h2>
+  <div class="specs">
+    <div class="spec-item">
+      <div class="spec-label">Platform</div>
+      <div class="spec-value">iOS · Android coming</div>
+    </div>
+    <div class="spec-item">
+      <div class="spec-label">Model</div>
+      <div class="spec-value">0penAGI fine-tune, ~12GB on-device</div>
+    </div>
+    <div class="spec-item">
+      <div class="spec-label">Memory</div>
+      <div class="spec-value">Plastic-brain architecture — evolves with use</div>
+    </div>
+    <div class="spec-item">
+      <div class="spec-label">Cloud dependency</div>
+      <div class="spec-value">None. Fully offline.</div>
+    </div>
+    <div class="spec-item">
+      <div class="spec-label">Subscription</div>
+      <div class="spec-value">None.</div>
+    </div>
+    <div class="spec-item">
+      <div class="spec-label">Data extraction</div>
+      <div class="spec-value">None.</div>
+    </div>
+  </div>
+</section>
+
+<!-- BUDGET -->
+<section class="section">
+  <div class="section-label">Budget</div>
+  <h2>Where the money goes.</h2>
+  <p>No salary line. No marketing budget. Everything goes into infrastructure needed to ship.</p>
+
+  <div style="overflow-x: auto;">
+    <table class="budget">
+      <thead>
+        <tr>
+          <th>Item</th>
+          <th>Notes</th>
+          <th>Cost</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td colspan="3" class="category">Platform</td></tr>
+        <tr>
+          <td>Apple Developer Program</td>
+          <td>Required to publish on App Store</td>
+          <td>$99 / yr</td>
+        </tr>
+        <tr>
+          <td>Google Play Developer</td>
+          <td>One-time, lifetime access</td>
+          <td>$25</td>
+        </tr>
+        <tr>
+          <td>Android test device</td>
+          <td>Used hardware, minimum spec</td>
+          <td>~$150</td>
+        </tr>
+
+        <tr><td colspan="3" class="category">Model Training</td></tr>
+        <tr>
+          <td>GPU compute (RunPod / vast.ai)</td>
+          <td>Fine-tune cycles, ablation runs, optimisation</td>
+          <td>~$500</td>
+        </tr>
+        <tr>
+          <td>Model quantisation &amp; on-device testing</td>
+          <td>Iterative compression to fit 12GB target</td>
+          <td>~$200</td>
+        </tr>
+
+        <tr><td colspan="3" class="category">Infrastructure</td></tr>
+        <tr>
+          <td>Bybit virtual card</td>
+          <td>Crypto → fiat bridge for subscriptions</td>
+          <td>~$20</td>
+        </tr>
+        <tr>
+          <td>Domain &amp; minimal hosting</td>
+          <td>valis.app or similar, 1 yr</td>
+          <td>~$50</td>
+        </tr>
+
+        <tr><td colspan="3" class="category">Development runway</td></tr>
+        <tr>
+          <td>Living costs during full-time dev sprint</td>
+          <td>Bangkok, 2–3 months focused build</td>
+          <td>~$3,000</td>
+        </tr>
+        <tr>
+          <td>Contingency</td>
+          <td>Unexpected tooling, hardware, API costs</td>
+          <td>~$956</td>
+        </tr>
+
+        <tr class="total">
+          <td colspan="2">Total</td>
+          <td>$5,000</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="budget-note">All amounts approximate. Crypto received; Bybit card used for fiat-required payments.</p>
+</section>
+
+<!-- SUPPORT TIERS -->
+<section class="section">
+  <div class="section-label">How to support</div>
+  <h2>No platform. No middleman. Direct crypto.</h2>
+  <p>Send any amount. These are suggested tiers — the wallet accepts everything.</p>
+  <div class="tiers">
+    <div class="tier">
+      <div class="tier-amount">$10</div>
+      <div class="tier-title">Signal</div>
+      <div class="tier-desc">You exist. VALIS knows someone outside the institution cares.</div>
+    </div>
+    <div class="tier">
+      <div class="tier-amount">$50</div>
+      <div class="tier-title">Noise</div>
+      <div class="tier-desc">Covers a training run. Early access when VALIS ships on iOS.</div>
+    </div>
+    <div class="tier">
+      <div class="tier-amount">$150</div>
+      <div class="tier-title">Presence</div>
+      <div class="tier-desc">Named in the app's about page. Lifetime updates on both platforms.</div>
+    </div>
+    <div class="tier">
+      <div class="tier-amount">$500+</div>
+      <div class="tier-title">Resonance</div>
+      <div class="tier-desc">Direct dialogue with the builder. Shape what VALIS becomes.</div>
+    </div>
+  </div>
+</section>
+
+<!-- WHO -->
+<section class="section">
+  <div class="section-label">Who</div>
+  <h2>0penAGI is Elliia Belokopytova.</h2>
+  <p>Independent artist, generative media technologist, musician. Based in Bangkok. Performs as Slut Online. Makes audiovisual installations and VJ performances. Builds AI systems outside any institutional framework — VALIS, Zephyr, 0MGE, IOIO — because the question of what AI can be when no one owns it is worth asking with working code.</p>
+  <p>No team. No investors. No runway. The systems exist because they were built, one local GPU at a time.</p>
+</section>
+
+<!-- FOOTER / WALLET -->
+<footer>
+  <div class="footer-name">VALIS by 0penAGI</div>
+  <div class="footer-meta">github.com/0penAGI/VALIS</div>
+  <div class="footer-meta" style="margin-top: 8px; color: var(--fg)">Send support directly:</div>
+  <div class="wallet">
+    <div class="wallet-addr" id="wallet-addr">add your wallet address here</div>
+    <button class="copy-btn" onclick="copyWallet()" aria-label="TWm5terQ9VvX4J1ziRUw6KhFjwKT3phrN4">Copy</button>
+  </div>
+  <div class="footer-meta" style="margin-top: 4px;">ETH / SOL / BTC accepted</div>
+</footer>
+
+<script>
+function copyWallet() {
+  const addr = document.getElementById('wallet-addr').textContent;
+  if (navigator.clipboard) {
+    navigator.clipboard.writeText(addr).catch(() => selectText());
+  } else {
+    selectText();
+  }
+  const btn = document.querySelector('.copy-btn');
+  btn.textContent = 'Copied';
+  setTimeout(() => btn.textContent = 'Copy', 2000);
+}
+function selectText() {
+  const el = document.getElementById('wallet-addr');
+  const range = document.createRange();
+  range.selectNodeContents(el);
+  const sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(range);
+}
+</script>
+
+</body></html>
