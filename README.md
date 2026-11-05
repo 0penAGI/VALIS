@@ -4,7 +4,7 @@
 
 VALIS is an on-device AI chat application for iOS built with SwiftUI and `llama.cpp` (GGUF). It combines local inference with a "plastic brain" memory system, persistent multi-chat architecture, multimodal vision, live HTML artifacts, a voice-layer post-processor, and a glass-morphic UI.
 
-![chat](https://github.com/0penAGI/VALIS/blob/main/IMG_8565.png)
+![chat](https://github.com/0penAGI/VALIS/blob/main/greeting.png)
 
 [FULL BENCHMARK](https://0penagi.github.io/VALIS/)
 
@@ -51,9 +51,11 @@ PHILOSOPHICAL DEPTH
 
 > **VALIS tied GPT Chat** — running entirely on-device with a 4B parameter model.
 
+
 **Key Finding:** The Plastic Brain memory architecture compensates for model scale. Kuramoto resonance synchronization and CognitiveEchoGraph context ranking provide coherence that cloud models achieve only with orders-of-magnitude more parameters.
 
 ---
+![chat](https://github.com/0penAGI/VALIS/blob/main/hi.png)
 
 ## Core Features
 
@@ -66,6 +68,8 @@ PHILOSOPHICAL DEPTH
 - **Response Drift Monitoring**: Tracks anchor retention, metaphor load, self-focus, repetition — repairs when drift > 0.58
 
 ### Memory System (Plastic Brain)
+
+![chat](https://github.com/0penAGI/VALIS/blob/main/settings.png)
 
 - **Temporal U-Shape Weighting**: Prioritizes both recent and deeply old memories (non-exponential decay)
 - **Power-Law Activation Decay**: Fast initial drop, long-tail plateau in CognitiveEchoGraph
@@ -82,6 +86,8 @@ PHILOSOPHICAL DEPTH
 
 ### Chat & Artifacts
 
+![chat](https://github.com/0penAGI/VALIS/blob/main/artifact.png)
+
 - **Separate Chats, Shared Memory**: Independent message history with unified long-term memory vault
 - **Thinking UI**: `<think>...</think>` blocks render as collapsible panels
 - **Voice Layer**: `VoiceLayerService` cleans prose after generation while preserving protected blocks
@@ -90,6 +96,8 @@ PHILOSOPHICAL DEPTH
 - **Artifact Continuity**: Latest artifact remembered per chat for iterative improvement
 - **Background Polish**: Unfinished artifacts receive continuation passes
 - **User HTML Detection**: Fenced ` ```html ` blocks auto-wrap into artifact canvases
+
+![chat](https://github.com/0penAGI/VALIS/blob/main/edit.png)
 
 ### Multimodal Vision
 
@@ -284,10 +292,7 @@ Download URLs (HuggingFace - unsloth):
 
 ---
 
-## Screenshots
 
-![chat](https://github.com/0penAGI/VALIS/blob/main/IMG_9344.png)
-![chat](https://github.com/0penAGI/VALIS/blob/main/IMG_8567.png)
 
 ---
 
